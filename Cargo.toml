@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/ks-core",
+    "crates/ks-engine",
+    "crates/ks-cli",
+    # "crates/ks-server",  # 稍后添加
+]
+resolver = "2"
+
+# ks-ebpf 是纯 C 项目，不在 workspace 中，由 build.rs 独立编译

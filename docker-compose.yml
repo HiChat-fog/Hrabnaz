@@ -1,0 +1,49 @@
+# ==========================================================================
+# 内核哨兵 — Docker Compose 开发环境
+# ==========================================================================
+#
+# 使用:
+#   docker compose run --rm build        # 编译 + 单元测试
+#   docker compose run --rm build-shell  # 进入编译容器
+#   docker compose run --rm e2e          # 端到端测试 (需要 --privileged)
+#
+# 注意:
+#   e2e 服务需要 --privileged 才能加载 eBPF，且仅在 Linux 宿主有意义
+#   Windows Docker Desktop 下 e2e 会加载到 WSL2 内核 (非生产环境)
+# ==========================================================================
+
+services:
+  # 编译验证 + 单元测试
+  build:
+    build: .
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+    working_dir: /workspace
+    command: cargo test --workspace -- --nocapture
+
+  # 编译容器交互式 Shell
+  build-shell:
+    build: .
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+    working_dir: /workspace
+    entrypoint: ["bash"]
+
+  # 端到端测试 (需要 --privileged + Linux 宿主)
+  # 当前状态: 不可用 — aya 集成未完成
+  e2e:
+    build: .
+    privileged: true
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+    working_dir: /workspace
+    command: cargo run --bin kernelsentinel -- start --rules-dir /workspace/rules
+    profiles:
+      - e2e  # 默认不启动，需显式指定
+
+volumes:
+  cargo-cache:
