@@ -22,6 +22,8 @@ flate2 = "1"
 aya = "0.14"
 aya-obj = "0.3"
 aya-log = "0.2"
+# A6: EventSource trait async 支持（trait object 需要 async_trait 宏）
+async-trait = "0.1"
 
 [build-dependencies]
 which = "7"

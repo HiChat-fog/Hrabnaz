@@ -1,5 +1,5 @@
-// 网络流状态机 — TCP 流生命周期追踪 + C2/外泄/扫描检测
-#include "common.h"
+#ifndef KS_PROBES_NETFLOW_H
+#define KS_PROBES_NETFLOW_H
 
 #define TCP_SYN_SENT    1
 #define TCP_ESTABLISHED 2
@@ -61,13 +61,10 @@ struct {
     __uint(max_entries, 4096);
 } port_scan_map SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} flow_events SEC(".maps");
+KS_EVENT_MAP(flow_events, 256 * 1024);
 
 SEC("kprobe/tcp_v4_connect")
-int kprobe_tcp_v4_connect_flow(struct sock *sk, struct sockaddr *uaddr, int addr_len) {
+int BPF_KPROBE(kprobe_tcp_v4_connect_flow, struct sock *sk, struct sockaddr *uaddr, int addr_len) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     if (pid == 0) return 0;
@@ -110,22 +107,21 @@ int kprobe_tcp_v4_connect_flow(struct sock *sk, struct sockaddr *uaddr, int addr
     }
 
     if (state.anomaly_flags > 0) {
-        struct net_flow_event *evt = bpf_ringbuf_reserve(&flow_events,
-                                                          sizeof(struct net_flow_event), 0);
+        struct net_flow_event *evt = KS_RESERVE(flow_events, struct net_flow_event);
         if (!evt) return 0;
         fill_header(&evt->header, EVENT_FLOW_CREATE);
         evt->pid=pid; evt->saddr=saddr; evt->daddr=daddr;
         evt->sport=sport; evt->dport=dport; evt->proto=6;
         evt->tcp_state=TCP_SYN_SENT; evt->anomaly_flags=state.anomaly_flags;
         evt->connect_count=state.connect_count;
-        bpf_ringbuf_submit(evt, 0);
+        KS_SUBMIT(evt);
     }
     bpf_map_update_elem(&net_flows, &key, &state, BPF_ANY);
     return 0;
 }
 
 SEC("kprobe/tcp_set_state")
-int kprobe_tcp_set_state_flow(struct sock *sk, int new_state) {
+int BPF_KPROBE(kprobe_tcp_set_state_flow, struct sock *sk, int new_state) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     if (pid == 0) return 0;
@@ -161,8 +157,7 @@ int kprobe_tcp_set_state_flow(struct sock *sk, int new_state) {
     }
 
     if (our_state == TCP_ESTABLISHED || our_state == TCP_CLOSED || flow->anomaly_flags > 0) {
-        struct net_flow_event *evt = bpf_ringbuf_reserve(&flow_events,
-                                                          sizeof(struct net_flow_event), 0);
+        struct net_flow_event *evt = KS_RESERVE(flow_events, struct net_flow_event);
         if (!evt) return 0;
         fill_header(&evt->header, EVENT_FLOW_STATE);
         evt->pid=pid; evt->saddr=key.saddr; evt->daddr=key.daddr;
@@ -171,7 +166,7 @@ int kprobe_tcp_set_state_flow(struct sock *sk, int new_state) {
         evt->byte_count=flow->byte_count; evt->packet_count=flow->packet_count;
         evt->duration_ns=now - flow->create_time_ns;
         evt->connect_count=flow->connect_count;
-        bpf_ringbuf_submit(evt, 0);
+        KS_SUBMIT(evt);
     }
 
     if (our_state == TCP_CLOSED)
@@ -180,7 +175,7 @@ int kprobe_tcp_set_state_flow(struct sock *sk, int new_state) {
 }
 
 SEC("kprobe/tcp_sendmsg")
-int kprobe_tcp_sendmsg_flow(struct sock *sk, struct msghdr *msg, size_t size) {
+int BPF_KPROBE(kprobe_tcp_sendmsg_flow, struct sock *sk, struct msghdr *msg, size_t size) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     if (pid == 0) return 0;
@@ -204,4 +199,4 @@ int kprobe_tcp_sendmsg_flow(struct sock *sk, struct msghdr *msg, size_t size) {
     return 0;
 }
 
-char LICENSE[] SEC("license") = "GPL";
+#endif // KS_PROBES_NETFLOW_H

@@ -1,5 +1,5 @@
-// 智能过滤 — 低风险事件只更新 Map, 高风险过 ring buffer
-#include "common.h"
+#ifndef KS_PROBES_SMART_FILTER_H
+#define KS_PROBES_SMART_FILTER_H
 
 #define EVENT_FILTER_PASS    70
 #define EVENT_FILTER_BLOCK   71
@@ -58,10 +58,7 @@ struct {
     __uint(max_entries, 1);
 } filter_stats_map SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} filter_events SEC(".maps");
+KS_EVENT_MAP(filter_events, 256 * 1024);
 
 static __always_inline u32 get_filter_config(u32 key, u32 default_val) {
     u32 *val = bpf_map_lookup_elem(&filter_config, &key);
@@ -124,7 +121,7 @@ static __always_inline void update_filter_stats(u8 action) {
 }
 
 SEC("kprobe/vfs_open")
-int smart_filter_vfs_open(struct path *path) {
+int BPF_KPROBE(smart_filter_vfs_open, struct path *path) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     if (pid == 0) return 0;
@@ -142,4 +139,4 @@ int smart_filter_vfs_open(struct path *path) {
     return 0;
 }
 
-char LICENSE[] SEC("license") = "GPL";
+#endif // KS_PROBES_SMART_FILTER_H

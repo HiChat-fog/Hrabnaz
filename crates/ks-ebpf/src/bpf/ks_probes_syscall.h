@@ -1,10 +1,5 @@
-// syscall 探针 — tracepoint/raw_syscalls 捕获 execve/open/connect/ptrace/kill
-#include "common.h"
-
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} events SEC(".maps");
+#ifndef KS_PROBES_SYSCALL_H
+#define KS_PROBES_SYSCALL_H
 
 struct syscall_ctx {
     u64 args[6];
@@ -59,7 +54,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
     u32 syscall_nr = sctx->syscall_nr;
 
     if (syscall_nr == 59 && ret >= 0) {
-        struct exec_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct exec_event), 0);
+        struct exec_event *evt = KS_RESERVE(events, struct exec_event);
         if (!evt) goto cleanup;
 
         fill_header(&evt->header, EVENT_PROCESS_EXEC);
@@ -80,19 +75,18 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
                 if (offset >= 448) break;
                 int len = bpf_probe_read_user_str(evt->args + offset, 64, arg_ptr);
                 if (len <= 0) break;
-                // 只累加偏移，不插入空格分隔符（避免验证器对内存访问的警告）
                 offset += len;
             }
         }
 
         infer_event(evt->header.pid, EVENT_PROCESS_EXEC,
                     (const char *)evt->filename, 0, 0, 0, 0);
-        bpf_ringbuf_submit(evt, 0);
+        KS_SUBMIT(evt);
         goto cleanup;
     }
 
     if ((syscall_nr == 2 || syscall_nr == 257) && ret >= 0) {
-        struct file_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct file_event), 0);
+        struct file_event *evt = KS_RESERVE(events, struct file_event);
         if (!evt) goto cleanup;
 
         fill_header(&evt->header, EVENT_FILE_OPEN);
@@ -111,12 +105,12 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
         infer_event(evt->header.pid, EVENT_FILE_OPEN,
                     (const char *)evt->filename, 0, 0, 0, 0);
-        bpf_ringbuf_submit(evt, 0);
+        KS_SUBMIT(evt);
         goto cleanup;
     }
 
     if (syscall_nr == 42) {
-        struct net_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct net_event), 0);
+        struct net_event *evt = KS_RESERVE(events, struct net_event);
         if (!evt) goto cleanup;
 
         fill_header(&evt->header, EVENT_NET_CONNECT);
@@ -155,12 +149,12 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
         infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
                     evt->daddr, evt->dport, evt->proto, 0);
-        bpf_ringbuf_submit(evt, 0);
+        KS_SUBMIT(evt);
         goto cleanup;
     }
 
     if (syscall_nr == 101 && ret >= 0) {
-        struct signal_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct signal_event), 0);
+        struct signal_event *evt = KS_RESERVE(events, struct signal_event);
         if (!evt) goto cleanup;
 
         fill_header(&evt->header, EVENT_PROC_PTRACE);
@@ -170,12 +164,12 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         evt->signal = (i32)sctx->args[0];
 
         infer_event(evt->header.pid, EVENT_PROC_PTRACE, NULL, 0,0,0, evt->target_pid);
-        bpf_ringbuf_submit(evt, 0);
+        KS_SUBMIT(evt);
         goto cleanup;
     }
 
     if (syscall_nr == 62 && ret >= 0) {
-        struct signal_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct signal_event), 0);
+        struct signal_event *evt = KS_RESERVE(events, struct signal_event);
         if (!evt) goto cleanup;
 
         fill_header(&evt->header, EVENT_PROC_SIGNAL);
@@ -185,7 +179,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         evt->signal = (i32)sctx->args[1];
 
         infer_event(evt->header.pid, EVENT_PROC_SIGNAL, NULL, 0,0,0, evt->target_pid);
-        bpf_ringbuf_submit(evt, 0);
+        KS_SUBMIT(evt);
         goto cleanup;
     }
 
@@ -196,7 +190,7 @@ cleanup:
 
 SEC("tracepoint/sched/sched_process_exec")
 int trace_sched_exec(struct trace_event_raw_sched_process_exec *ctx) {
-    struct signal_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct signal_event), 0);
+    struct signal_event *evt = KS_RESERVE(events, struct signal_event);
     if (!evt) return 0;
 
     fill_header(&evt->header, EVENT_PROCESS_EXEC);
@@ -205,13 +199,13 @@ int trace_sched_exec(struct trace_event_raw_sched_process_exec *ctx) {
     evt->target_pid = 0;
     evt->signal = 0;
 
-    bpf_ringbuf_submit(evt, 0);
+    KS_SUBMIT(evt);
     return 0;
 }
 
 SEC("tracepoint/sched/sched_process_exit")
 int trace_sched_exit(struct trace_event_raw_sched_process_template *ctx) {
-    struct signal_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct signal_event), 0);
+    struct signal_event *evt = KS_RESERVE(events, struct signal_event);
     if (!evt) return 0;
 
     fill_header(&evt->header, EVENT_PROCESS_EXIT);
@@ -220,8 +214,8 @@ int trace_sched_exit(struct trace_event_raw_sched_process_template *ctx) {
     evt->target_pid = 0;
     evt->signal = 0;
 
-    bpf_ringbuf_submit(evt, 0);
+    KS_SUBMIT(evt);
     return 0;
 }
 
-char LICENSE[] SEC("license") = "GPL";
+#endif // KS_PROBES_SYSCALL_H

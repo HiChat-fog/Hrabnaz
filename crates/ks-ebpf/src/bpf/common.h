@@ -14,6 +14,47 @@
 typedef __s32 i32;
 typedef __s64 i64;
 
+/* ── Tier 条件编译（由 build.rs 注入 -DKS_TIER_xxx）───────── */
+#if defined(KS_TIER_MODERN)
+    #define KS_RINGBUF   1
+    #define KS_LRU_HASH  1
+#elif defined(KS_TIER_LEGACY)
+    #define KS_RINGBUF   0
+    #define KS_LRU_HASH  1
+#elif defined(KS_TIER_ANCIENT)
+    #define KS_RINGBUF   0
+    #define KS_LRU_HASH  0
+#else
+    /* 默认 modern tier */
+    #define KS_RINGBUF   1
+    #define KS_LRU_HASH  1
+#endif
+
+/* ── 事件 Map 声明宏（ringbuf vs perf_event_array）────────── */
+#if KS_RINGBUF
+    #define KS_EVENT_MAP(name, size) \
+        struct { \
+            __uint(type, BPF_MAP_TYPE_RINGBUF); \
+            __uint(max_entries, size); \
+        } name SEC(".maps")
+#else
+    #define KS_EVENT_MAP(name, size) \
+        struct { \
+            __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); \
+            __uint(max_entries, 0); \
+            __type(key, i32); \
+            __type(value, u32); \
+        } name SEC(".maps")
+#endif
+
+/* ── 事件提交宏（ringbuf 路径已实现，perfbuf 路径 Phase B 实现）── */
+#if KS_RINGBUF
+    #define KS_RESERVE(buf, type) ((type *)bpf_ringbuf_reserve(&(buf), sizeof(type), 0))
+    #define KS_SUBMIT(evt)        bpf_ringbuf_submit((evt), 0)
+#else
+    #error "perfbuf 路径尚未实现，请在 Phase B 中完成 KS_RESERVE/KS_SUBMIT 的 perfbuf 分支"
+#endif
+
 /* ── 事件类型常量 ───────────────────────────── */
 #define EVENT_UNKNOWN       0
 #define EVENT_PROCESS_EXEC  1

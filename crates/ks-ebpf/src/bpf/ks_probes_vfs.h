@@ -1,10 +1,5 @@
-// VFS 探针 — kprobe/vfs_open, kprobe/vfs_write, kprobe/vfs_unlink
-#include "common.h"
-
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} events SEC(".maps");
+#ifndef KS_PROBES_VFS_H
+#define KS_PROBES_VFS_H
 
 static __always_inline int read_full_path(struct path *p, u8 *dst, int dst_len) {
     long ret = bpf_d_path(p, (char *)dst, dst_len);
@@ -24,7 +19,7 @@ static __always_inline int read_file_path(struct file *f, u8 *dst, int dst_len) 
 
 SEC("kprobe/vfs_open")
 int BPF_KPROBE(kprobe_vfs_open, struct path *path, struct file *file) {
-    struct file_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct file_event), 0);
+    struct file_event *evt = KS_RESERVE(events, struct file_event);
     if (!evt) return 0;
 
     fill_header(&evt->header, EVENT_FILE_OPEN);
@@ -33,7 +28,7 @@ int BPF_KPROBE(kprobe_vfs_open, struct path *path, struct file *file) {
     evt->fd = -1;  evt->bytes = 0;  evt->flags = 0;
 
     infer_sensitive_file((const char *)evt->filename, evt->header.pid);
-    bpf_ringbuf_submit(evt, 0);
+    KS_SUBMIT(evt);
     return 0;
 }
 
@@ -41,7 +36,7 @@ SEC("kprobe/vfs_write")
 int BPF_KPROBE(kprobe_vfs_write, struct file *file, const char *buf, size_t count, loff_t *pos) {
     if (count < 1024) return 0;
 
-    struct file_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct file_event), 0);
+    struct file_event *evt = KS_RESERVE(events, struct file_event);
     if (!evt) return 0;
 
     fill_header(&evt->header, EVENT_FILE_WRITE);
@@ -50,13 +45,13 @@ int BPF_KPROBE(kprobe_vfs_write, struct file *file, const char *buf, size_t coun
     evt->bytes = count;  evt->fd = 0;  evt->flags = 0;
 
     infer_bulk_file_ops(evt->header.pid, EVENT_FILE_WRITE);
-    bpf_ringbuf_submit(evt, 0);
+    KS_SUBMIT(evt);
     return 0;
 }
 
 SEC("kprobe/vfs_unlink")
 int BPF_KPROBE(kprobe_vfs_unlink, struct inode *dir, struct dentry *dentry, struct inode **delegated_inode) {
-    struct file_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct file_event), 0);
+    struct file_event *evt = KS_RESERVE(events, struct file_event);
     if (!evt) return 0;
 
     fill_header(&evt->header, EVENT_FILE_DELETE);
@@ -67,8 +62,8 @@ int BPF_KPROBE(kprobe_vfs_unlink, struct inode *dir, struct dentry *dentry, stru
     evt->bytes = 0;  evt->fd = -1;  evt->flags = 0;
 
     infer_bulk_file_ops(evt->header.pid, EVENT_FILE_DELETE);
-    bpf_ringbuf_submit(evt, 0);
+    KS_SUBMIT(evt);
     return 0;
 }
 
-char LICENSE[] SEC("license") = "GPL";
+#endif // KS_PROBES_VFS_H

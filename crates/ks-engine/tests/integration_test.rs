@@ -20,11 +20,11 @@ use tempfile::TempDir;
 
 // ========== 编码辅助函数 ==========
 
-/// 将任意 #[repr(C)] Copy 结构体编码为字节序列 (使用 write_unaligned 避免对齐 UB)
+/// 将任意 #[repr(C)] Copy 结构体编码为字节序列 (直接从引用拷贝，避免大结构体栈副本)
 fn encode_struct<T: Copy>(s: &T) -> Vec<u8> {
     let size = core::mem::size_of::<T>();
     let mut data = vec![0u8; size];
-    unsafe { core::ptr::write_unaligned(data.as_mut_ptr() as *mut T, *s); }
+    unsafe { core::ptr::copy_nonoverlapping(s as *const T as *const u8, data.as_mut_ptr(), size); }
     data
 }
 
@@ -52,11 +52,11 @@ fn make_cstr_16(s: &str) -> [u8; 16] {
     buf
 }
 
-/// IPv4 点分十进制 → u32 (网络字节序 / 大端)
+/// IPv4 点分十进制 → u32 (native-endian，与内核 bpf_probe_read_kernel 一致)
 fn ipv4_to_u32(addr: &str) -> u32 {
     let parts: Vec<u8> = addr.split('.').filter_map(|p| p.parse::<u8>().ok()).collect();
     if parts.len() == 4 {
-        u32::from_be_bytes([parts[0], parts[1], parts[2], parts[3]])
+        u32::from_ne_bytes([parts[0], parts[1], parts[2], parts[3]])
     } else {
         0
     }

@@ -1,14 +1,9 @@
-// 网络探针 — kprobe/tcp_v4_connect, tcp_v6_connect, udp_sendmsg
-#include "common.h"
-
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} events SEC(".maps");
+#ifndef KS_PROBES_NET_H
+#define KS_PROBES_NET_H
 
 SEC("kprobe/tcp_v4_connect")
 int BPF_KPROBE(kprobe_tcp_connect, struct sock *sk, struct sockaddr *uaddr, int addr_len) {
-    struct net_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct net_event), 0);
+    struct net_event *evt = KS_RESERVE(events, struct net_event);
     if (!evt) return 0;
 
     fill_header(&evt->header, EVENT_NET_CONNECT);
@@ -33,13 +28,13 @@ int BPF_KPROBE(kprobe_tcp_connect, struct sock *sk, struct sockaddr *uaddr, int 
 
     infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
                 evt->daddr, evt->dport, evt->proto, 0);
-    bpf_ringbuf_submit(evt, 0);
+    KS_SUBMIT(evt);
     return 0;
 }
 
 SEC("kprobe/tcp_v6_connect")
 int BPF_KPROBE(kprobe_tcp_v6_connect, struct sock *sk, struct sockaddr *uaddr, int addr_len) {
-    struct net_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct net_event), 0);
+    struct net_event *evt = KS_RESERVE(events, struct net_event);
     if (!evt) return 0;
 
     fill_header(&evt->header, EVENT_NET_CONNECT);
@@ -62,13 +57,13 @@ int BPF_KPROBE(kprobe_tcp_v6_connect, struct sock *sk, struct sockaddr *uaddr, i
 
     infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
                 0, evt->dport, evt->proto, 0);
-    bpf_ringbuf_submit(evt, 0);
+    KS_SUBMIT(evt);
     return 0;
 }
 
 SEC("kprobe/udp_sendmsg")
 int BPF_KPROBE(kprobe_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t len) {
-    struct net_event *evt = bpf_ringbuf_reserve(&events, sizeof(struct net_event), 0);
+    struct net_event *evt = KS_RESERVE(events, struct net_event);
     if (!evt) return 0;
 
     fill_header(&evt->header, EVENT_NET_SEND);
@@ -97,8 +92,8 @@ int BPF_KPROBE(kprobe_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t l
 
     infer_event(evt->header.pid, evt->header.event_type, NULL,
                 evt->daddr, evt->dport, evt->proto, 0);
-    bpf_ringbuf_submit(evt, 0);
+    KS_SUBMIT(evt);
     return 0;
 }
 
-char LICENSE[] SEC("license") = "GPL";
+#endif // KS_PROBES_NET_H

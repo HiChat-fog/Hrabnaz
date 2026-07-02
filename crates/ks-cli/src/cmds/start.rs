@@ -8,7 +8,11 @@ use ks_engine::aggregator::EventAggregator;
 use ks_engine::forensic::{ForensicLogger, RotationConfig};
 use ks_engine::chain::ChainReconstructor;
 use ks_engine::config::Config;
-use ks_engine::event_source::{EventSource, default_event_source};
+use ks_engine::event_source::EventSource;
+#[cfg(not(target_os = "linux"))]
+use ks_engine::event_source::default_event_source;
+#[cfg(target_os = "linux")]
+use ks_engine::ebpf_source::EbpfModernSource;
 
 #[cfg(target_os = "linux")]
 const STATUS_FILE: &str = "/tmp/ks-status.json";
@@ -27,10 +31,23 @@ pub async fn run(rules_dir: &str, log_dir: &str) -> Result<()> {
     println!("      取证日志目录: {}", config.forensic.log_dir);
     println!("      取证保留天数: {}", config.forensic.retention_days);
 
-    println!("[2/6] 加载 eBPF 探针...");
-    let mut loader = ks_engine::loader::EbpfLoader::new();
-    loader.start_all().await?;
-    println!("      探针已挂载: {} 个", loader.loaded_probes().len());
+    // ── A7: 统一事件源 ──
+    // Linux 上：EbpfModernSource 包装 loader，事件循环通过 trait 路由
+    // 非 Linux：mock 回放（CI/演示）
+    #[cfg(target_os = "linux")]
+    let mut source: Box<dyn EventSource> = {
+        println!("[2/6] 加载 eBPF 探针...");
+        let mut loader = ks_engine::loader::EbpfLoader::new();
+        loader.start_all().await?;
+        println!("      探针已挂载: {} 个", loader.loaded_probes().len());
+        Box::new(EbpfModernSource::new(loader))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut source: Box<dyn EventSource> = {
+        println!("[2/6] 跳过 eBPF 探针（非 Linux 平台）");
+        default_event_source().await
+    };
+    println!("      事件源: {} [{}]", source.description(), source.kind().as_str());
 
     println!("[3/6] 加载检测规则...");
     let detector = Arc::new(Mutex::new(DetectionEngine::new()));
@@ -84,23 +101,13 @@ pub async fn run(rules_dir: &str, log_dir: &str) -> Result<()> {
     println!("      监听规则目录变更: {}", rules_dir);
 
     println!();
-    let event_source = default_event_source();
-    println!("      事件源: {}", event_source.description());
     println!("      按 Ctrl+C 停止");
     println!();
 
-    #[cfg(target_os = "linux")]
-    let using_ebpf = loader.loaded_probes().len() > 0;
-    #[cfg(not(target_os = "linux"))]
-    let using_ebpf = false;
-    if using_ebpf {
-        println!("      事件源: eBPF ring buffer (4 tracepoints)");
-    } else {
-        println!("      事件源: {}", event_source.description());
-    }
-    let mut source: Box<dyn EventSource> = event_source;
     let mut stats = EventStats::new();
     let anomaly_threshold = config.detection.anomaly_threshold;
+    // mock 耗尽（loop_mode=false）时退出；eBPF ringbuf 暂空时 sleep 1ms 继续
+    let continue_on_empty = !source.is_mock();
 
     loop {
         tokio::select! {
@@ -110,29 +117,21 @@ pub async fn run(rules_dir: &str, log_dir: &str) -> Result<()> {
                 break;
             }
             result = async {
-                // Linux 上优先从 eBPF ring buffer 读，否则 fallback 到 mock
-                #[cfg(target_os = "linux")]
-                {
-                    if using_ebpf {
-                        if let Some(data) = loader.try_next_event() {
-                            return consume_next_event_data(data, &aggregator, &detector, &forensic, &chain_reconstructor, &mut stats, anomaly_threshold).await;
-                        }
-                        // ring buffer 空时等 1ms
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                        return Ok(true);
-                    }
-                }
-                // Mock 或非 Linux：从事件源读
-                let bytes = match source.next_bytes() {
+                let bytes = match source.next_bytes().await {
                     Ok(Some(b)) => b,
                     Ok(None) => {
-                        #[cfg(not(target_os = "linux"))]
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        return Ok(true);
+                        if continue_on_empty {
+                            // eBPF ringbuf 暂空，sleep 1ms 后继续轮询
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            return Ok(true);
+                        } else {
+                            // mock 耗尽，退出循环
+                            return Ok(false);
+                        }
                     }
                     Err(e) => return Err(e),
                 };
-                consume_next_event_data(bytes, &aggregator, &detector, &forensic, &chain_reconstructor, &mut stats, anomaly_threshold).await
+                process_event_bytes(&bytes, &aggregator, &detector, &forensic, &chain_reconstructor, &mut stats, anomaly_threshold).await
             } => {
                 match result {
                     Ok(true) => {}
@@ -142,8 +141,10 @@ pub async fn run(rules_dir: &str, log_dir: &str) -> Result<()> {
                     }
                     Err(e) => {
                         log::warn!("事件处理失败: {}", e);
-                        #[cfg(not(target_os = "linux"))]
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        // eBPF 路径：错误后短暂 sleep 避免 busy loop
+                        if continue_on_empty {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
                     }
                 }
             }
@@ -152,8 +153,10 @@ pub async fn run(rules_dir: &str, log_dir: &str) -> Result<()> {
 
     println!();
     println!("安全关闭...");
-    println!("      停止探针...");
-    loader.stop_all().await?;
+    println!("      释放事件源（含 eBPF 探针 fd）...");
+    // A7: source drop 时 EbpfModernSource 自动 drop EbpfLoader，
+    // loader 内部 rings/bpf fd 自动关闭，无需显式 stop_all。
+    drop(source);
     println!("      Flush 取证日志...");
     forensic.lock().await.flush()?;
 
@@ -171,36 +174,7 @@ pub async fn run(rules_dir: &str, log_dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// 直接处理原始事件字节（来自 eBPF ring buffer）
-async fn consume_next_event_data(
-    data: Vec<u8>,
-    aggregator: &Arc<Mutex<EventAggregator>>,
-    detector: &Arc<Mutex<DetectionEngine>>,
-    forensic: &Arc<Mutex<ForensicLogger>>,
-    chain_reconstructor: &ChainReconstructor,
-    stats: &mut EventStats,
-    anomaly_threshold: f64,
-) -> Result<bool> {
-    process_event_bytes(&data, aggregator, detector, forensic, chain_reconstructor, stats, anomaly_threshold).await
-}
-
-async fn consume_next_event(
-    source: &mut dyn EventSource,
-    aggregator: &Arc<Mutex<EventAggregator>>,
-    detector: &Arc<Mutex<DetectionEngine>>,
-    forensic: &Arc<Mutex<ForensicLogger>>,
-    chain_reconstructor: &ChainReconstructor,
-    stats: &mut EventStats,
-    anomaly_threshold: f64,
-) -> Result<bool> {
-    let bytes = match source.next_bytes()? {
-        Some(b) => b,
-        None => return Ok(false),
-    };
-    process_event_bytes(&bytes, aggregator, detector, forensic, chain_reconstructor, stats, anomaly_threshold).await
-}
-
-/// 处理单条事件字节（consume_next_event 和 ring buffer 共用）
+/// 处理单条事件字节（统一入口，eBPF/mock 共用）
 async fn process_event_bytes(
     bytes: &[u8],
     aggregator: &Arc<Mutex<EventAggregator>>,
@@ -219,7 +193,7 @@ async fn process_event_bytes(
     for m in &matches {
         let alert = detector.lock().await.generate_alert(m, &event);
         println!("  [规则告警] [{}] {} — PID: {}, COMM: {}",
-                 alert.severity, alert.title, alert.header_pid_or_process(), event.comm);
+                 alert.severity, alert.title, alert.process.pid, event.comm);
         forensic.lock().await.log_alert(&alert)?;
         stats.rule_alerts += 1;
 
@@ -310,7 +284,7 @@ fn write_status_file() {
 
 fn cleanup_status_file() {
     let status_path = get_status_file_path();
-    let _ = std::fs::remove_file(&status_path);
+    let _ = std::fs::remove_file(status_path);
 }
 
 fn get_status_file_path() -> &'static str {

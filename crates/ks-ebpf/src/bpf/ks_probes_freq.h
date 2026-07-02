@@ -1,7 +1,5 @@
-// 行为频率计数器 — 60s 窗口内各维度操作频次, 超阈值告警
-// 共享类型 (struct freq_counter, freq_counters map, FREQ_* flags, update_freq_counter)
-// 已定义在 common.h
-#include "common.h"
+#ifndef KS_PROBES_FREQ_H
+#define KS_PROBES_FREQ_H
 
 #define EVENT_FREQ_UPDATE  60
 #define EVENT_FREQ_ANOMALY 61
@@ -22,7 +20,6 @@ struct freq_update_event {
     u64 duration_ns;
 };
 
-// 频率阈值配置（独立 map，与推理配置分离）
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, u32);
@@ -36,17 +33,13 @@ enum freq_threshold_key {
     TH_REPORT_EVERY = 6,  TH_WINDOW_NS = 7,
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} freq_events SEC(".maps");
+KS_EVENT_MAP(freq_events, 256 * 1024);
 
 static __always_inline u32 get_threshold(u32 key, u32 default_val) {
     u32 *val = bpf_map_lookup_elem(&freq_thresholds, &key);
     return val ? *val : default_val;
 }
 
-// 覆盖 common.h 中的通用版本：使用独立阈值 map + 异常事件发送
 static __always_inline void update_freq_counter_ex(u32 pid, u32 counter_type) {
     u64 now = bpf_ktime_get_ns();
     u64 window_ns = (u64)get_threshold(TH_WINDOW_NS, 60) * 1000000000ULL;
@@ -107,8 +100,7 @@ static __always_inline void update_freq_counter_ex(u32 pid, u32 counter_type) {
         fc->anomaly_flags |= FREQ_ANOMALY_INJECTION;
 
     if (fc->anomaly_flags > 0) {
-        struct freq_anomaly_event *evt = bpf_ringbuf_reserve(&freq_events,
-                                                              sizeof(struct freq_anomaly_event), 0);
+        struct freq_anomaly_event *evt = KS_RESERVE(freq_events, struct freq_anomaly_event);
         if (!evt) goto report;
         fill_header(&evt->header, EVENT_FREQ_ANOMALY);
         evt->pid=pid; evt->syscall_count_60s=fc->syscall_count_60s;
@@ -116,15 +108,14 @@ static __always_inline void update_freq_counter_ex(u32 pid, u32 counter_type) {
         evt->dns_op_count_60s=fc->dns_op_count_60s; evt->ptrace_count_60s=fc->ptrace_count_60s;
         evt->signal_count_60s=fc->signal_count_60s; evt->anomaly_flags=fc->anomaly_flags;
         evt->duration_ns=now - fc->window_start_ns;
-        bpf_ringbuf_submit(evt, 0);
-    } /* end anomaly block */
+        KS_SUBMIT(evt);
+    }
 
 report:
     ;
     u32 report_every = get_threshold(TH_REPORT_EVERY, 100);
     if (fc->syscall_count_60s % report_every == 0) {
-        struct freq_update_event *evt = bpf_ringbuf_reserve(&freq_events,
-                                                              sizeof(struct freq_update_event), 0);
+        struct freq_update_event *evt = KS_RESERVE(freq_events, struct freq_update_event);
         if (!evt) return;
         fill_header(&evt->header, EVENT_FREQ_UPDATE);
         evt->pid=pid; evt->syscall_count_60s=fc->syscall_count_60s;
@@ -132,14 +123,11 @@ report:
         evt->dns_op_count_60s=fc->dns_op_count_60s; evt->ptrace_count_60s=fc->ptrace_count_60s;
         evt->signal_count_60s=fc->signal_count_60s; evt->anomaly_flags=fc->anomaly_flags;
         evt->duration_ns=now - fc->window_start_ns;
-        bpf_ringbuf_submit(evt, 0);
+        KS_SUBMIT(evt);
     }
 
     bpf_map_update_elem(&freq_counters, &pid, fc, BPF_ANY);
 }
-
-// 使用 update_freq_counter_ex 包装，与 common.h 中的简化版区分
-#define update_freq_counter(pid, type) update_freq_counter_ex(pid, type)
 
 SEC("tracepoint/raw_syscalls/sys_exit")
 int freq_sys_exit(struct trace_event_raw_sys_exit *ctx) {
@@ -149,15 +137,15 @@ int freq_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     u32 syscall_nr = ctx->id;
     switch (syscall_nr) {
-    case 2:  case 257: update_freq_counter(pid, 10); break;
-    case 0:            update_freq_counter(pid, 11); break;
-    case 1:            update_freq_counter(pid, 12); break;
-    case 87:           update_freq_counter(pid, 13); break;
-    case 42:           update_freq_counter(pid, 20); break;
-    case 101:          update_freq_counter(pid, 30); break;
-    case 62:           update_freq_counter(pid, 31); break;
+    case 2:  case 257: update_freq_counter_ex(pid, 10); break;
+    case 0:            update_freq_counter_ex(pid, 11); break;
+    case 1:            update_freq_counter_ex(pid, 12); break;
+    case 87:           update_freq_counter_ex(pid, 13); break;
+    case 42:           update_freq_counter_ex(pid, 20); break;
+    case 101:          update_freq_counter_ex(pid, 30); break;
+    case 62:           update_freq_counter_ex(pid, 31); break;
     }
     return 0;
 }
 
-char LICENSE[] SEC("license") = "GPL";
+#endif // KS_PROBES_FREQ_H

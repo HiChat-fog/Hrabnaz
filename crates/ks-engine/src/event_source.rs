@@ -1,12 +1,68 @@
 //! 事件源抽象 — 统一 eBPF ring buffer、mock、文件回放的数据获取接口。
+//!
+//! A6 重构：
+//! - trait 改为 async（next_bytes 返回 Future，避免 perfbuf/inotify 阻塞 tokio reactor）
+//! - 删 Sync 约束（RingBuf 是 Send 但不是 Sync；强加 Sync 会逼出 Mutex<RingBuf> 损失性能）
+//! - 加 SourceKind enum，用于运行时多态 + 配置展示 + 日志区分
 
 use anyhow::Result;
+use async_trait::async_trait;
 use ks_core::event::{EventHeader, ExecEvent, FileEvent, NetEvent, SignalEvent, af};
 
-pub trait EventSource: Send + Sync {
-    fn next_bytes(&mut self) -> Result<Option<Vec<u8>>>;
+/// 事件源种类。
+///
+/// 与多 tier eBPF 架构对应：Modern (5.8+ ringbuf) / Legacy (4.x perfbuf) /
+/// Ancient (3.10+ BTF backport)。Mock/FileReplay 用于测试与离线分析。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// 现代 eBPF tier（5.8+，BPF_MAP_TYPE_RINGBUF）
+    EbpfModern,
+    /// Legacy eBPF tier（4.x，BPF_MAP_TYPE_PERF_EVENT_ARRAY）— Phase B 实现
+    EbpfLegacy,
+    /// Ancient eBPF tier（3.10.0-1160+ BTF backport，HASH + 手动 LRU）— Phase C 研究性突破
+    EbpfAncient,
+    /// Mock 回放（测试/演示/CI 用）
+    Mock,
+    /// 文件回放（离线 pcap/jsonl 日志重放）— 未来扩展
+    FileReplay,
+}
+
+impl SourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceKind::EbpfModern  => "eBPF-Modern (5.8+ ringbuf)",
+            SourceKind::EbpfLegacy  => "eBPF-Legacy (4.x perfbuf)",
+            SourceKind::EbpfAncient => "eBPF-Ancient (3.10+ BTF backport)",
+            SourceKind::Mock        => "Mock 回放",
+            SourceKind::FileReplay  => "文件回放",
+        }
+    }
+}
+
+/// 统一事件源 trait。
+///
+/// 设计要点：
+/// - `Send` 不 `Sync`：RingBuf<MapData> 是 Send 但不是 Sync，强加 Sync 会逼出
+///   `Mutex<RingBuf>` 包装，每次 next_bytes 都 lock，无意义损失性能。
+///   去掉 Sync 后 `Box<dyn EventSource>` 不能跨 await share ref，但本架构里
+///   每个事件源由单 task 独占持有，无需跨 task 共享，删 Sync 安全。
+/// - `async` next_bytes：未来 Phase B 的 perfbuf / FileReplay 可能需 await
+///   epoll/AsyncFd，trait 一开始就 async 避免后续破坏性改动。
+#[async_trait]
+pub trait EventSource: Send {
+    /// 取下一条事件字节。Ok(None) 表示暂无数据（非错误，调用方应 sleep）。
+    async fn next_bytes(&mut self) -> Result<Option<Vec<u8>>>;
+
+    /// 来源种类（用于运行时多态与日志展示）。
+    fn kind(&self) -> SourceKind;
+
+    /// 人类可读描述（含 tier、ringbuf 名等细节）。
     fn description(&self) -> &str;
-    fn is_mock(&self) -> bool;
+
+    /// 是否为 mock（用于跳过告警上报等）。
+    fn is_mock(&self) -> bool {
+        matches!(self.kind(), SourceKind::Mock)
+    }
 }
 
 // ========== Mock 事件源 ==========
@@ -188,8 +244,9 @@ impl MockEventSource {
     }
 }
 
+#[async_trait]
 impl EventSource for MockEventSource {
-    fn next_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+    async fn next_bytes(&mut self) -> Result<Option<Vec<u8>>> {
         if self.cursor >= self.events.len() {
             if self.loop_mode { self.cursor = 0; } else { return Ok(None); }
         }
@@ -197,13 +254,15 @@ impl EventSource for MockEventSource {
         self.cursor += 1;
         Ok(Some(data))
     }
-    fn description(&self) -> &str { "mock 事件源" }
+    fn kind(&self) -> SourceKind { SourceKind::Mock }
+    fn description(&self) -> &str { "mock 事件源（场景回放）" }
     fn is_mock(&self) -> bool { true }
 }
 
 // ========== Linux 真实事件源 (aya ring buffer) ==========
 // 注意：LinuxEventSource 已简化为 stub。
 // 真实 ring buffer 消费在 start.rs 中通过 loader.try_next_event() 直接调用。
+// A7 会用 EbpfModernSource 替换此 stub，真正通过 trait 路由 eBPF 事件。
 
 #[cfg(target_os = "linux")]
 pub struct LinuxEventSource;
@@ -214,12 +273,15 @@ impl LinuxEventSource {
 }
 
 #[cfg(target_os = "linux")]
+#[async_trait]
 impl EventSource for LinuxEventSource {
-    fn next_bytes(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        // stub — 真实消费由 start.rs 绕过此 trait 直接调 loader
+    async fn next_bytes(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        // stub — 真实消费由 start.rs 绕过此 trait 直接调 loader。
+        // A7 重构后由 EbpfModernSource 接管此职责。
         Ok(None)
     }
-    fn description(&self) -> &str { "Linux eBPF (via loader)" }
+    fn kind(&self) -> SourceKind { SourceKind::EbpfModern }
+    fn description(&self) -> &str { "Linux eBPF (stub — A7 替换中)" }
     fn is_mock(&self) -> bool { false }
 }
 
@@ -247,14 +309,17 @@ fn make_cstr_512(s: &str) -> [u8; 512] {
 }
 
 fn ipv4_to_u32(addr: &str) -> u32 {
+    // 与内核 bpf_probe_read_kernel 一致：网络字节序的字节直接拷入 u32 字段，
+    // Rust 读出来是 native-endian。用 from_ne_bytes 匹配内核行为。
     let parts: Vec<u8> = addr.split('.').filter_map(|p| p.parse::<u8>().ok()).collect();
-    if parts.len() == 4 { u32::from_be_bytes([parts[0], parts[1], parts[2], parts[3]]) } else { 0 }
+    if parts.len() == 4 { u32::from_ne_bytes([parts[0], parts[1], parts[2], parts[3]]) } else { 0 }
 }
 
 fn encode_struct<T: Copy>(s: &T) -> Vec<u8> {
     let size = core::mem::size_of::<T>();
     let mut data = vec![0u8; size];
-    unsafe { core::ptr::write_unaligned(data.as_mut_ptr() as *mut T, *s); }
+    // 直接从引用拷贝到 Vec，避免 *s 在栈上产生大结构体副本（ExecEvent ~800B）
+    unsafe { core::ptr::copy_nonoverlapping(s as *const T as *const u8, data.as_mut_ptr(), size); }
     data
 }
 
@@ -272,18 +337,56 @@ pub use mock_only::*;
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    pub use super::{EventSource, MockEventSource, MockScenario, LinuxEventSource};
-    /// 默认事件源（未传入 channel 时用 mock 兜底）
-    pub fn default_event_source() -> Box<dyn EventSource> {
-        log::warn!("default_event_source() 返回 mock（因未提供 eBPF receiver）");
-        Box::new(MockEventSource::new_with_all_scenarios().with_loop(true))
+    pub use super::{EventSource, MockEventSource, SourceKind};
+    use crate::tier_detect::detect_ebpf_tier;
+    use crate::ebpf_source::EbpfModernSource;
+    use crate::loader::EbpfLoader;
+
+    /// A8: 默认事件源 — 根据内核版本自动选择 eBPF tier。
+    ///
+    /// - 5.8+ → EbpfModernSource（加载 ks_main.o，attach 18 个程序）
+    /// - 4.x  → mock + warning（Phase B 实现 EbpfLegacySource 后切换）
+    /// - 3.10+ → mock + warning（Phase C 实现 EbpfAncientSource 后切换）
+    /// - 太老/读不到版本 → mock + warning
+    ///
+    /// 调用方需 .await（因为 EbpfLoader::start_all 是 async）。
+    pub async fn default_event_source() -> Box<dyn EventSource> {
+        match detect_ebpf_tier() {
+            Some(SourceKind::EbpfModern) => {
+                log::info!("[tier-detect] 当前内核支持 Modern tier (5.8+ ringbuf)");
+                let mut loader = EbpfLoader::new();
+                match loader.start_all().await {
+                    Ok(_) => {
+                        log::info!("[tier-detect] eBPF Modern tier 加载成功，{} 个程序已 attach",
+                                   loader.loaded_probes().len());
+                        return Box::new(EbpfModernSource::new(loader));
+                    }
+                    Err(e) => {
+                        log::warn!("[tier-detect] Modern tier 加载失败: {} — fallback mock", e);
+                    }
+                }
+                Box::new(MockEventSource::new_with_all_scenarios().with_loop(true))
+            }
+            Some(SourceKind::EbpfLegacy) => {
+                log::warn!("[tier-detect] 检测到 4.x 内核，Legacy tier 尚未实现（Phase B），fallback mock");
+                Box::new(MockEventSource::new_with_all_scenarios().with_loop(true))
+            }
+            Some(SourceKind::EbpfAncient) => {
+                log::warn!("[tier-detect] 检测到 3.10+ 内核，Ancient tier 尚未实现（Phase C 研究性突破），fallback mock");
+                Box::new(MockEventSource::new_with_all_scenarios().with_loop(true))
+            }
+            _ => {
+                log::warn!("[tier-detect] 内核版本无法识别或太老，fallback mock");
+                Box::new(MockEventSource::new_with_all_scenarios().with_loop(true))
+            }
+        }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 mod mock_only {
     pub use super::{EventSource, MockEventSource};
-    pub fn default_event_source() -> Box<dyn EventSource> {
+    pub async fn default_event_source() -> Box<dyn EventSource> {
         Box::new(MockEventSource::new_with_all_scenarios().with_loop(true))
     }
 }
@@ -293,23 +396,23 @@ mod tests {
     use super::*;
     use crate::aggregator::EventAggregator;
 
-    #[test]
-    fn test_mock_source_decodable() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mock_source_decodable() {
         let mut source = MockEventSource::new_with_all_scenarios().with_loop(false);
         let mut agg = EventAggregator::new(10000);
         let mut n = 0;
-        while let Ok(Some(bytes)) = source.next_bytes() {
+        while let Ok(Some(bytes)) = source.next_bytes().await {
             if agg.decode(&bytes).is_ok() { n += 1; }
         }
         assert!(n > 10);
     }
 
-    #[test]
-    fn test_reverse_shell_scenario() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_reverse_shell_scenario() {
         let mut source = MockEventSource::new_with_scenario(MockScenario::ReverseShell).with_loop(false);
         let mut agg = EventAggregator::new(10000);
         let mut events = Vec::new();
-        while let Ok(Some(bytes)) = source.next_bytes() {
+        while let Ok(Some(bytes)) = source.next_bytes().await {
             if let Ok(e) = agg.decode(&bytes) { events.push(e); }
         }
         assert_eq!(events.len(), 4);
@@ -319,6 +422,6 @@ mod tests {
     #[test]
     fn test_ipv4_encoding() {
         assert_eq!(ipv4_to_u32("8.8.8.8"), 0x08080808);
-        assert_eq!(ipv4_to_u32("10.0.0.1"), 0x0a000001);
+        assert_eq!(ipv4_to_u32("10.0.0.1"), u32::from_ne_bytes([10, 0, 0, 1]));
     }
 }
