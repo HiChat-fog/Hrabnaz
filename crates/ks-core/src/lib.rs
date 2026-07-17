@@ -1,6 +1,6 @@
+pub mod alert;
 pub mod event;
 pub mod rule;
-pub mod alert;
 
 use serde::{Deserialize, Serialize};
 

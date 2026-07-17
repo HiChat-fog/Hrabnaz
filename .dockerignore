@@ -1,0 +1,50 @@
+# KernelSentinel .dockerignore — 减小构建上下文、加速缓存命中
+# 规则: 忽略构建产物/缓存/无关文件，保留源码 + Cargo + vendor + rules
+
+# === Rust 构建产物 ===
+target/
+**/target/
+
+# === Git ===
+.git/
+.gitignore
+.gitattributes
+
+# === Node / 前端依赖 (前端在镜像外预构建) ===
+node_modules/
+**/node_modules/
+
+# === IDE / 工具缓存 ===
+.trae/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# === 文档 (保留 README.md) ===
+*.md
+!README.md
+
+# === 测试场景与 e2e 脚本 (运行时不需要) ===
+scenarios/
+
+# === 日志与运行时数据 ===
+logs/
+*.jsonl
+*.log
+*.gz
+
+# === 现有部署脚本 (Dockerfile 不需要) ===
+deploy/install.sh
+deploy/uninstall.sh
+deploy/kernelsentinel.service
+
+# === Docker 自身文件 (避免递归) ===
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# === CI / 其他 ===
+.github/
+.gitlab-ci.yml

@@ -9,6 +9,9 @@
 #   3. 编译 Rust 项目
 #   4. 运行测试
 #
+# 注: 原"阶段 3 构建 ks-frontend"已移除（申报书不涉及Web前端），
+#     历史痕迹见 git log。
+#
 # 前提:
 #   - 在 Docker 编译容器中运行
 #   - 需要 clang-15, bpftool, libbpf-dev

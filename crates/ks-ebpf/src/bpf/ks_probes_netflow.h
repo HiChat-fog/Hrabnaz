@@ -42,44 +42,34 @@ struct net_flow_event {
     u32 connect_count, _pad_flow1;
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, struct net_flow_key);
-    __type(value, struct net_flow_state);
-    __uint(max_entries, 8192);
-} net_flows SEC(".maps");
+KS_LRU_HASH_MAP(net_flows, struct net_flow_key, struct net_flow_state, 8192);
 
 struct port_scan_tracker {
     u32 scan_count, _pad_scan1, _pad_scan2;
     u64 first_scan_ns;
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, u32);
-    __type(value, struct port_scan_tracker);
-    __uint(max_entries, 4096);
-} port_scan_map SEC(".maps");
+KS_LRU_HASH_MAP(port_scan_map, u32, struct port_scan_tracker, 4096);
 
 KS_EVENT_MAP(flow_events, 256 * 1024);
 
-SEC("kprobe/tcp_v4_connect")
-int BPF_KPROBE(kprobe_tcp_v4_connect_flow, struct sock *sk, struct sockaddr *uaddr, int addr_len) {
+static __always_inline void netflow_handle_tcp_v4_connect(void *ctx, struct sock *sk, struct sockaddr *uaddr) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
-    if (pid == 0) return 0;
+    if (pid == 0) return;
     u64 now = bpf_ktime_get_ns();
 
     struct inet_sock *inet = (struct inet_sock *)sk;
     u32 saddr = BPF_CORE_READ(inet, inet_saddr);
     u16 sport = bpf_ntohs(BPF_CORE_READ(inet, inet_sport));
     struct sockaddr_in sin;
-    if (bpf_probe_read_kernel(&sin, sizeof(sin), uaddr) < 0) return 0;
+    if (bpf_probe_read_kernel(&sin, sizeof(sin), uaddr) < 0) return;
     u32 daddr = sin.sin_addr.s_addr;
     u16 dport = bpf_ntohs(sin.sin_port);
 
-    struct net_flow_key key = {.pid=pid, .saddr=saddr, .daddr=daddr,
-                               .sport=sport, .dport=dport, .proto=6, ._pad_key=0};
+    struct net_flow_key key = {};
+    key.pid=pid; key.saddr=saddr; key.daddr=daddr;
+    key.sport=sport; key.dport=dport; key.proto=6; key._pad_key=0;
     struct net_flow_state state = {};
     state.tcp_state=TCP_SYN_SENT; state.create_time_ns=now;
     state.last_update_ns=now; state.connect_count=1;
@@ -102,22 +92,23 @@ int BPF_KPROBE(kprobe_tcp_v4_connect_flow, struct sock *sk, struct sockaddr *uad
         if (scan->scan_count >= 20 && scan_duration < 30ULL * 1000 * 1000 * 1000)
             state.anomaly_flags |= FLOW_ANOMALY_PORT_SCAN;
     } else {
-        struct port_scan_tracker new_scan = {.scan_count=1, .first_scan_ns=now};
+        struct port_scan_tracker new_scan = {};
+        new_scan.scan_count = 1;
+        new_scan.first_scan_ns = now;
         bpf_map_update_elem(&port_scan_map, &pid, &new_scan, BPF_ANY);
     }
 
     if (state.anomaly_flags > 0) {
         struct net_flow_event *evt = KS_RESERVE(flow_events, struct net_flow_event);
-        if (!evt) return 0;
+        if (!evt) return;
         fill_header(&evt->header, EVENT_FLOW_CREATE);
         evt->pid=pid; evt->saddr=saddr; evt->daddr=daddr;
         evt->sport=sport; evt->dport=dport; evt->proto=6;
         evt->tcp_state=TCP_SYN_SENT; evt->anomaly_flags=state.anomaly_flags;
         evt->connect_count=state.connect_count;
-        KS_SUBMIT(evt);
+        KS_SUBMIT(ctx, flow_events, evt);
     }
     bpf_map_update_elem(&net_flows, &key, &state, BPF_ANY);
-    return 0;
 }
 
 SEC("kprobe/tcp_set_state")
@@ -166,7 +157,7 @@ int BPF_KPROBE(kprobe_tcp_set_state_flow, struct sock *sk, int new_state) {
         evt->byte_count=flow->byte_count; evt->packet_count=flow->packet_count;
         evt->duration_ns=now - flow->create_time_ns;
         evt->connect_count=flow->connect_count;
-        KS_SUBMIT(evt);
+        KS_SUBMIT(ctx, flow_events, evt);
     }
 
     if (our_state == TCP_CLOSED)

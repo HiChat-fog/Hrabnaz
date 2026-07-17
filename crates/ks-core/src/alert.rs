@@ -3,18 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressFamily {
     #[serde(rename = "IPv4")]
+    #[default]
     IPv4,
     #[serde(rename = "IPv6")]
     IPv6,
-}
-
-impl Default for AddressFamily {
-    fn default() -> Self {
-        AddressFamily::IPv4
-    }
 }
 
 impl fmt::Display for AddressFamily {
@@ -26,7 +21,7 @@ impl fmt::Display for AddressFamily {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     #[serde(rename = "TCP")]
     TCP,
@@ -35,13 +30,8 @@ pub enum Protocol {
     #[serde(rename = "ICMP")]
     ICMP,
     #[serde(rename = "OTHER")]
+    #[default]
     OTHER,
-}
-
-impl Default for Protocol {
-    fn default() -> Self {
-        Protocol::OTHER
-    }
 }
 
 impl fmt::Display for Protocol {
@@ -101,9 +91,10 @@ impl fmt::Display for FileOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlertStatus {
     #[serde(rename = "new")]
+    #[default]
     New,
     #[serde(rename = "investigating")]
     Investigating,
@@ -111,12 +102,6 @@ pub enum AlertStatus {
     Resolved,
     #[serde(rename = "false_positive")]
     FalsePositive,
-}
-
-impl Default for AlertStatus {
-    fn default() -> Self {
-        AlertStatus::New
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +118,9 @@ pub struct Alert {
     pub event_ids: Vec<u64>,
     pub mitre: Option<MitreInfo>,
     pub status: AlertStatus,
+    /// G4.2: 误报反馈 — None=未反馈, Some(true)=确认告警, Some(false)=误报
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +175,7 @@ impl Alert {
             event_ids: Vec::new(),
             mitre: None,
             status: AlertStatus::New,
+            feedback: None,
         }
     }
 }

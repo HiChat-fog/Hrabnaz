@@ -1,35 +1,33 @@
 use anyhow::Result;
+use std::sync::Arc;
 
-pub async fn run(port: u16) -> Result<()> {
+use crate::cmds::{build_server_config, SecurityArgs};
+
+/// F4: ks-cli `serve` 子命令入口 — 启动 standalone 数据服务模式。
+///
+/// 与 `start --serve <port>` 不同，此命令不加载 eBPF 探针，
+/// 仅启动 ks-server REST API + WebSocket。安全配置由 `SecurityArgs` 提供：
+/// - `--no-auth` / `--auth-token` / `KS_AUTH_TOKEN` 控制 API 鉴权
+/// - `--tls-cert` + `--tls-key` 启用 TLS；`--tls-client-ca` 启用 mTLS
+/// - `--rate-limit` 控制速率限制（默认 100/min/IP）
+/// - `--audit-log` 控制审计日志路径
+pub async fn run(port: u16, security: &SecurityArgs) -> Result<()> {
     println!("╔══════════════════════════════════════════╗");
-    println!("║  内核哨兵 — 数据服务模式                   ║");
+    println!("║  内核哨兵 — 数据服务模式 (standalone)       ║");
     println!("╚══════════════════════════════════════════╝");
     println!();
-    println!("端口配置: localhost:{}", port);
+    println!("REST API:   http://127.0.0.1:{}/api/v1/", port);
+    println!("WebSocket:  ws://127.0.0.1:{}/ws/alerts", port);
     println!();
-    println!("── 设计决策: CLI-first ──");
+    println!("提示: 此模式不启动 eBPF 探针。");
+    println!(
+        "      如需实时检测 + 数据服务，请用: kernelsentinel start --serve {}",
+        port
+    );
     println!();
-    println!("  内核哨兵不提供 Web 大屏可视化界面。");
-    println!("  原因:");
-    println!("    1. 核心价值 = eBPF 内核探针 + 哈希链取证, 不在数据展示");
-    println!("    2. 大屏会流于通用安全分析形态, 遮蔽内核级检测的独特创新");
-    println!("    3. CLI 与内核安全运维场景天然匹配");
-    println!("    4. replay 命令已提供攻击链可视化 + 哈希链校验");
-    println!();
-    println!("── 数据服务 (API) 扩展方向 ──");
-    println!();
-    println!("  当开发机到位后, 将实现 ks-server crate:");
-    println!("    REST API:   7 个分组, 20+ 端点 (见 docs/api-design.md)");
-    println!("    WebSocket:  实时告警推送 (供 SIEM/SOAR 消费)");
-    println!("    认证:       JWT (Admin/Analyst/Viewer 三级权限)");
-    println!("    目标:       不做独立前端, 而是做 API 数据源");
-    println!("                接入已有安全平台 (Security Onion, Wazuh, etc.)");
-    println!();
-    println!("── 当前可用命令 ──");
-    println!();
-    println!("  kernelsentinel start       → 启动探针 + 实时告警输出");
-    println!("  kernelsentinel replay <file> → 取证回放 (8 阶段分析)");
-    println!("  kernelsentinel status       → 系统状态 (探针 + Map + 配置)");
 
-    Ok(())
+    // F4: 用 SecurityArgs 构建 ServerConfig（auth/tls/audit/rate_limit）
+    let server_config = build_server_config(security);
+    let state = Arc::new(ks_server::ServerState::new());
+    ks_server::run_server_with_config(state, port, server_config).await
 }

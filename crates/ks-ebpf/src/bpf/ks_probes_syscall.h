@@ -53,6 +53,8 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
     long ret = ctx->ret;
     u32 syscall_nr = sctx->syscall_nr;
 
+    freq_handle_sys_exit(ctx, syscall_nr);
+
     if (syscall_nr == 59 && ret >= 0) {
         struct exec_event *evt = KS_RESERVE(events, struct exec_event);
         if (!evt) goto cleanup;
@@ -64,24 +66,27 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         const char __user *filename_ptr = (const char __user *)sctx->args[0];
         bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), filename_ptr);
 
+        // 3.10 verifier 无法追踪 map value 指针上的变量偏移 bounds，
+        // 手动展开 5 次调用，使用编译期常量偏移（0/64/128/192/256）。
         const char __user *const *argv_ptr = (const char __user *const *)sctx->args[1];
         if (argv_ptr) {
-            int offset = 0;
-            for (int i = 0; i < 5; i++) {
-                const char __user *arg_ptr;
-                if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[i]) < 0)
-                    break;
-                if (!arg_ptr) break;
-                if (offset >= 448) break;
-                int len = bpf_probe_read_user_str(evt->args + offset, 64, arg_ptr);
-                if (len <= 0) break;
-                offset += len;
-            }
+            const char __user *arg_ptr;
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[0]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(evt->args,       64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[1]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(evt->args + 64,  64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[2]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(evt->args + 128, 64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[3]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(evt->args + 192, 64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[4]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(evt->args + 256, 64, arg_ptr);
         }
 
-        infer_event(evt->header.pid, EVENT_PROCESS_EXEC,
+        int verdict = infer_event(evt->header.pid, EVENT_PROCESS_EXEC,
                     (const char *)evt->filename, 0, 0, 0, 0);
-        KS_SUBMIT(evt);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict);
+        KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
 
@@ -103,9 +108,10 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         evt->flags = (syscall_nr == 2) ? (i32)sctx->args[1] : (i32)sctx->args[2];
         evt->bytes = 0;
 
-        infer_event(evt->header.pid, EVENT_FILE_OPEN,
+        int verdict2 = infer_event(evt->header.pid, EVENT_FILE_OPEN,
                     (const char *)evt->filename, 0, 0, 0, 0);
-        KS_SUBMIT(evt);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict2);
+        KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
 
@@ -147,9 +153,10 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
             }
         }
 
-        infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
+        int verdict3 = infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
                     evt->daddr, evt->dport, evt->proto, 0);
-        KS_SUBMIT(evt);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict3);
+        KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
 
@@ -163,8 +170,9 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         evt->target_pid = (u32)sctx->args[1];
         evt->signal = (i32)sctx->args[0];
 
-        infer_event(evt->header.pid, EVENT_PROC_PTRACE, NULL, 0,0,0, evt->target_pid);
-        KS_SUBMIT(evt);
+        int verdict4 = infer_event(evt->header.pid, EVENT_PROC_PTRACE, NULL, 0,0,0, evt->target_pid);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict4);
+        KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
 
@@ -178,43 +186,14 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         evt->target_pid = (u32)sctx->args[0];
         evt->signal = (i32)sctx->args[1];
 
-        infer_event(evt->header.pid, EVENT_PROC_SIGNAL, NULL, 0,0,0, evt->target_pid);
-        KS_SUBMIT(evt);
+        int verdict5 = infer_event(evt->header.pid, EVENT_PROC_SIGNAL, NULL, 0,0,0, evt->target_pid);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict5);
+        KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
 
 cleanup:
     bpf_map_delete_elem(&syscall_ctxs, &pid_tgid);
-    return 0;
-}
-
-SEC("tracepoint/sched/sched_process_exec")
-int trace_sched_exec(struct trace_event_raw_sched_process_exec *ctx) {
-    struct signal_event *evt = KS_RESERVE(events, struct signal_event);
-    if (!evt) return 0;
-
-    fill_header(&evt->header, EVENT_PROCESS_EXEC);
-    evt->header.syscall_nr = 59;
-    evt->header.retval = 0;
-    evt->target_pid = 0;
-    evt->signal = 0;
-
-    KS_SUBMIT(evt);
-    return 0;
-}
-
-SEC("tracepoint/sched/sched_process_exit")
-int trace_sched_exit(struct trace_event_raw_sched_process_template *ctx) {
-    struct signal_event *evt = KS_RESERVE(events, struct signal_event);
-    if (!evt) return 0;
-
-    fill_header(&evt->header, EVENT_PROCESS_EXIT);
-    evt->header.syscall_nr = 0;
-    evt->header.retval = 0;
-    evt->target_pid = 0;
-    evt->signal = 0;
-
-    KS_SUBMIT(evt);
     return 0;
 }
 

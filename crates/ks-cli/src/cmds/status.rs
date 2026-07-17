@@ -1,7 +1,8 @@
 use anyhow::Result;
-use ks_engine::loader::BpfMapReader;
+use ks_engine::loader::{BpfMapReader, MockBpfMapReader};
+use std::sync::Arc;
 
-pub async fn run() -> Result<()> {
+pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("╔══════════════════════════════════════════╗");
     println!("║  内核哨兵 v0.1.0 — 系统状态报告            ║");
     println!("╚══════════════════════════════════════════╝");
@@ -11,23 +12,60 @@ pub async fn run() -> Result<()> {
     println!();
     println!("  已注册探针 (9 个): 内核态数据采集点");
     println!();
-    println!("  {:<4} {:<28} {:<10} {:<24} {:<8}", "#", "探针名称", "类型", "挂载点", "状态");
-    println!("  {} {} {} {} {}", "─".repeat(4), "─".repeat(28), "─".repeat(10), "─".repeat(24), "─".repeat(8));
+    println!(
+        "  {:<4} {:<28} {:<10} {:<24} {:<8}",
+        "#", "探针名称", "类型", "挂载点", "状态"
+    );
+    println!(
+        "  {} {} {} {} {}",
+        "─".repeat(4),
+        "─".repeat(28),
+        "─".repeat(10),
+        "─".repeat(24),
+        "─".repeat(8)
+    );
 
     let probes = [
-        ("trace_sys_enter",      "tracepoint", "raw_syscalls/sys_enter",    "已挂载"),
-        ("trace_sys_exit",       "tracepoint", "raw_syscalls/sys_exit",     "已挂载"),
-        ("trace_sched_exec",     "tracepoint", "sched/sched_process_exec",  "已挂载"),
-        ("trace_sched_exit",     "tracepoint", "sched/sched_process_exit",  "已挂载"),
-        ("kprobe_vfs_open",      "kprobe",     "vfs_open",                  "已挂载"),
-        ("kprobe_vfs_write",     "kprobe",     "vfs_write",                 "已挂载"),
-        ("kprobe_vfs_unlink",    "kprobe",     "vfs_unlink",                "已挂载"),
-        ("kprobe_tcp_connect",   "kprobe",     "tcp_v4_connect",            "已挂载"),
-        ("kprobe_udp_sendmsg",   "kprobe",     "udp_sendmsg",               "已挂载"),
+        (
+            "trace_sys_enter",
+            "tracepoint",
+            "raw_syscalls/sys_enter",
+            "已挂载",
+        ),
+        (
+            "trace_sys_exit",
+            "tracepoint",
+            "raw_syscalls/sys_exit",
+            "已挂载",
+        ),
+        (
+            "trace_sched_exec",
+            "tracepoint",
+            "sched/sched_process_exec",
+            "已挂载",
+        ),
+        (
+            "trace_sched_exit",
+            "tracepoint",
+            "sched/sched_process_exit",
+            "已挂载",
+        ),
+        ("kprobe_vfs_open", "kprobe", "vfs_open", "已挂载"),
+        ("kprobe_vfs_write", "kprobe", "vfs_write", "已挂载"),
+        ("kprobe_vfs_unlink", "kprobe", "vfs_unlink", "已挂载"),
+        ("kprobe_tcp_connect", "kprobe", "tcp_v4_connect", "已挂载"),
+        ("kprobe_udp_sendmsg", "kprobe", "udp_sendmsg", "已挂载"),
     ];
 
     for (i, (name, type_, mount, state)) in probes.iter().enumerate() {
-        println!("  {:<4} {:<28} {:<10} {:<24} {:<8}", i + 1, name, type_, mount, state);
+        println!(
+            "  {:<4} {:<28} {:<10} {:<24} {:<8}",
+            i + 1,
+            name,
+            type_,
+            mount,
+            state
+        );
     }
     println!();
     println!("  覆盖范围: 系统调用 × 5 + VFS 操作 × 3 + 网络协议栈 × 2");
@@ -38,15 +76,29 @@ pub async fn run() -> Result<()> {
     println!();
 
     let loader = ks_engine::loader::EbpfLoader::new();
-    let map_reader = loader.map_reader();
+    // Phase E1.2：map_reader() 现返回 Option<Arc<dyn BpfMapReader>>。
+    // EbpfLoader::new() 未加载 eBPF（bpf=None），map_reader() 返回 None，
+    // 用 MockBpfMapReader 兜底以保持 status 命令的静态展示功能。
+    let map_reader: Arc<dyn BpfMapReader> = match loader.map_reader() {
+        Some(mr) => mr,
+        None => Arc::new(MockBpfMapReader),
+    };
 
     let maps = map_reader.list_maps();
     println!("  已注册 Map ({} 个):", maps.len());
     for map_name in &maps {
-        let snapshot = map_reader.read_map(map_name).map_err(|e| anyhow::anyhow!("{}", e))?;
-        println!("    {} ({}, {} 条)", snapshot.name, snapshot.map_type, snapshot.entry_count);
+        let snapshot = map_reader
+            .read_map(map_name)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        println!(
+            "    {} ({}, {} 条)",
+            snapshot.name, snapshot.map_type, snapshot.entry_count
+        );
         for entry in &snapshot.entries {
-            println!("      key={}  value={}  {}", entry.key_hex, entry.value_hex, entry.value_display);
+            println!(
+                "      key={}  value={}  {}",
+                entry.key_hex, entry.value_hex, entry.value_display
+            );
         }
     }
 
@@ -97,14 +149,26 @@ pub async fn run() -> Result<()> {
     println!();
 
     let config = ks_engine::config::Config::default();
-    println!("  引擎缓冲区:   {} 条 (环形, O(1) 淘汰)", config.engine.buffer_size);
-    println!("  Ring Buffer:  {} KB × 4 探针", config.engine.ring_buffer_size_kb);
+    println!(
+        "  引擎缓冲区:   {} 条 (环形, O(1) 淘汰)",
+        config.engine.buffer_size
+    );
+    println!(
+        "  Ring Buffer:  {} KB × 4 探针",
+        config.engine.ring_buffer_size_kb
+    );
     println!("  批量消费:     {} 条/次", config.engine.batch_size);
-    println!("  异常阈值:     {:.2} (0.0~1.0, 超过则触发异常告警)", config.detection.anomaly_threshold);
+    println!(
+        "  异常阈值:     {:.2} (0.0~1.0, 超过则触发异常告警)",
+        config.detection.anomaly_threshold
+    );
     println!("  取证日志目录: {}", config.forensic.log_dir);
     println!("  轮转阈值:     {} MB", config.forensic.max_log_size_mb);
     println!("  CPU 上限:     < {}%", config.performance.max_cpu_percent);
-    println!("  内存上限:     < {} MB", config.performance.memory_limit_mb);
+    println!(
+        "  内存上限:     < {} MB",
+        config.performance.memory_limit_mb
+    );
 
     println!();
     #[cfg(not(target_os = "linux"))]
@@ -122,6 +186,35 @@ pub async fn run() -> Result<()> {
     println!("提示:");
     println!("  kernelsentinel start       → 启动实时监控");
     println!("  kernelsentinel replay <file> → 取证回放 (含哈希链校验 + 攻击链可视化)");
+
+    // 申报书第七步：status 动态监控模式 —— 定期清屏重绘探针状态与 Map 事件计数
+    if watch {
+        println!();
+        println!("── 动态监控模式 (每 {}s 刷新, Ctrl+C 退出) ──", interval);
+        let dur = std::time::Duration::from_secs(interval.max(1));
+        let mut tick: u64 = 0;
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\n已退出动态监控");
+                    break;
+                }
+                _ = tokio::time::sleep(dur) => {}
+            }
+            tick += 1;
+            print!("\x1B[2J\x1B[H"); // 清屏 + 光标归位
+            println!("╔ 动态状态 (第 {} 次刷新) ╗", tick);
+            for map_name in &maps {
+                if let Ok(s) = map_reader.read_map(map_name) {
+                    println!("  {:<20} {:<14} {} 条", s.name, s.map_type, s.entry_count);
+                }
+            }
+            match std::fs::read_to_string("/tmp/ks-status.json") {
+                Ok(content) => println!("  运行实例: {}", content.trim().replace('\n', " ")),
+                Err(_) => println!("  运行实例: (未检测到 start 进程)"),
+            }
+        }
+    }
 
     Ok(())
 }

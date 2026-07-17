@@ -50,6 +50,7 @@ pub struct ProcessTreeManager {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct AnomalyPattern {
     parent_comm: String,
     child_comm: String,
@@ -58,19 +59,64 @@ struct AnomalyPattern {
     mitre_technique: String,
 }
 
+impl Default for ProcessTreeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcessTreeManager {
     pub fn new() -> Self {
-        Self { nodes: HashMap::new(), anomaly_patterns: Self::default_anomaly_patterns() }
+        Self {
+            nodes: HashMap::new(),
+            anomaly_patterns: Self::default_anomaly_patterns(),
+        }
     }
 
     fn default_anomaly_patterns() -> Vec<AnomalyPattern> {
         vec![
-            AnomalyPattern { parent_comm: "systemd".into(), child_comm: "nc".into(), description: "系统服务执行网络工具，疑似反弹Shell".into(), mitre_tactic: "TA0001".into(), mitre_technique: "T1059.004".into() },
-            AnomalyPattern { parent_comm: "cron".into(), child_comm: "nc".into(), description: "定时任务执行nc，疑似C2".into(), mitre_tactic: "TA0003".into(), mitre_technique: "T1053.003".into() },
-            AnomalyPattern { parent_comm: "bash".into(), child_comm: "wget".into(), description: "Shell下载文件，可能是payload".into(), mitre_tactic: "TA0002".into(), mitre_technique: "T1105".into() },
-            AnomalyPattern { parent_comm: "sshd".into(), child_comm: "bash".into(), description: "SSH会话启动Shell".into(), mitre_tactic: "TA0001".into(), mitre_technique: "T1021.004".into() },
-            AnomalyPattern { parent_comm: "bash".into(), child_comm: "sudo".into(), description: "Shell调sudo提权".into(), mitre_tactic: "TA0004".into(), mitre_technique: "T1548.003".into() },
-            AnomalyPattern { parent_comm: "bash".into(), child_comm: "insmod".into(), description: "Shell加载内核模块，疑似Rootkit".into(), mitre_tactic: "TA0005".into(), mitre_technique: "T1547.006".into() },
+            AnomalyPattern {
+                parent_comm: "systemd".into(),
+                child_comm: "nc".into(),
+                description: "系统服务执行网络工具，疑似反弹Shell".into(),
+                mitre_tactic: "TA0001".into(),
+                mitre_technique: "T1059.004".into(),
+            },
+            AnomalyPattern {
+                parent_comm: "cron".into(),
+                child_comm: "nc".into(),
+                description: "定时任务执行nc，疑似C2".into(),
+                mitre_tactic: "TA0003".into(),
+                mitre_technique: "T1053.003".into(),
+            },
+            AnomalyPattern {
+                parent_comm: "bash".into(),
+                child_comm: "wget".into(),
+                description: "Shell下载文件，可能是payload".into(),
+                mitre_tactic: "TA0002".into(),
+                mitre_technique: "T1105".into(),
+            },
+            AnomalyPattern {
+                parent_comm: "sshd".into(),
+                child_comm: "bash".into(),
+                description: "SSH会话启动Shell".into(),
+                mitre_tactic: "TA0001".into(),
+                mitre_technique: "T1021.004".into(),
+            },
+            AnomalyPattern {
+                parent_comm: "bash".into(),
+                child_comm: "sudo".into(),
+                description: "Shell调sudo提权".into(),
+                mitre_tactic: "TA0004".into(),
+                mitre_technique: "T1548.003".into(),
+            },
+            AnomalyPattern {
+                parent_comm: "bash".into(),
+                child_comm: "insmod".into(),
+                description: "Shell加载内核模块，疑似Rootkit".into(),
+                mitre_tactic: "TA0005".into(),
+                mitre_technique: "T1547.006".into(),
+            },
         ]
     }
 
@@ -85,37 +131,75 @@ impl ProcessTreeManager {
         let timestamp_ns = event.header.timestamp_ns;
 
         let is_anomalous_child = if ppid > 0 {
-            let parent_comm = self.nodes.get(&ppid).map(|n| n.comm.clone()).unwrap_or_default();
-            self.anomaly_patterns.iter().any(|p| parent_comm.contains(&p.parent_comm) && comm.contains(&p.child_comm))
-        } else { false };
+            let parent_comm = self
+                .nodes
+                .get(&ppid)
+                .map(|n| n.comm.clone())
+                .unwrap_or_default();
+            self.anomaly_patterns
+                .iter()
+                .any(|p| parent_comm.contains(&p.parent_comm) && comm.contains(&p.child_comm))
+        } else {
+            false
+        };
 
         if let Some(node) = self.nodes.get_mut(&pid) {
-            if event_type == 1 { node.comm = comm.clone(); if let Some(f) = &filename { node.exe_path = f.clone(); } }
-            else if event_type == 2 { node.exit_time_ns = timestamp_ns; }
+            if event_type == 1 {
+                node.comm = comm.clone();
+                if let Some(f) = &filename {
+                    node.exe_path = f.clone();
+                }
+            } else if event_type == 2 {
+                node.exit_time_ns = timestamp_ns;
+            }
             node.events.push(event.clone());
-            if uid == 0 { node.flags.is_root = true; }
-            if is_anomalous_child { node.flags.is_anomalous = true; }
+            if uid == 0 {
+                node.flags.is_root = true;
+            }
+            if is_anomalous_child {
+                node.flags.is_anomalous = true;
+            }
         } else {
-            self.nodes.insert(pid, ProcessNode {
-                pid, ppid, comm: comm.clone(), exe_path: filename.unwrap_or_default(),
-                create_time_ns: timestamp_ns, exit_time_ns: 0,
-                flags: ProcessFlags { is_root: uid == 0, is_container: false, is_orphan: false, is_anomalous: is_anomalous_child },
-                risk_score: 0, events: vec![event.clone()], children: Vec::new(),
-            });
+            self.nodes.insert(
+                pid,
+                ProcessNode {
+                    pid,
+                    ppid,
+                    comm: comm.clone(),
+                    exe_path: filename.unwrap_or_default(),
+                    create_time_ns: timestamp_ns,
+                    exit_time_ns: 0,
+                    flags: ProcessFlags {
+                        is_root: uid == 0,
+                        is_container: false,
+                        is_orphan: false,
+                        is_anomalous: is_anomalous_child,
+                    },
+                    risk_score: 0,
+                    events: vec![event.clone()],
+                    children: Vec::new(),
+                },
+            );
         }
 
         if ppid > 0 && self.nodes.contains_key(&ppid) {
             let parent = self.nodes.get_mut(&ppid).unwrap();
-            if !parent.children.contains(&pid) { parent.children.push(pid); }
+            if !parent.children.contains(&pid) {
+                parent.children.push(pid);
+            }
         }
     }
 
-    pub fn get_node(&self, pid: u32) -> Option<&ProcessNode> { self.nodes.get(&pid) }
+    pub fn get_node(&self, pid: u32) -> Option<&ProcessNode> {
+        self.nodes.get(&pid)
+    }
 
     /// BFS 遍历进程树
     pub fn get_family(&self, root_pid: u32) -> Option<ProcessFamily> {
         let root = self.nodes.get(&root_pid)?;
-        if root.events.is_empty() && root.children.is_empty() { return None; }
+        if root.events.is_empty() && root.children.is_empty() {
+            return None;
+        }
 
         let mut member_pids = HashSet::new();
         let mut all_events = Vec::new();
@@ -126,51 +210,93 @@ impl ProcessTreeManager {
         let mut queue = vec![root_pid];
 
         while let Some(pid) = queue.pop() {
-            if member_pids.contains(&pid) { continue; }
+            if member_pids.contains(&pid) {
+                continue;
+            }
             member_pids.insert(pid);
-            let node = match self.nodes.get(&pid){Some(n)=>n,None=>continue};
+            let node = match self.nodes.get(&pid) {
+                Some(n) => n,
+                None => continue,
+            };
             all_events.extend(node.events.iter().cloned());
             max_risk_score = max_risk_score.max(node.risk_score);
-            if node.flags.is_root { has_root_process = true; }
-            if node.flags.is_anomalous { has_anomalous_process = true; }
+            if node.flags.is_root {
+                has_root_process = true;
+            }
+            if node.flags.is_anomalous {
+                has_anomalous_process = true;
+            }
 
             if node.ppid > 0 {
-                let pc = self.nodes.get(&node.ppid).map(|p| p.comm.clone()).unwrap_or_default();
+                let pc = self
+                    .nodes
+                    .get(&node.ppid)
+                    .map(|p| p.comm.clone())
+                    .unwrap_or_default();
                 for pattern in &self.anomaly_patterns {
-                    if pc.contains(&pattern.parent_comm) && node.comm.contains(&pattern.child_comm) {
+                    if pc.contains(&pattern.parent_comm) && node.comm.contains(&pattern.child_comm)
+                    {
                         anomaly_relations.push(AnomalyRelation {
-                            parent_comm: pc.clone(), child_comm: node.comm.clone(),
-                            parent_pid: node.ppid, child_pid: node.pid,
+                            parent_comm: pc.clone(),
+                            child_comm: node.comm.clone(),
+                            parent_pid: node.ppid,
+                            child_pid: node.pid,
                             anomaly_type: pattern.description.clone(),
                         });
                     }
                 }
             }
-            for child in &node.children { queue.push(*child); }
+            for child in &node.children {
+                queue.push(*child);
+            }
         }
 
         all_events.sort_by_key(|e| e.header.timestamp_ns);
-        Some(ProcessFamily { root_pid, member_pids, all_events, max_risk_score, has_root_process, has_anomalous_process, anomaly_relations })
+        Some(ProcessFamily {
+            root_pid,
+            member_pids,
+            all_events,
+            max_risk_score,
+            has_root_process,
+            has_anomalous_process,
+            anomaly_relations,
+        })
     }
 
     pub fn all_families(&self) -> Vec<ProcessFamily> {
-        let roots: Vec<u32> = self.nodes.iter().filter(|(_, n)| n.ppid == 0 || !self.nodes.contains_key(&n.ppid)).map(|(pid, _)| *pid).collect();
-        roots.iter().filter_map(|pid| self.get_family(*pid)).collect()
+        let roots: Vec<u32> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.ppid == 0 || !self.nodes.contains_key(&n.ppid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        roots
+            .iter()
+            .filter_map(|pid| self.get_family(*pid))
+            .collect()
     }
 
     pub fn anomalous_families(&self) -> Vec<ProcessFamily> {
-        self.all_families().into_iter().filter(|f| f.has_anomalous_process || !f.anomaly_relations.is_empty()).collect()
+        self.all_families()
+            .into_iter()
+            .filter(|f| f.has_anomalous_process || !f.anomaly_relations.is_empty())
+            .collect()
     }
 
     /// 基于进程族的事件链还原（升级版 chain.rs）
     pub fn reconstruct_tree_attack_chain(&self, family: &ProcessFamily) -> Option<TreeAttackChain> {
-        if family.all_events.is_empty() { return None; }
+        if family.all_events.is_empty() {
+            return None;
+        }
         let reconstructor = crate::chain::ChainReconstructor::new();
         let chain = reconstructor.reconstruct(&family.all_events)?;
         Some(TreeAttackChain {
-            root_pid: family.root_pid, member_pids: family.member_pids.clone(),
-            steps: chain.steps, confidence: chain.confidence,
-            has_root_process: family.has_root_process, has_anomalous_process: family.has_anomalous_process,
+            root_pid: family.root_pid,
+            member_pids: family.member_pids.clone(),
+            steps: chain.steps,
+            confidence: chain.confidence,
+            has_root_process: family.has_root_process,
+            has_anomalous_process: family.has_anomalous_process,
             anomaly_relations: family.anomaly_relations.clone(),
         })
     }
@@ -192,13 +318,50 @@ mod tests {
     use super::*;
     use ks_core::event::EventHeader;
 
-    fn make_event(seq: u64, pid: u32, ppid: u32, et: u32, comm: &str, uid: u32, filename: Option<&str>) -> DecodedEvent {
+    fn make_event(
+        seq: u64,
+        pid: u32,
+        ppid: u32,
+        et: u32,
+        comm: &str,
+        uid: u32,
+        filename: Option<&str>,
+    ) -> DecodedEvent {
         let mut cb = [0u8; 16];
         let len = comm.len().min(16);
         cb[..len].copy_from_slice(&comm.as_bytes()[..len]);
-        DecodedEvent { seq, comm: comm.to_string(),
-            header: EventHeader { event_type: et, _pad1: 0, timestamp_ns: seq * 1_000_000_000, pid, tid: 0, uid, ppid, comm: cb, syscall_nr: 0, _pad2: 0, retval: 0 },
-            filename: filename.map(|s| s.to_string()), args: None, saddr: None, daddr: None, sport: None, dport: None, proto: None, target_pid: None, signal: None, file_bytes: None,
+        DecodedEvent {
+            seq,
+            comm: comm.to_string(),
+            header: EventHeader {
+                event_type: et,
+                _pad1: 0,
+                timestamp_ns: seq * 1_000_000_000,
+                pid,
+                tid: 0,
+                uid,
+                ppid,
+                comm: cb,
+                syscall_nr: 0,
+                _pad2: 0,
+                retval: 0,
+            },
+            filename: filename.map(|s| s.to_string()),
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
         }
     }
 
@@ -206,7 +369,15 @@ mod tests {
     fn test_process_tree_basic() {
         let mut tree = ProcessTreeManager::new();
         tree.update_from_event(&make_event(1, 100, 1, 1, "bash", 0, Some("/bin/bash")));
-        tree.update_from_event(&make_event(2, 101, 100, 1, "wget", 1000, Some("/usr/bin/wget")));
+        tree.update_from_event(&make_event(
+            2,
+            101,
+            100,
+            1,
+            "wget",
+            1000,
+            Some("/usr/bin/wget"),
+        ));
         let parent = tree.get_node(100).unwrap();
         assert!(parent.children.contains(&101));
         assert_eq!(tree.get_node(101).unwrap().ppid, 100);
@@ -219,7 +390,7 @@ mod tests {
         tree.update_from_event(&make_event(2, 101, 100, 1, "wget", 1000, None));
         let anomalous = tree.anomalous_families();
         assert!(!anomalous.is_empty());
-        assert!(anomalous[0].anomaly_relations.len() >= 1);
+        assert!(!anomalous[0].anomaly_relations.is_empty());
     }
 
     #[test]

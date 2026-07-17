@@ -1,7 +1,10 @@
-use ks_core::rule::{DetectionRule, Condition, Operator, MatchResult, Field};
-use ks_core::alert::{Alert, ProcessInfo, NetworkInfo, FileInfo, MitreInfo, AddressFamily, Protocol, FileOperation, AlertStatus};
 use crate::aggregator::DecodedEvent;
 use anyhow::Result;
+use ks_core::alert::{
+    AddressFamily, Alert, AlertStatus, FileInfo, FileOperation, MitreInfo, NetworkInfo,
+    ProcessInfo, Protocol,
+};
+use ks_core::rule::{Condition, DetectionRule, Field, MatchResult, Operator};
 use log::{info, warn};
 
 pub struct DetectionEngine {
@@ -9,9 +12,18 @@ pub struct DetectionEngine {
     rules_index: std::collections::HashMap<String, usize>,
 }
 
+impl Default for DetectionEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DetectionEngine {
     pub fn new() -> Self {
-        Self { rules: Vec::new(), rules_index: std::collections::HashMap::new() }
+        Self {
+            rules: Vec::new(),
+            rules_index: std::collections::HashMap::new(),
+        }
     }
 
     pub fn load_rules_from_yaml(&mut self, yaml_content: &str) -> Result<usize> {
@@ -26,7 +38,9 @@ impl DetectionEngine {
         Ok(count)
     }
 
-    pub fn rule_count(&self) -> usize { self.rules.len() }
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
 
     /// 单事件匹配所有规则，返回命中的规则列表
     pub fn match_event(&self, event: &DecodedEvent) -> Vec<MatchResult> {
@@ -37,7 +51,9 @@ impl DetectionEngine {
                     rule_name: rule.name.clone(),
                     severity: rule.severity.clone(),
                     alert_message: rule.alert_message.clone(),
-                    matched_conditions: rule.conditions.iter()
+                    matched_conditions: rule
+                        .conditions
+                        .iter()
                         .map(|c| format!("{} {} {}", c.field, op_to_str(&c.operator), c.value))
                         .collect(),
                 });
@@ -47,7 +63,9 @@ impl DetectionEngine {
     }
 
     fn rule_matches(&self, rule: &DetectionRule, event: &DecodedEvent) -> bool {
-        rule.conditions.iter().all(|cond| self.condition_matches(cond, event))
+        rule.conditions
+            .iter()
+            .all(|cond| self.condition_matches(cond, event))
     }
 
     fn condition_matches(&self, cond: &Condition, event: &DecodedEvent) -> bool {
@@ -56,13 +74,19 @@ impl DetectionEngine {
             Field::Pid => match_u32(event.header.pid, &cond.operator, &cond.value),
             Field::Uid => match_u32(event.header.uid, &cond.operator, &cond.value),
             Field::Ppid => match_u32(event.header.ppid, &cond.operator, &cond.value),
-            Field::Dport => match_opt_u32(event.dport.map(|v| v as u32), &cond.operator, &cond.value),
-            Field::Sport => match_opt_u32(event.sport.map(|v| v as u32), &cond.operator, &cond.value),
+            Field::Dport => {
+                match_opt_u32(event.dport.map(|v| v as u32), &cond.operator, &cond.value)
+            }
+            Field::Sport => {
+                match_opt_u32(event.sport.map(|v| v as u32), &cond.operator, &cond.value)
+            }
             Field::TargetPid => match_opt_u32(event.target_pid, &cond.operator, &cond.value),
             Field::Signal => match_opt_i32(event.signal, &cond.operator, &cond.value),
             Field::FileBytes => match_opt_u64(event.file_bytes, &cond.operator, &cond.value),
             Field::Comm => match_str(&event.comm, &cond.operator, &cond.value),
-            Field::Filename => match_opt_str(event.filename.as_deref(), &cond.operator, &cond.value),
+            Field::Filename => {
+                match_opt_str(event.filename.as_deref(), &cond.operator, &cond.value)
+            }
             Field::Args => match_opt_str(event.args.as_deref(), &cond.operator, &cond.value),
             Field::Saddr => match_opt_str(event.saddr.as_deref(), &cond.operator, &cond.value),
             Field::Daddr => match_opt_str(event.daddr.as_deref(), &cond.operator, &cond.value),
@@ -70,39 +94,60 @@ impl DetectionEngine {
             Field::Saddr6 => match_ipv6_field(event.saddr.as_deref(), &cond.operator, &cond.value),
             Field::Daddr6 => match_ipv6_field(event.daddr.as_deref(), &cond.operator, &cond.value),
             Field::Family => {
-                let inferred_family = event.saddr.as_ref().map(|a| {
-                    if a.contains(':') { "IPv6" } else { "IPv4" }
-                });
+                let inferred_family =
+                    event
+                        .saddr
+                        .as_ref()
+                        .map(|a| if a.contains(':') { "IPv6" } else { "IPv4" });
                 match_family_field(inferred_family, &cond.operator, &cond.value)
             }
+            // E4.4 新增字段: 容器逃逸 / LKM 加载 / eBPF 篡改
+            Field::ModuleName => {
+                match_opt_str(event.module_name.as_deref(), &cond.operator, &cond.value)
+            }
+            Field::ProgName => {
+                match_opt_str(event.prog_name.as_deref(), &cond.operator, &cond.value)
+            }
+            Field::SourceNsInum => match_opt_u32(event.source_ns_inum, &cond.operator, &cond.value),
+            Field::TargetNsInum => match_opt_u32(event.target_ns_inum, &cond.operator, &cond.value),
+            Field::CapEff => match_opt_u32(event.cap_eff, &cond.operator, &cond.value),
+            Field::Action => match_opt_str(event.action.as_deref(), &cond.operator, &cond.value),
         }
     }
 
     /// 从匹配结果组装告警
     pub fn generate_alert(&self, result: &MatchResult, event: &DecodedEvent) -> Alert {
-        let mitre = self.rules_index.get(&result.rule_name)
+        let mitre = self
+            .rules_index
+            .get(&result.rule_name)
             .map(|idx| &self.rules[*idx])
-            .and_then(|r| {
-                match (&r.mitre_tactic, &r.mitre_technique) {
-                    (Some(tactic), Some(technique)) => Some(MitreInfo {
-                        tactic: tactic.clone(),
-                        technique: technique.clone(),
-                        sub_technique: None,
-                    }),
-                    _ => None,
-                }
+            .and_then(|r| match (&r.mitre_tactic, &r.mitre_technique) {
+                (Some(tactic), Some(technique)) => Some(MitreInfo {
+                    tactic: tactic.clone(),
+                    technique: technique.clone(),
+                    sub_technique: None,
+                }),
+                _ => None,
             });
 
         let family = event.saddr.as_ref().map(|addr| {
-            if addr.contains(':') { AddressFamily::IPv6 } else { AddressFamily::IPv4 }
+            if addr.contains(':') {
+                AddressFamily::IPv6
+            } else {
+                AddressFamily::IPv4
+            }
         });
 
-        let proto = event.proto.as_ref().map(|p| match p.as_str() {
-            "TCP" => Protocol::TCP,
-            "UDP" => Protocol::UDP,
-            "ICMP" => Protocol::ICMP,
-            _ => Protocol::OTHER,
-        }).unwrap_or_default();
+        let proto = event
+            .proto
+            .as_ref()
+            .map(|p| match p.as_str() {
+                "TCP" => Protocol::TCP,
+                "UDP" => Protocol::UDP,
+                "ICMP" => Protocol::ICMP,
+                _ => Protocol::OTHER,
+            })
+            .unwrap_or_default();
 
         Alert {
             id: uuid::Uuid::new_v4(),
@@ -123,8 +168,16 @@ impl DetectionEngine {
                 Some(NetworkInfo {
                     saddr: event.saddr.clone().unwrap_or_default(),
                     daddr: event.daddr.clone().unwrap_or_default(),
-                    saddr6: if family == Some(AddressFamily::IPv6) { event.saddr.clone() } else { None },
-                    daddr6: if family == Some(AddressFamily::IPv6) { event.daddr.clone() } else { None },
+                    saddr6: if family == Some(AddressFamily::IPv6) {
+                        event.saddr.clone()
+                    } else {
+                        None
+                    },
+                    daddr6: if family == Some(AddressFamily::IPv6) {
+                        event.daddr.clone()
+                    } else {
+                        None
+                    },
                     family,
                     sport: event.sport.unwrap_or(0),
                     dport: event.dport.unwrap_or(0),
@@ -145,6 +198,7 @@ impl DetectionEngine {
             event_ids: vec![event.seq],
             mitre,
             status: AlertStatus::New,
+            feedback: None,
         }
     }
 
@@ -155,9 +209,12 @@ impl DetectionEngine {
         let now_ns = event.header.timestamp_ns;
 
         // 系统调用频率
-        let recent_syscalls = history.iter()
-            .filter(|e| e.header.pid == event.header.pid
-                && now_ns.saturating_sub(e.header.timestamp_ns) < window_ns)
+        let recent_syscalls = history
+            .iter()
+            .filter(|e| {
+                e.header.pid == event.header.pid
+                    && now_ns.saturating_sub(e.header.timestamp_ns) < window_ns
+            })
             .count();
         if recent_syscalls > 500 {
             score += 0.4;
@@ -167,17 +224,36 @@ impl DetectionEngine {
 
         // 敏感文件访问
         if let Some(ref fname) = event.filename {
-            for sensitive in &["/etc/shadow", "/root/.ssh", "/etc/ssl/private", "/root/.gnupg"] {
-                if fname.contains(sensitive) { score += 0.5; break; }
+            for sensitive in &[
+                "/etc/shadow",
+                "/root/.ssh",
+                "/etc/ssl/private",
+                "/root/.gnupg",
+            ] {
+                if fname.contains(sensitive) {
+                    score += 0.5;
+                    break;
+                }
             }
             if score < 0.5 {
-                for sensitive in &["/etc/passwd", "/etc/sudoers", "/etc/crontab", "/etc/ssh/sshd_config"] {
-                    if fname.contains(sensitive) { score += 0.35; break; }
+                for sensitive in &[
+                    "/etc/passwd",
+                    "/etc/sudoers",
+                    "/etc/crontab",
+                    "/etc/ssh/sshd_config",
+                ] {
+                    if fname.contains(sensitive) {
+                        score += 0.35;
+                        break;
+                    }
                 }
             }
             if score < 0.35 {
                 for sensitive in &["/var/log", "/proc/", "/etc/hosts"] {
-                    if fname.contains(sensitive) { score += 0.15; break; }
+                    if fname.contains(sensitive) {
+                        score += 0.15;
+                        break;
+                    }
                 }
             }
         }
@@ -185,11 +261,20 @@ impl DetectionEngine {
         // 可疑命令特征
         let args = event.args.as_deref().unwrap_or("");
         let suspicious_patterns: &[(&str, f64)] = &[
-            ("bash -i", 0.5), ("/dev/tcp", 0.5), ("python -c", 0.4),
-            ("nc -e", 0.5), ("wget", 0.2), ("curl", 0.2),
-            ("chmod +s", 0.4), ("chmod u+s", 0.4), ("chmod 4755", 0.4),
-            ("LD_PRELOAD", 0.4), ("ptrace", 0.4), ("nohup", 0.2),
-            ("base64 -d", 0.3), ("mkfifo", 0.3),
+            ("bash -i", 0.5),
+            ("/dev/tcp", 0.5),
+            ("python -c", 0.4),
+            ("nc -e", 0.5),
+            ("wget", 0.2),
+            ("curl", 0.2),
+            ("chmod +s", 0.4),
+            ("chmod u+s", 0.4),
+            ("chmod 4755", 0.4),
+            ("LD_PRELOAD", 0.4),
+            ("ptrace", 0.4),
+            ("nohup", 0.2),
+            ("base64 -d", 0.3),
+            ("mkfifo", 0.3),
         ];
         for (pattern, weight) in suspicious_patterns {
             if event.comm.contains(pattern) || args.contains(pattern) {
@@ -201,11 +286,21 @@ impl DetectionEngine {
         // 勒索软件扩展名
         if let Some(ref fname) = event.filename {
             let ransomware_extensions: &[&str] = &[
-                ".encrypted", ".locked", ".crypto",
-                ".ryuk", ".wanna", ".cerber", ".crypt", ".cry", ".locky",
+                ".encrypted",
+                ".locked",
+                ".crypto",
+                ".ryuk",
+                ".wanna",
+                ".cerber",
+                ".crypt",
+                ".cry",
+                ".locky",
             ];
             for ext in ransomware_extensions {
-                if fname.contains(ext) { score += 0.4; break; }
+                if fname.contains(ext) {
+                    score += 0.4;
+                    break;
+                }
             }
         }
 
@@ -218,7 +313,9 @@ impl DetectionEngine {
                 score += 0.2;
             }
             if let Some(ref daddr) = event.daddr {
-                if !is_private_ip(daddr) { score += 0.1; }
+                if !is_private_ip(daddr) {
+                    score += 0.1;
+                }
             }
         }
 
@@ -230,11 +327,18 @@ impl DetectionEngine {
 
 fn match_i32(value: i32, op: &Operator, target: &str) -> bool {
     match op {
-        Operator::Equals | Operator::GreaterThan | Operator::LessThan |
-        Operator::GreaterThanOrEqual | Operator::LessThanOrEqual | Operator::NotEquals => {
+        Operator::Equals
+        | Operator::GreaterThan
+        | Operator::LessThan
+        | Operator::GreaterThanOrEqual
+        | Operator::LessThanOrEqual
+        | Operator::NotEquals => {
             let target_val: i32 = match target.parse() {
                 Ok(v) => v,
-                Err(_) => { warn!("'{}' 不是有效的 i32", target); return false; }
+                Err(_) => {
+                    warn!("'{}' 不是有效的 i32", target);
+                    return false;
+                }
             };
             match op {
                 Operator::Equals => value == target_val,
@@ -254,11 +358,18 @@ fn match_i32(value: i32, op: &Operator, target: &str) -> bool {
 
 fn match_u32(value: u32, op: &Operator, target: &str) -> bool {
     match op {
-        Operator::Equals | Operator::GreaterThan | Operator::LessThan |
-        Operator::GreaterThanOrEqual | Operator::LessThanOrEqual | Operator::NotEquals => {
+        Operator::Equals
+        | Operator::GreaterThan
+        | Operator::LessThan
+        | Operator::GreaterThanOrEqual
+        | Operator::LessThanOrEqual
+        | Operator::NotEquals => {
             let target_val: u32 = match target.parse() {
                 Ok(v) => v,
-                Err(_) => { warn!("'{}' 不是有效的 u32", target); return false; }
+                Err(_) => {
+                    warn!("'{}' 不是有效的 u32", target);
+                    return false;
+                }
             };
             match op {
                 Operator::Equals => value == target_val,
@@ -277,17 +388,26 @@ fn match_u32(value: u32, op: &Operator, target: &str) -> bool {
 }
 
 fn match_opt_u32(value: Option<u32>, op: &Operator, target: &str) -> bool {
-    match value { Some(v) => match_u32(v, op, target), None => false }
+    match value {
+        Some(v) => match_u32(v, op, target),
+        None => false,
+    }
 }
 
 fn match_opt_i32(value: Option<i32>, op: &Operator, target: &str) -> bool {
-    match value { Some(v) => match_i32(v, op, target), None => false }
+    match value {
+        Some(v) => match_i32(v, op, target),
+        None => false,
+    }
 }
 
 fn match_opt_u64(value: Option<u64>, op: &Operator, target: &str) -> bool {
     let target_val: u64 = match target.parse() {
         Ok(v) => v,
-        Err(_) => { warn!("'{}' 不是有效的 u64", target); return false; }
+        Err(_) => {
+            warn!("'{}' 不是有效的 u64", target);
+            return false;
+        }
     };
     match value {
         Some(v) => match op {
@@ -309,14 +429,17 @@ fn match_str(value: &str, op: &Operator, target: &str) -> bool {
         Operator::NotEquals => value != target,
         Operator::Contains => value.contains(target),
         Operator::StartsWith => value.starts_with(target),
-        Operator::Regex => {
-            match regex::Regex::new(target) {
-                Ok(re) => re.is_match(value),
-                Err(e) => { warn!("正则无效: '{}' — {}", target, e); false }
+        Operator::Regex => match regex::Regex::new(target) {
+            Ok(re) => re.is_match(value),
+            Err(e) => {
+                warn!("正则无效: '{}' — {}", target, e);
+                false
             }
-        }
-        Operator::GreaterThan | Operator::LessThan |
-        Operator::GreaterThanOrEqual | Operator::LessThanOrEqual => {
+        },
+        Operator::GreaterThan
+        | Operator::LessThan
+        | Operator::GreaterThanOrEqual
+        | Operator::LessThanOrEqual => {
             let a: f64 = value.parse().unwrap_or(0.0);
             let b: f64 = target.parse().unwrap_or(0.0);
             match op {
@@ -331,22 +454,35 @@ fn match_str(value: &str, op: &Operator, target: &str) -> bool {
 }
 
 fn match_opt_str(value: Option<&str>, op: &Operator, target: &str) -> bool {
-    match value { Some(v) => match_str(v, op, target), None => false }
+    match value {
+        Some(v) => match_str(v, op, target),
+        None => false,
+    }
 }
 
 fn is_private_ip(addr: &str) -> bool {
-    if addr.starts_with("10.") { return true; }
-    if addr.starts_with("192.168.") { return true; }
+    if addr.starts_with("10.") {
+        return true;
+    }
+    if addr.starts_with("192.168.") {
+        return true;
+    }
     if addr.starts_with("172.") {
         let parts: Vec<&str> = addr.split('.').collect();
         if parts.len() >= 2 {
             if let Ok(second_octet) = parts[1].parse::<u8>() {
-                if second_octet >= 16 && second_octet <= 31 { return true; }
+                if (16..=31).contains(&second_octet) {
+                    return true;
+                }
             }
         }
     }
-    if addr.starts_with("127.") { return true; }
-    if addr.starts_with("fc") || addr.starts_with("fd") || addr == "::1" { return true; }
+    if addr.starts_with("127.") {
+        return true;
+    }
+    if addr.starts_with("fc") || addr.starts_with("fd") || addr == "::1" {
+        return true;
+    }
     false
 }
 
@@ -370,8 +506,11 @@ fn match_ipv6_field(value: Option<&str>, op: &Operator, target: &str) -> bool {
 
 fn match_family_field(value: Option<&str>, op: &Operator, target: &str) -> bool {
     match op {
-        Operator::Equals => value.map_or(false, |v| v == target),
-        _ => { log::warn!("Family 字段不支持 {:?} 操作符", op); false }
+        Operator::Equals => value == Some(target),
+        _ => {
+            log::warn!("Family 字段不支持 {:?} 操作符", op);
+            false
+        }
     }
 }
 
@@ -410,9 +549,17 @@ mod tests {
 
     fn make_header(event_type: u32, pid: u32) -> EventHeader {
         EventHeader {
-            event_type, _pad1: 0, timestamp_ns: 100_000_000_000,
-            pid, tid: 0, uid: 0, ppid: 0,
-            comm: [0; 16], syscall_nr: 0, _pad2: 0, retval: 0,
+            event_type,
+            _pad1: 0,
+            timestamp_ns: 100_000_000_000,
+            pid,
+            tid: 0,
+            uid: 0,
+            ppid: 0,
+            comm: [0; 16],
+            syscall_nr: 0,
+            _pad2: 0,
+            retval: 0,
         }
     }
 
@@ -431,10 +578,25 @@ mod tests {
         let mut engine = DetectionEngine::new();
         engine.load_rules_from_yaml(yaml).unwrap();
         let event = DecodedEvent {
-            seq: 1, header: make_header(10, 100), comm: "cat".to_string(),
+            seq: 1,
+            header: make_header(10, 100),
+            comm: "cat".to_string(),
             filename: Some("/etc/shadow".to_string()),
-            args: None, saddr: None, daddr: None, sport: None, dport: None, proto: None,
-            target_pid: None, signal: None, file_bytes: None,
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
         };
         let results = engine.match_event(&event);
         assert_eq!(results.len(), 1);
@@ -444,9 +606,25 @@ mod tests {
     fn test_anomaly_score_baseline() {
         let engine = DetectionEngine::new();
         let event = DecodedEvent {
-            seq: 1, header: make_header(2, 100), comm: "ls".to_string(),
-            filename: None, args: None, saddr: None, daddr: None, sport: None, dport: None, proto: None,
-            target_pid: None, signal: None, file_bytes: None,
+            seq: 1,
+            header: make_header(2, 100),
+            comm: "ls".to_string(),
+            filename: None,
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
         };
         assert_eq!(engine.anomaly_score(&event, &[]), 0.0);
     }
@@ -455,10 +633,25 @@ mod tests {
     fn test_anomaly_score_sensitive_file() {
         let engine = DetectionEngine::new();
         let event = DecodedEvent {
-            seq: 1, header: make_header(10, 100), comm: "cat".to_string(),
+            seq: 1,
+            header: make_header(10, 100),
+            comm: "cat".to_string(),
             filename: Some("/etc/shadow".to_string()),
-            args: None, saddr: None, daddr: None, sport: None, dport: None, proto: None,
-            target_pid: None, signal: None, file_bytes: None,
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
         };
         assert!(engine.anomaly_score(&event, &[]) >= 0.5);
     }
@@ -480,9 +673,25 @@ mod tests {
         let mut header = make_header(1, 100);
         header.syscall_nr = 59;
         let event = DecodedEvent {
-            seq: 1, header, comm: "test".to_string(),
-            filename: None, args: None, saddr: None, daddr: None, sport: None, dport: None, proto: None,
-            target_pid: None, signal: None, file_bytes: None,
+            seq: 1,
+            header,
+            comm: "test".to_string(),
+            filename: None,
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
         };
         let results = engine.match_event(&event);
         assert_eq!(results.len(), 1);

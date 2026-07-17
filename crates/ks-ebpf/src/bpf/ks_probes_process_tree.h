@@ -35,12 +35,7 @@ struct process_tree_event {
     u32 _pad_tree1, _pad_tree2;
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, u32);
-    __type(value, struct process_node);
-    __uint(max_entries, 65536);
-} process_tree SEC(".maps");
+KS_LRU_HASH_MAP(process_tree, u32, struct process_node, 65536);
 
 KS_EVENT_MAP(tree_events, 256 * 1024);
 
@@ -67,16 +62,13 @@ struct pt_scratch {
     struct process_node updated;      /* exec: 节点更新中 */
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __type(key, u32);
-    __type(value, struct pt_scratch);
-    __uint(max_entries, 1);
-} pt_scratch_map SEC(".maps");
+/* 取当前 CPU 的 scratch，失败时直接返回（验证器友好）
+ * C6/C7: 通过 KS_PERCPU_ARRAY_MAP 宏声明 + KS_PERCPU_KEY() 取 key，
+ *        Ancient tier 自动回退到 CPU-keyed ARRAY（无 PERCPU_ARRAY 支持）*/
+KS_PERCPU_ARRAY_MAP(pt_scratch_map, struct pt_scratch);
 
-/* 取当前 CPU 的 scratch，失败时直接返回（验证器友好） */
 static __always_inline struct pt_scratch *pt_scratch_get(void) {
-    u32 key = 0;
+    u32 key = KS_PERCPU_KEY();
     return bpf_map_lookup_elem(&pt_scratch_map, &key);
 }
 
@@ -147,7 +139,7 @@ int trace_sched_fork(struct trace_event_raw_sched_process_fork *ctx) {
         evt->parent_risk = (u16)parent_info->risk_score;
         evt->anomaly_type = detected_anomaly;
         evt->_pad_tree1 = 0;  evt->_pad_tree2 = 0;
-        KS_SUBMIT(evt);
+        KS_SUBMIT(ctx, tree_events, evt);
     }
     return 0;
 }
@@ -203,7 +195,7 @@ int trace_sched_exec_tree(struct trace_event_raw_sched_process_exec *ctx) {
         evt->parent_risk = 0;
     }
     evt->anomaly_type = 0;  evt->_pad_tree1 = 0;  evt->_pad_tree2 = 0;
-    KS_SUBMIT(evt);
+    KS_SUBMIT(ctx, tree_events, evt);
     return 0;
 }
 
@@ -230,7 +222,7 @@ int trace_sched_exit_tree(struct trace_event_raw_sched_process_template *ctx) {
     __builtin_memset(evt->parent_comm, 0, 16);
     evt->parent_risk = 0;  evt->anomaly_type = 0;
     evt->_pad_tree1 = 0;  evt->_pad_tree2 = 0;
-    KS_SUBMIT(evt);
+    KS_SUBMIT(ctx, tree_events, evt);
 
     bpf_map_delete_elem(&process_tree, &pid);
     return 0;

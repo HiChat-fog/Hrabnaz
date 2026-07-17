@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -65,9 +65,15 @@ pub async fn run(file: &str) -> Result<()> {
     let verification = ks_engine::forensic::ForensicLogger::verify_chain(&path_buf)?;
 
     if verification.is_valid {
-        println!("  [✓] 链完整性: 通过 — {} 条记录, 链完整无断裂", verification.total_records);
+        println!(
+            "  [✓] 链完整性: 通过 — {} 条记录, 链完整无断裂",
+            verification.total_records
+        );
     } else {
-        println!("  [✗] 链完整性: 断裂 — 第 {} 条记录处检测到篡改", verification.broken_at.unwrap_or(0));
+        println!(
+            "  [✗] 链完整性: 断裂 — 第 {} 条记录处检测到篡改",
+            verification.broken_at.unwrap_or(0)
+        );
         println!("  建议: 检查该记录是否被人为修改或插入");
     }
 
@@ -103,7 +109,8 @@ pub async fn run(file: &str) -> Result<()> {
             }
         };
 
-        let record_type = record.get("type")
+        let record_type = record
+            .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("event");
 
@@ -114,24 +121,69 @@ pub async fn run(file: &str) -> Result<()> {
                 *severities.entry(severity.to_string()).or_insert(0) += 1;
             }
 
-            if let Some(tactic) = record.get("mitre").and_then(|m| m.get("tactic")).and_then(|v| v.as_str()) {
-                let technique = record.get("mitre").and_then(|m| m.get("technique")).and_then(|v| v.as_str()).unwrap_or("?");
-                mitre_tags.entry(tactic.to_string()).or_default().push(technique.to_string());
+            if let Some(tactic) = record
+                .get("mitre")
+                .and_then(|m| m.get("tactic"))
+                .and_then(|v| v.as_str())
+            {
+                let technique = record
+                    .get("mitre")
+                    .and_then(|m| m.get("technique"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                mitre_tags
+                    .entry(tactic.to_string())
+                    .or_default()
+                    .push(technique.to_string());
             }
 
-            let title = record.get("title").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let severity = record.get("severity").and_then(|v| v.as_str()).unwrap_or("?");
-            let pid = record.get("process").and_then(|p| p.get("pid")).and_then(|v| v.as_u64()).unwrap_or(0);
-            let comm = record.get("process").and_then(|p| p.get("comm")).and_then(|v| v.as_str()).unwrap_or("?");
+            let title = record
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let severity = record
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let pid = record
+                .get("process")
+                .and_then(|p| p.get("pid"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let comm = record
+                .get("process")
+                .and_then(|p| p.get("comm"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
 
-            let daddr = record.get("network").and_then(|n| n.get("daddr")).and_then(|v| v.as_str());
-            let dport = record.get("network").and_then(|n| n.get("dport")).and_then(|v| v.as_u64());
-            let proto = record.get("network").and_then(|n| n.get("proto")).and_then(|v| v.as_str());
+            let daddr = record
+                .get("network")
+                .and_then(|n| n.get("daddr"))
+                .and_then(|v| v.as_str());
+            let dport = record
+                .get("network")
+                .and_then(|n| n.get("dport"))
+                .and_then(|v| v.as_u64());
+            let proto = record
+                .get("network")
+                .and_then(|n| n.get("proto"))
+                .and_then(|v| v.as_str());
 
-            let filepath = record.get("file").and_then(|f| f.get("path")).and_then(|v| v.as_str());
+            let filepath = record
+                .get("file")
+                .and_then(|f| f.get("path"))
+                .and_then(|v| v.as_str());
 
-            let mitre_tactic = record.get("mitre").and_then(|m| m.get("tactic")).and_then(|v| v.as_str()).unwrap_or("");
-            let mitre_technique = record.get("mitre").and_then(|m| m.get("technique")).and_then(|v| v.as_str()).unwrap_or("");
+            let mitre_tactic = record
+                .get("mitre")
+                .and_then(|m| m.get("tactic"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mitre_technique = record
+                .get("mitre")
+                .and_then(|m| m.get("technique"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             attack_chains.push(AttackChainEntry {
                 title: title.to_string(),
@@ -155,9 +207,19 @@ pub async fn run(file: &str) -> Result<()> {
             if let Some(pid) = record.get("pid").and_then(|v| v.as_u64()) {
                 pids.insert(pid as u32);
                 let seq = record.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-                let etype = record.get("event_type").and_then(|v| v.as_u64()).unwrap_or(0);
-                let comm = record.get("comm").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                pid_events.entry(pid as u32).or_default().push((seq, etype as u32, comm));
+                let etype = record
+                    .get("event_type")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let comm = record
+                    .get("comm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                pid_events
+                    .entry(pid as u32)
+                    .or_default()
+                    .push((seq, etype as u32, comm));
             }
 
             if let Some(ts) = record.get("timestamp_ns").and_then(|v| v.as_u64()) {
@@ -172,11 +234,23 @@ pub async fn run(file: &str) -> Result<()> {
     println!("  事件总数: {}", event_count);
     println!("  告警总数: {}", alert_count);
     println!("  唯一进程: {}", pids.len());
-    println!("  链完整性: {}", if verification.is_valid { "通过 ✓" } else { "断裂 ✗" });
+    println!(
+        "  链完整性: {}",
+        if verification.is_valid {
+            "通过 ✓"
+        } else {
+            "断裂 ✗"
+        }
+    );
 
     if let (Some(first), Some(last)) = (first_ts, last_ts) {
         let duration_secs = (last - first) / 1_000_000_000;
-        println!("  时间跨度: {} 秒 ({} → {})", duration_secs, format_timestamp(first), format_timestamp(last));
+        println!(
+            "  时间跨度: {} 秒 ({} → {})",
+            duration_secs,
+            format_timestamp(first),
+            format_timestamp(last)
+        );
     }
 
     if !event_types.is_empty() {
@@ -204,10 +278,10 @@ pub async fn run(file: &str) -> Result<()> {
         for (sev, count) in &severities {
             let icon = match sev.as_str() {
                 "critical" => "🔴",
-                "high"     => "🟠",
-                "medium"   => "🟡",
-                "low"      => "🟢",
-                _          => "⚪",
+                "high" => "🟠",
+                "medium" => "🟡",
+                "low" => "🟢",
+                _ => "⚪",
             };
             println!("  {} {:<10} {} 条", icon, sev, count);
         }
@@ -237,11 +311,20 @@ pub async fn run(file: &str) -> Result<()> {
 
         let mut sorted_chains = attack_chains.clone();
         sorted_chains.sort_by(|a, b| {
-            let sev_order = |s: &str| match s { "critical" => 0, "high" => 1, "medium" => 2, "low" => 3, _ => 4 };
+            let sev_order = |s: &str| match s {
+                "critical" => 0,
+                "high" => 1,
+                "medium" => 2,
+                "low" => 3,
+                _ => 4,
+            };
             sev_order(&a.severity).cmp(&sev_order(&b.severity))
         });
 
-        let phase_order = ["TA0001", "TA0002", "TA0003", "TA0004", "TA0005", "TA0006", "TA0007", "TA0008", "TA0010", "TA0011"];
+        let phase_order = [
+            "TA0001", "TA0002", "TA0003", "TA0004", "TA0005", "TA0006", "TA0007", "TA0008",
+            "TA0010", "TA0011",
+        ];
         let mut phase_sorted: Vec<&AttackChainEntry> = Vec::new();
         for phase in &phase_order {
             for entry in &attack_chains {
@@ -251,7 +334,8 @@ pub async fn run(file: &str) -> Result<()> {
             }
         }
         for entry in &attack_chains {
-            if entry.mitre_tactic.is_empty() || !phase_order.contains(&entry.mitre_tactic.as_str()) {
+            if entry.mitre_tactic.is_empty() || !phase_order.contains(&entry.mitre_tactic.as_str())
+            {
                 phase_sorted.push(entry);
             }
         }
@@ -260,12 +344,19 @@ pub async fn run(file: &str) -> Result<()> {
             for (i, entry) in phase_sorted.iter().enumerate() {
                 let connector = if i == 0 { "▶" } else { "│" };
                 let phase_label = if !entry.mitre_tactic.is_empty() {
-                    format!("{} ({})", entry.mitre_tactic, mitre_phase_name(&entry.mitre_tactic))
+                    format!(
+                        "{} ({})",
+                        entry.mitre_tactic,
+                        mitre_phase_name(&entry.mitre_tactic)
+                    )
                 } else {
                     "未映射".to_string()
                 };
 
-                println!("  {} [{}] {} — PID:{} ({})", connector, entry.severity, entry.title, entry.pid, entry.comm);
+                println!(
+                    "  {} [{}] {} — PID:{} ({})",
+                    connector, entry.severity, entry.title, entry.pid, entry.comm
+                );
 
                 if let Some(ref daddr) = entry.daddr {
                     let port_info = entry.dport.map(|p| format!(":{}", p)).unwrap_or_default();
@@ -278,7 +369,10 @@ pub async fn run(file: &str) -> Result<()> {
                 }
 
                 if !entry.mitre_tactic.is_empty() {
-                    println!("  │   └─ MITRE: {} / {}", phase_label, entry.mitre_technique);
+                    println!(
+                        "  │   └─ MITRE: {} / {}",
+                        phase_label, entry.mitre_technique
+                    );
                 }
             }
 
@@ -294,7 +388,9 @@ pub async fn run(file: &str) -> Result<()> {
         println!();
 
         for (pid, events) in pid_events.iter() {
-            if events.len() < 2 { continue; }
+            if events.len() < 2 {
+                continue;
+            }
             println!("  PID {} ({} 条事件):", pid, events.len());
             for (_, etype, comm) in events.iter().take(5) {
                 println!("    └─ {} [type={}]", comm, etype);
@@ -308,7 +404,14 @@ pub async fn run(file: &str) -> Result<()> {
     println!();
     println!("╔══════════════════════════════════════════╗");
     println!("║  回放完成 — 上述分析基于 SHA-256 式校验   ║");
-    println!("║  链完整性={}", if verification.is_valid { "通过 ✓" } else { "断裂 ✗" });
+    println!(
+        "║  链完整性={}",
+        if verification.is_valid {
+            "通过 ✓"
+        } else {
+            "断裂 ✗"
+        }
+    );
     println!("║  所有结论均有哈希链佐证, 可用于司法取证     ║");
     println!("╚══════════════════════════════════════════╝");
 

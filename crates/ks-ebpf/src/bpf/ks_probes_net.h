@@ -3,6 +3,8 @@
 
 SEC("kprobe/tcp_v4_connect")
 int BPF_KPROBE(kprobe_tcp_connect, struct sock *sk, struct sockaddr *uaddr, int addr_len) {
+    netflow_handle_tcp_v4_connect(ctx, sk, uaddr);
+
     struct net_event *evt = KS_RESERVE(events, struct net_event);
     if (!evt) return 0;
 
@@ -28,7 +30,7 @@ int BPF_KPROBE(kprobe_tcp_connect, struct sock *sk, struct sockaddr *uaddr, int 
 
     infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
                 evt->daddr, evt->dport, evt->proto, 0);
-    KS_SUBMIT(evt);
+    KS_SUBMIT(ctx, events, evt);
     return 0;
 }
 
@@ -57,7 +59,7 @@ int BPF_KPROBE(kprobe_tcp_v6_connect, struct sock *sk, struct sockaddr *uaddr, i
 
     infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
                 0, evt->dport, evt->proto, 0);
-    KS_SUBMIT(evt);
+    KS_SUBMIT(ctx, events, evt);
     return 0;
 }
 
@@ -92,7 +94,7 @@ int BPF_KPROBE(kprobe_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t l
 
     infer_event(evt->header.pid, evt->header.event_type, NULL,
                 evt->daddr, evt->dport, evt->proto, 0);
-    KS_SUBMIT(evt);
+    KS_SUBMIT(ctx, events, evt);
     return 0;
 }
 

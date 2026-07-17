@@ -4,7 +4,7 @@ use std::path::Path;
 
 /// 配置来源优先级: CLI > KS_* 环境变量 > YAML 配置文件 > 内置默认值。
 /// 绝大多数情况默认值就能跑，生产环境再上配置文件。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub engine: EngineConfig,
@@ -28,9 +28,15 @@ pub struct EngineConfig {
     pub batch_size: u32,
 }
 
-fn default_engine_buffer_size() -> usize { 10_000 }
-fn default_engine_ring_buffer_size_kb() -> u32 { 256 }
-fn default_engine_batch_size() -> u32 { 64 }
+fn default_engine_buffer_size() -> usize {
+    10_000
+}
+fn default_engine_ring_buffer_size_kb() -> u32 {
+    256
+}
+fn default_engine_batch_size() -> u32 {
+    64
+}
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -50,11 +56,36 @@ pub struct DetectionConfig {
     pub anomaly_threshold: f64,
     #[serde(default = "default_detection_kernel_inference")]
     pub kernel_inference: bool,
+    /// G2.3: 是否启用内核态阻断（默认 false 防误杀）
+    #[serde(default = "default_detection_block_enabled")]
+    pub block_enabled: bool,
+    /// G2.3: 阻断 TTL（秒，默认 300）
+    #[serde(default = "default_detection_block_ttl_secs")]
+    pub block_ttl_secs: u64,
+    /// G2.3: 触发阻断的严重度阈值（"critical" / "high" / "medium"）
+    #[serde(default = "default_detection_block_severity_threshold")]
+    pub block_severity_threshold: String,
 }
 
-fn default_detection_rules_dir() -> String { "/etc/ks/rules/".to_string() }
-fn default_detection_anomaly_threshold() -> f64 { 0.7 }
-fn default_detection_kernel_inference() -> bool { true }
+fn default_detection_block_enabled() -> bool {
+    false
+}
+fn default_detection_block_ttl_secs() -> u64 {
+    300
+}
+fn default_detection_block_severity_threshold() -> String {
+    "critical".to_string()
+}
+
+fn default_detection_rules_dir() -> String {
+    "/etc/ks/rules/".to_string()
+}
+fn default_detection_anomaly_threshold() -> f64 {
+    0.7
+}
+fn default_detection_kernel_inference() -> bool {
+    true
+}
 
 impl Default for DetectionConfig {
     fn default() -> Self {
@@ -62,6 +93,9 @@ impl Default for DetectionConfig {
             rules_dir: default_detection_rules_dir(),
             anomaly_threshold: default_detection_anomaly_threshold(),
             kernel_inference: default_detection_kernel_inference(),
+            block_enabled: default_detection_block_enabled(),
+            block_ttl_secs: default_detection_block_ttl_secs(),
+            block_severity_threshold: default_detection_block_severity_threshold(),
         }
     }
 }
@@ -78,10 +112,18 @@ pub struct ForensicConfig {
     pub hash_chain: bool,
 }
 
-fn default_forensic_log_dir() -> String { "/var/log/ks/".to_string() }
-fn default_forensic_max_log_size_mb() -> u32 { 100 }
-fn default_forensic_retention_days() -> u32 { 30 }
-fn default_forensic_hash_chain() -> bool { true }
+fn default_forensic_log_dir() -> String {
+    "/var/log/ks/".to_string()
+}
+fn default_forensic_max_log_size_mb() -> u32 {
+    100
+}
+fn default_forensic_retention_days() -> u32 {
+    30
+}
+fn default_forensic_hash_chain() -> bool {
+    true
+}
 
 impl Default for ForensicConfig {
     fn default() -> Self {
@@ -104,9 +146,15 @@ pub struct NetworkConfig {
     pub ws_enabled: bool,
 }
 
-fn default_network_serve_port() -> u16 { 3000 }
-fn default_network_bind_address() -> String { "127.0.0.1".to_string() }
-fn default_network_ws_enabled() -> bool { true }
+fn default_network_serve_port() -> u16 {
+    3000
+}
+fn default_network_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_network_ws_enabled() -> bool {
+    true
+}
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -128,9 +176,15 @@ pub struct PerformanceConfig {
     pub memory_limit_mb: u32,
 }
 
-fn default_performance_cpu_affinity() -> String { "auto".to_string() }
-fn default_performance_max_cpu_percent() -> u32 { 5 }
-fn default_performance_memory_limit_mb() -> u32 { 128 }
+fn default_performance_cpu_affinity() -> String {
+    "auto".to_string()
+}
+fn default_performance_max_cpu_percent() -> u32 {
+    5
+}
+fn default_performance_memory_limit_mb() -> u32 {
+    128
+}
 
 impl Default for PerformanceConfig {
     fn default() -> Self {
@@ -138,18 +192,6 @@ impl Default for PerformanceConfig {
             cpu_affinity: default_performance_cpu_affinity(),
             max_cpu_percent: default_performance_max_cpu_percent(),
             memory_limit_mb: default_performance_memory_limit_mb(),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            engine: EngineConfig::default(),
-            detection: DetectionConfig::default(),
-            forensic: ForensicConfig::default(),
-            network: NetworkConfig::default(),
-            performance: PerformanceConfig::default(),
         }
     }
 }
@@ -209,6 +251,23 @@ impl Config {
             } else {
                 log::warn!("KS_DETECTION_KERNEL_INFERENCE 解析失败: '{}'", v);
             }
+        }
+        if let Ok(v) = std::env::var("KS_DETECTION_BLOCK_ENABLED") {
+            if let Ok(parsed) = v.parse::<bool>() {
+                self.detection.block_enabled = parsed;
+            } else {
+                log::warn!("KS_DETECTION_BLOCK_ENABLED 解析失败: '{}'", v);
+            }
+        }
+        if let Ok(v) = std::env::var("KS_DETECTION_BLOCK_TTL_SECS") {
+            if let Ok(parsed) = v.parse::<u64>() {
+                self.detection.block_ttl_secs = parsed;
+            } else {
+                log::warn!("KS_DETECTION_BLOCK_TTL_SECS 解析失败: '{}'", v);
+            }
+        }
+        if let Ok(v) = std::env::var("KS_DETECTION_BLOCK_SEVERITY_THRESHOLD") {
+            self.detection.block_severity_threshold = v;
         }
         if let Ok(v) = std::env::var("KS_FORENSIC_LOG_DIR") {
             self.forensic.log_dir = v;

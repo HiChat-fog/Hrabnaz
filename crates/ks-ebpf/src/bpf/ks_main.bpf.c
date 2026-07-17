@@ -15,13 +15,18 @@
 /* ── 共享事件 ringbuf（syscall/vfs/net 探针共用，1MB 容量）── */
 KS_EVENT_MAP(events, 1024 * 1024);
 
-/* ── 探针函数体（来自原 .bpf.c，已移除 map 声明和 LICENSE）── */
+/* ── 探针函数体（来自原 .bpf.c，已移除 map 声明和 LICENSE）──
+ * include 顺序: freq/netflow/smart_filter 的 inline helper 必须在
+ * syscall/vfs/net 主探针之前，以便主探针调用这些 helper */
+#include "ks_probes_freq.h"
+#include "ks_probes_netflow.h"
+#include "ks_probes_smart_filter.h"
 #include "ks_probes_syscall.h"
 #include "ks_probes_vfs.h"
 #include "ks_probes_net.h"
 #include "ks_probes_process_tree.h"
-#include "ks_probes_freq.h"
-#include "ks_probes_netflow.h"
-#include "ks_probes_smart_filter.h"
+#include "ks_probes_container.h"
+#include "ks_probes_lkm.h"
+#include "ks_probes_self_protect.h"
 
 char LICENSE[] SEC("license") = "GPL";

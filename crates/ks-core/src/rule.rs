@@ -80,22 +80,41 @@ pub enum Field {
     TargetPid,
     #[serde(rename = "signal")]
     Signal,
+    // E4.4 新增字段 (容器逃逸 / LKM 加载 / eBPF 篡改探针)
+    #[serde(rename = "module_name")]
+    ModuleName,
+    #[serde(rename = "prog_name")]
+    ProgName,
+    #[serde(rename = "source_ns_inum")]
+    SourceNsInum,
+    #[serde(rename = "target_ns_inum")]
+    TargetNsInum,
+    #[serde(rename = "cap_eff")]
+    CapEff,
+    #[serde(rename = "action")]
+    Action,
 }
 
 impl Field {
     pub fn is_numeric(&self) -> bool {
-        matches!(self,
+        matches!(
+            self,
             Field::Pid | Field::Ppid | Field::Uid | Field::SyscallNr |
             Field::Sport | Field::Dport | Field::TargetPid | Field::Signal |
-            Field::FileBytes
+            Field::FileBytes |
+            // E4.4: 容器逃逸数值字段
+            Field::SourceNsInum | Field::TargetNsInum | Field::CapEff
         )
     }
 
     pub fn is_string(&self) -> bool {
-        matches!(self,
+        matches!(
+            self,
             Field::Comm | Field::Filename | Field::Args |
             Field::Saddr | Field::Daddr | Field::Proto |
-            Field::Saddr6 | Field::Daddr6 | Field::Family
+            Field::Saddr6 | Field::Daddr6 | Field::Family |
+            // E4.4: LKM/eBPF 字符串字段
+            Field::ModuleName | Field::ProgName | Field::Action
         )
     }
 
@@ -119,16 +138,43 @@ impl Field {
             Field::Family => "family",
             Field::TargetPid => "target_pid",
             Field::Signal => "signal",
+            // E4.4 新增字段
+            Field::ModuleName => "module_name",
+            Field::ProgName => "prog_name",
+            Field::SourceNsInum => "source_ns_inum",
+            Field::TargetNsInum => "target_ns_inum",
+            Field::CapEff => "cap_eff",
+            Field::Action => "action",
         }
     }
 
     pub fn all_yaml_names() -> &'static [&'static str] {
         &[
-            "comm", "pid", "ppid", "uid", "syscall_nr",
-            "filename", "args", "file_bytes",
-            "saddr", "daddr", "sport", "dport", "proto",
-            "saddr6", "daddr6", "family",
-            "target_pid", "signal",
+            "comm",
+            "pid",
+            "ppid",
+            "uid",
+            "syscall_nr",
+            "filename",
+            "args",
+            "file_bytes",
+            "saddr",
+            "daddr",
+            "sport",
+            "dport",
+            "proto",
+            "saddr6",
+            "daddr6",
+            "family",
+            "target_pid",
+            "signal",
+            // E4.4 新增字段
+            "module_name",
+            "prog_name",
+            "source_ns_inum",
+            "target_ns_inum",
+            "cap_eff",
+            "action",
         ]
     }
 }

@@ -40,7 +40,7 @@ static __always_inline u32 get_threshold(u32 key, u32 default_val) {
     return val ? *val : default_val;
 }
 
-static __always_inline void update_freq_counter_ex(u32 pid, u32 counter_type) {
+static __always_inline void update_freq_counter_ex(void *ctx, u32 pid, u32 counter_type) {
     u64 now = bpf_ktime_get_ns();
     u64 window_ns = (u64)get_threshold(TH_WINDOW_NS, 60) * 1000000000ULL;
 
@@ -108,7 +108,7 @@ static __always_inline void update_freq_counter_ex(u32 pid, u32 counter_type) {
         evt->dns_op_count_60s=fc->dns_op_count_60s; evt->ptrace_count_60s=fc->ptrace_count_60s;
         evt->signal_count_60s=fc->signal_count_60s; evt->anomaly_flags=fc->anomaly_flags;
         evt->duration_ns=now - fc->window_start_ns;
-        KS_SUBMIT(evt);
+        KS_SUBMIT(ctx, freq_events, evt);
     }
 
 report:
@@ -123,29 +123,26 @@ report:
         evt->dns_op_count_60s=fc->dns_op_count_60s; evt->ptrace_count_60s=fc->ptrace_count_60s;
         evt->signal_count_60s=fc->signal_count_60s; evt->anomaly_flags=fc->anomaly_flags;
         evt->duration_ns=now - fc->window_start_ns;
-        KS_SUBMIT(evt);
+        KS_SUBMIT(ctx, freq_events, evt);
     }
 
     bpf_map_update_elem(&freq_counters, &pid, fc, BPF_ANY);
 }
 
-SEC("tracepoint/raw_syscalls/sys_exit")
-int freq_sys_exit(struct trace_event_raw_sys_exit *ctx) {
+static __always_inline void freq_handle_sys_exit(void *ctx, u32 syscall_nr) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
-    if (pid == 0) return 0;
+    if (pid == 0) return;
 
-    u32 syscall_nr = ctx->id;
     switch (syscall_nr) {
-    case 2:  case 257: update_freq_counter_ex(pid, 10); break;
-    case 0:            update_freq_counter_ex(pid, 11); break;
-    case 1:            update_freq_counter_ex(pid, 12); break;
-    case 87:           update_freq_counter_ex(pid, 13); break;
-    case 42:           update_freq_counter_ex(pid, 20); break;
-    case 101:          update_freq_counter_ex(pid, 30); break;
-    case 62:           update_freq_counter_ex(pid, 31); break;
+    case 2:  case 257: update_freq_counter_ex(ctx, pid, 10); break;
+    case 0:            update_freq_counter_ex(ctx, pid, 11); break;
+    case 1:            update_freq_counter_ex(ctx, pid, 12); break;
+    case 87:           update_freq_counter_ex(ctx, pid, 13); break;
+    case 42:           update_freq_counter_ex(ctx, pid, 20); break;
+    case 101:          update_freq_counter_ex(ctx, pid, 30); break;
+    case 62:           update_freq_counter_ex(ctx, pid, 31); break;
     }
-    return 0;
 }
 
 #endif // KS_PROBES_FREQ_H

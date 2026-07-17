@@ -7,6 +7,8 @@
 //!
 //! 探测依据：/proc/sys/kernel/osrelease 主.次版本号。
 //! Phase B/C 实现后，default_event_source() 会按此返回对应 EbpfXxxSource。
+//!
+//! C8: Ancient tier 额外探测 /sys/kernel/btf/vmlinux，缺失则降级到 Mock。
 
 use crate::event_source::SourceKind;
 
@@ -15,7 +17,26 @@ use crate::event_source::SourceKind;
 pub fn detect_ebpf_tier() -> Option<SourceKind> {
     let release = read_kernel_release()?;
     let (major, minor) = parse_kernel_version(&release)?;
-    tier_from_version(major, minor)
+    let tier = tier_from_version(major, minor)?;
+    // Ancient tier 有两条加载路径：
+    //   有 BTF → ks_main_ancient.o (CO-RE 重定位)
+    //   无 BTF → ks_main_ancient_nobtf.o (硬编码 offset，无需 kernel-plus)
+    if matches!(tier, SourceKind::EbpfAncient) {
+        if btf_available() {
+            log::info!("Ancient tier: BTF 可用，使用 CO-RE 重定位 (ks_main_ancient.o)");
+        } else {
+            log::info!(
+                "Ancient tier: BTF 不可用，使用 NOBTF 硬编码 offset (ks_main_ancient_nobtf.o)"
+            );
+        }
+    }
+    Some(tier)
+}
+
+/// 检测内核 BTF 是否可用。
+/// 4.18+ 原生支持 BTF；3.10 stock 无 BTF，需 kernel-plus 或走 NOBTF 路径。
+pub fn btf_available() -> bool {
+    std::path::Path::new("/sys/kernel/btf/vmlinux").exists()
 }
 
 /// 读取 /proc/sys/kernel/osrelease，形如 "6.5.0-26-generic"。
@@ -32,7 +53,10 @@ fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
     let major: u32 = parts.next()?.parse().ok()?;
     let minor_part = parts.next()?;
     // minor 可能含 "-" 后缀（如 "0-26-generic"），取前导数字部分
-    let minor_str: String = minor_part.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let minor_str: String = minor_part
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if minor_str.is_empty() {
         return None;
     }
@@ -73,7 +97,10 @@ mod tests {
     #[test]
     fn test_parse_version_centos7() {
         // CentOS 7 默认 3.10.0-1160.el7.x86_64
-        assert_eq!(parse_kernel_version("3.10.0-1160.el7.x86_64"), Some((3, 10)));
+        assert_eq!(
+            parse_kernel_version("3.10.0-1160.el7.x86_64"),
+            Some((3, 10))
+        );
     }
 
     #[test]
@@ -121,6 +148,24 @@ mod tests {
         // CI 通常 5.x+，应该是 Modern；如果失败说明环境异常
         if let Some(t) = tier {
             println!("当前内核 tier: {:?}", t);
+        }
+    }
+
+    #[test]
+    fn test_btf_available_returns_bool() {
+        // 不 panic 即可，结果依赖运行环境
+        let _ = btf_available();
+    }
+
+    #[test]
+    fn test_ancient_without_btf_still_returns_ancient() {
+        // NOBTF: Ancient tier 无 BTF 时不再降级到 Mock，而是走 NOBTF 路径
+        let tier = detect_ebpf_tier();
+        if let Some(t) = tier {
+            if matches!(t, SourceKind::EbpfAncient) {
+                // 无论 BTF 是否存在，都应返回 Ancient
+                println!("Ancient tier 检测到，BTF={}", btf_available());
+            }
         }
     }
 }

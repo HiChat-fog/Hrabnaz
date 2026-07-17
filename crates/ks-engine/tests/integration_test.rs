@@ -11,11 +11,17 @@
 //!   5. Rootkit 加载 (rootkit_detect) 全链路
 //!   6. 配置模块集成
 
-use ks_engine::aggregator::{EventAggregator, DecodedEvent};
-use ks_engine::detector::DetectionEngine;
-use ks_engine::forensic::{ForensicLogger, RotationConfig};
+use ks_core::alert::Alert;
+use ks_core::event::{
+    af, ContainerEscapeEvent, EbpfTamperEvent, EventHeader, ExecEvent, FileEvent, LkmLoadEvent,
+    NetEvent, SignalEvent,
+};
+use ks_core::rule::Severity;
+use ks_engine::aggregator::{DecodedEvent, EventAggregator};
 use ks_engine::chain::ChainReconstructor;
-use ks_core::event::{EventHeader, ExecEvent, FileEvent, NetEvent, SignalEvent, af};
+use ks_engine::detector::DetectionEngine;
+use ks_engine::event_source::{EventSource, MockEventSource, MockScenario};
+use ks_engine::forensic::{ForensicLogger, RotationConfig};
 use tempfile::TempDir;
 
 // ========== 编码辅助函数 ==========
@@ -24,7 +30,9 @@ use tempfile::TempDir;
 fn encode_struct<T: Copy>(s: &T) -> Vec<u8> {
     let size = core::mem::size_of::<T>();
     let mut data = vec![0u8; size];
-    unsafe { core::ptr::copy_nonoverlapping(s as *const T as *const u8, data.as_mut_ptr(), size); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(s as *const T as *const u8, data.as_mut_ptr(), size);
+    }
     data
 }
 
@@ -54,7 +62,10 @@ fn make_cstr_16(s: &str) -> [u8; 16] {
 
 /// IPv4 点分十进制 → u32 (native-endian，与内核 bpf_probe_read_kernel 一致)
 fn ipv4_to_u32(addr: &str) -> u32 {
-    let parts: Vec<u8> = addr.split('.').filter_map(|p| p.parse::<u8>().ok()).collect();
+    let parts: Vec<u8> = addr
+        .split('.')
+        .filter_map(|p| p.parse::<u8>().ok())
+        .collect();
     if parts.len() == 4 {
         u32::from_ne_bytes([parts[0], parts[1], parts[2], parts[3]])
     } else {
@@ -65,7 +76,15 @@ fn ipv4_to_u32(addr: &str) -> u32 {
 // ========== 通用初始化辅助 ==========
 
 /// 初始化聚合器、检测引擎 (加载指定规则文件)、取证日志器、攻击链还原器
-fn init_pipeline(rule_file_names: &[&str]) -> (EventAggregator, DetectionEngine, ForensicLogger, ChainReconstructor, TempDir) {
+fn init_pipeline(
+    rule_file_names: &[&str],
+) -> (
+    EventAggregator,
+    DetectionEngine,
+    ForensicLogger,
+    ChainReconstructor,
+    TempDir,
+) {
     let aggregator = EventAggregator::new(10000);
     let mut detector = DetectionEngine::new();
 
@@ -119,7 +138,7 @@ fn process_events(
 
         let history: Vec<_> = aggregator.recent(1000).into_iter().cloned().collect();
         let score = detector.anomaly_score(&event, &history);
-        assert!(score >= 0.0 && score <= 1.0);
+        assert!((0.0..=1.0).contains(&score));
     }
 
     forensic.flush().unwrap();
@@ -288,15 +307,26 @@ fn test_reverse_shell_full_pipeline() {
 
     // 事件 3 (/etc/shadow) 应触发敏感文件访问规则
     let matches_file = detector.match_event(&decoded[2]);
-    assert!(!matches_file.is_empty(), "/etc/shadow访问应至少触发一条规则");
+    assert!(
+        !matches_file.is_empty(),
+        "/etc/shadow访问应至少触发一条规则"
+    );
 
     // ===== 验证异常评分 =====
     // bash -i + /dev/tcp + dport=4444 组合应产生高分
     let score_exec = detector.anomaly_score(&decoded[0], &decoded);
-    assert!(score_exec >= 0.5, "bash -i 异常评分应 >= 0.5, 实际: {}", score_exec);
+    assert!(
+        score_exec >= 0.5,
+        "bash -i 异常评分应 >= 0.5, 实际: {}",
+        score_exec
+    );
 
     let score_net = detector.anomaly_score(&decoded[1], &decoded);
-    assert!(score_net >= 0.5, "TCP→4444 异常评分应 >= 0.5, 实际: {}", score_net);
+    assert!(
+        score_net >= 0.5,
+        "TCP→4444 异常评分应 >= 0.5, 实际: {}",
+        score_net
+    );
 
     // ===== 验证取证日志 =====
     let log_path = dir.path().join("integration_test.jsonl");
@@ -307,7 +337,7 @@ fn test_reverse_shell_full_pipeline() {
     let pid_events: Vec<_> = aggregator.by_pid(1234).into_iter().cloned().collect();
     assert_eq!(pid_events.len(), 3, "PID 1234 应有 3 条事件");
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
-        assert!(chain.steps.len() >= 1, "攻击链应至少有 1 个步骤");
+        assert!(!chain.steps.is_empty(), "攻击链应至少有 1 个步骤");
     }
 
     // ===== 统计摘要 =====
@@ -459,7 +489,10 @@ fn test_ransomware_full_pipeline() {
 
     // 事件 3: 删除原文件 (type=13)
     assert_eq!(decoded[2].header.event_type, 13);
-    assert_eq!(decoded[2].filename.as_ref().unwrap(), "/home/user/documents/report.pdf");
+    assert_eq!(
+        decoded[2].filename.as_ref().unwrap(),
+        "/home/user/documents/report.pdf"
+    );
 
     // 事件 4: .locked 勒索信
     assert_eq!(decoded[3].header.event_type, 12);
@@ -469,16 +502,26 @@ fn test_ransomware_full_pipeline() {
     // ===== 验证规则匹配 =====
     // 事件 2 (.encrypted) 应触发勒索软件加密行为规则
     let matches_encrypt = detector.match_event(&decoded[1]);
-    assert!(!matches_encrypt.is_empty(), ".encrypted 文件应触发勒索软件规则");
+    assert!(
+        !matches_encrypt.is_empty(),
+        ".encrypted 文件应触发勒索软件规则"
+    );
 
     // 事件 4 (.locked) 也应触发勒索软件加密行为规则
     let matches_locked = detector.match_event(&decoded[3]);
-    assert!(!matches_locked.is_empty(), ".locked 勒索信应触发勒索软件规则");
+    assert!(
+        !matches_locked.is_empty(),
+        ".locked 勒索信应触发勒索软件规则"
+    );
 
     // ===== 验证异常评分 =====
     // .encrypted 文件写入应提高异常评分
     let score_encrypt = detector.anomaly_score(&decoded[1], &decoded);
-    assert!(score_encrypt > 0.0, "加密文件异常评分应 > 0.0, 实际: {}", score_encrypt);
+    assert!(
+        score_encrypt > 0.0,
+        "加密文件异常评分应 > 0.0, 实际: {}",
+        score_encrypt
+    );
 
     // ===== 验证取证日志 =====
     let log_path = dir.path().join("integration_test.jsonl");
@@ -489,7 +532,7 @@ fn test_ransomware_full_pipeline() {
     let pid_events: Vec<_> = aggregator.by_pid(5000).into_iter().cloned().collect();
     assert_eq!(pid_events.len(), 4, "PID 5000 应有 4 条事件");
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
-        assert!(chain.steps.len() >= 1);
+        assert!(!chain.steps.is_empty());
     }
 
     // ===== 统计摘要 =====
@@ -641,20 +684,34 @@ fn test_privilege_escalation_full_pipeline() {
 
     // /etc/sudoers 应触发 sudo 配置篡改规则
     let matches_sudoers = detector.match_event(&decoded[1]);
-    assert!(!matches_sudoers.is_empty(), "/etc/sudoers 应触发 sudo 配置篡改规则");
+    assert!(
+        !matches_sudoers.is_empty(),
+        "/etc/sudoers 应触发 sudo 配置篡改规则"
+    );
 
     // ptrace (syscall_nr=101) 应触发 ptrace 注入规则
     let matches_ptrace = detector.match_event(&decoded[2]);
-    assert!(!matches_ptrace.is_empty(), "ptrace syscall_nr=101 应触发注入规则");
+    assert!(
+        !matches_ptrace.is_empty(),
+        "ptrace syscall_nr=101 应触发注入规则"
+    );
 
     // ===== 验证异常评分 =====
     // chmod +s 应提高异常评分
     let score_chmod = detector.anomaly_score(&decoded[0], &decoded);
-    assert!(score_chmod >= 0.4, "chmod +s 异常评分应 >= 0.4, 实际: {}", score_chmod);
+    assert!(
+        score_chmod >= 0.4,
+        "chmod +s 异常评分应 >= 0.4, 实际: {}",
+        score_chmod
+    );
 
     // /etc/sudoers 修改属于中敏感文件, 异常评分应提高
     let score_sudoers = detector.anomaly_score(&decoded[1], &decoded);
-    assert!(score_sudoers >= 0.35, "/etc/sudoers 异常评分应 >= 0.35, 实际: {}", score_sudoers);
+    assert!(
+        score_sudoers >= 0.35,
+        "/etc/sudoers 异常评分应 >= 0.35, 实际: {}",
+        score_sudoers
+    );
 
     // ===== 验证取证日志 =====
     let log_path = dir.path().join("integration_test.jsonl");
@@ -665,7 +722,7 @@ fn test_privilege_escalation_full_pipeline() {
     let pid_events: Vec<_> = aggregator.by_pid(3000).into_iter().cloned().collect();
     assert_eq!(pid_events.len(), 3);
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
-        assert!(chain.steps.len() >= 1);
+        assert!(!chain.steps.is_empty());
     }
 
     // ===== 统计摘要 =====
@@ -821,7 +878,10 @@ fn test_dns_tunnel_full_pipeline() {
     // ===== 验证规则匹配 =====
     // UDP dport=53 应触发 DNS 隧道规则
     let matches_dns1 = detector.match_event(&decoded[1]);
-    assert!(!matches_dns1.is_empty(), "UDP:53 DNS 查询应触发 DNS 隧道规则");
+    assert!(
+        !matches_dns1.is_empty(),
+        "UDP:53 DNS 查询应触发 DNS 隧道规则"
+    );
 
     let matches_dns2 = detector.match_event(&decoded[2]);
     assert!(!matches_dns2.is_empty(), "第二次 UDP:53 查询也应触发规则");
@@ -831,7 +891,11 @@ fn test_dns_tunnel_full_pipeline() {
     let score_dns = detector.anomaly_score(&decoded[1], &decoded);
     // 非私有 IP 外连会加 0.1 分, 但 DNS 53 端口不在恶意端口列表中
     // 所以主要靠后续规则匹配验证
-    assert!(score_dns >= 0.0, "DNS 异常评分应 >= 0.0, 实际: {}", score_dns);
+    assert!(
+        score_dns >= 0.0,
+        "DNS 异常评分应 >= 0.0, 实际: {}",
+        score_dns
+    );
 
     // ===== 验证取证日志 =====
     let log_path = dir.path().join("integration_test.jsonl");
@@ -842,7 +906,7 @@ fn test_dns_tunnel_full_pipeline() {
     let pid_events: Vec<_> = aggregator.by_pid(7000).into_iter().cloned().collect();
     assert_eq!(pid_events.len(), 3);
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
-        assert!(chain.steps.len() >= 1);
+        assert!(!chain.steps.is_empty());
     }
 
     // ===== 统计摘要 =====
@@ -993,16 +1057,26 @@ fn test_rootkit_full_pipeline() {
     // ===== 验证规则匹配 =====
     // insmod 应触发 rootkit_module_load 规则
     let matches_insmod = detector.match_event(&decoded[0]);
-    assert!(!matches_insmod.is_empty(), "insmod 应触发 rootkit 模块加载规则");
+    assert!(
+        !matches_insmod.is_empty(),
+        "insmod 应触发 rootkit 模块加载规则"
+    );
 
     // SIGKILL + kill comm 应触发 hidden_process_kill 规则
     let matches_sigkill = detector.match_event(&decoded[2]);
-    assert!(!matches_sigkill.is_empty(), "SIGKILL+kill 应触发 rootkit 信号规则");
+    assert!(
+        !matches_sigkill.is_empty(),
+        "SIGKILL+kill 应触发 rootkit 信号规则"
+    );
 
     // ===== 验证异常评分 =====
     // /proc/kallsyms 属于 /proc/ 低敏感文件, 应加分
     let score_proc = detector.anomaly_score(&decoded[1], &decoded);
-    assert!(score_proc >= 0.15, "/proc/kallsyms 异常评分应 >= 0.15, 实际: {}", score_proc);
+    assert!(
+        score_proc >= 0.15,
+        "/proc/kallsyms 异常评分应 >= 0.15, 实际: {}",
+        score_proc
+    );
 
     // ===== 验证取证日志 =====
     let log_path = dir.path().join("integration_test.jsonl");
@@ -1013,7 +1087,7 @@ fn test_rootkit_full_pipeline() {
     let pid_events: Vec<_> = aggregator.by_pid(8000).into_iter().cloned().collect();
     assert_eq!(pid_events.len(), 3);
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
-        assert!(chain.steps.len() >= 1);
+        assert!(!chain.steps.is_empty());
     }
 
     // ===== 统计摘要 =====
@@ -1074,4 +1148,789 @@ fn test_config_integration() {
     let matches = detector.match_event(&event);
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].rule_name, "config_test_rule");
+}
+
+// ========== Mock 事件源全链路测试 (Phase E1.3) ==========
+//
+// 与上面手工构造事件的全链路测试不同，这两组测试通过 MockEventSource 回放
+// 内置场景（Ransomware / PrivilegeEscalation），验证 EventSource trait →
+// aggregator.decode → detector.match_event → forensic 落盘 的完整异步管线。
+//
+// MockEventSource 的场景定义见 crates/ks-engine/src/event_source.rs。
+
+/// Phase E1.3: 通过 MockEventSource 回放勒索软件场景，验证全链路检测。
+///
+/// 场景事件序列 (ransomware_scenario, 10 条):
+///   1. ExecEvent: encryptor 执行
+///   2-5. FileEvent (type=12): 写入 .encrypted 文件 ×4
+///   6-9. FileEvent (type=13): 删除原文件 ×4
+///   10. FileEvent (type=12): 写入 README_FOR_DECRYPT.txt
+#[tokio::test]
+async fn test_ransomware_full_chain() {
+    let (mut aggregator, mut detector, mut forensic, _chain, _dir) =
+        init_pipeline(&["ransomware.yml"]);
+
+    // 内联 fallback 规则（与 ransomware.yml 等价，保证规则文件缺失时仍能匹配）
+    let fallback_yaml = r#"
+- name: "勒索软件加密行为_inline"
+  description: "检测文件写入加密后缀 (.encrypted/.locked/.crypto)"
+  severity: critical
+  conditions:
+    - field: filename
+      operator: regex
+      value: "(\\.encrypted|\\.locked|\\.crypto|\\.ryuk|\\.wanna|\\.cerber)$"
+  alert_message: "检测到可疑文件加密行为"
+  mitre_tactic: "TA0040"
+  mitre_technique: "T1486"
+"#;
+    detector.load_rules_from_yaml(fallback_yaml).unwrap();
+
+    // 通过 MockEventSource 异步消费所有事件
+    let mut source = MockEventSource::new_with_scenario(MockScenario::Ransomware).with_loop(false);
+    let mut decoded_events: Vec<DecodedEvent> = Vec::new();
+    let mut alerts: Vec<Alert> = Vec::new();
+
+    while let Ok(Some(bytes)) = source.next_bytes().await {
+        let event = match aggregator.decode(&bytes) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        decoded_events.push(event.clone());
+
+        forensic.log_event(&event).unwrap();
+
+        let matches = detector.match_event(&event);
+        for m in &matches {
+            let alert = detector.generate_alert(m, &event);
+            forensic.log_alert(&alert).unwrap();
+            alerts.push(alert);
+        }
+    }
+    forensic.flush().unwrap();
+
+    // ===== 断言 1: 事件数 ≥ 5 (4 个 .encrypted + 1 个 README_FOR_DECRYPT + exec + 4 deletes = 10) =====
+    assert!(
+        decoded_events.len() >= 5,
+        "勒索场景事件数应 >= 5, 实际: {}",
+        decoded_events.len()
+    );
+
+    // ===== 断言 2: 告警数 ≥ 1 (.encrypted 扩展名匹配勒索规则) =====
+    assert!(
+        !alerts.is_empty(),
+        "应至少有 1 条告警 (.encrypted 文件匹配勒索规则), 实际告警数: {}",
+        alerts.len()
+    );
+
+    // ===== 断言 3: forensic chain_tail_hash() 非空且非 genesis hash =====
+    let tail_hash = forensic.chain_tail_hash();
+    assert!(!tail_hash.is_empty(), "chain_tail_hash 不应为空");
+    assert_ne!(
+        tail_hash, "0000000000000000000000000000000000000000000000000000000000000000",
+        "chain_tail_hash 应已推进 (非 genesis hash), 实际: {}",
+        tail_hash
+    );
+
+    // ===== 断言 4: 至少一条告警 severity 为 high 或 critical =====
+    let has_high_or_critical = alerts
+        .iter()
+        .any(|a| matches!(a.severity, Severity::High | Severity::Critical));
+    assert!(
+        has_high_or_critical,
+        "应至少有一条告警 severity 为 high 或 critical"
+    );
+
+    // ===== 验证 .encrypted 文件确实被检测到 =====
+    let encrypted_alerts: Vec<_> = alerts
+        .iter()
+        .filter(|a| a.rule_name.contains("勒索") || a.rule_name.contains("encrypt"))
+        .collect();
+    assert!(
+        !encrypted_alerts.is_empty(),
+        "应有勒索软件相关告警 (rule_name 含 '勒索' 或 'encrypt')"
+    );
+
+    // ===== 统计摘要 =====
+    assert!(forensic.event_count() >= 5, "forensic event_count 应 >= 5");
+    assert!(aggregator.seq() >= 5, "aggregator seq 应 >= 5");
+}
+
+/// Phase E1.3: 通过 MockEventSource 回放提权场景，验证全链路检测。
+///
+/// 场景事件序列 (privilege_escalation_scenario, 5 条):
+///   1. ExecEvent: chmod +s /bin/bash (SUID 提权)
+///   2. FileEvent (type=15): chmod 修改 /bin/bash 权限
+///   3. FileEvent (type=12): 写入 /etc/sudoers
+///   4. ExecEvent: LD_PRELOAD=/tmp/malicious.so /bin/su (DLL 劫持)
+///   5. SignalEvent (type=30): ptrace (syscall_nr=101, 进程注入)
+#[tokio::test]
+async fn test_privilege_escalation_full_chain() {
+    let (mut aggregator, mut detector, mut forensic, _chain, _dir) =
+        init_pipeline(&["privilege_escalation.yml"]);
+
+    // 内联 fallback 规则（与 privilege_escalation.yml 等价）
+    let fallback_yaml = r#"
+- name: "SUID 提权检测_inline"
+  description: "检测通过 chmod 设置 SUID 位进行提权"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: equals
+      value: "chmod"
+    - field: args
+      operator: regex
+      value: "(\\+s|u\\+s|4755|4[0-9]{3})"
+  alert_message: "检测到 chmod 设置 SUID 位操作"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1548.001"
+
+- name: "sudo 配置篡改检测_inline"
+  description: "检测对 /etc/sudoers 文件的写入操作"
+  severity: critical
+  conditions:
+    - field: filename
+      operator: contains
+      value: "/etc/sudoers"
+  alert_message: "检测到 /etc/sudoers 文件被修改"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1548.003"
+
+- name: "LD_PRELOAD 劫持检测_inline"
+  description: "检测通过 LD_PRELOAD 环境变量进行动态链接库劫持"
+  severity: high
+  conditions:
+    - field: args
+      operator: contains
+      value: "LD_PRELOAD"
+  alert_message: "检测到进程设置 LD_PRELOAD 环境变量"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1574.006"
+
+- name: "ptrace 进程注入检测_inline"
+  description: "检测通过 ptrace 系统调用注入其他进程"
+  severity: critical
+  conditions:
+    - field: syscall_nr
+      operator: equals
+      value: "101"
+  alert_message: "检测到 ptrace 系统调用"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1055.009"
+"#;
+    detector.load_rules_from_yaml(fallback_yaml).unwrap();
+
+    // 通过 MockEventSource 异步消费所有事件
+    let mut source =
+        MockEventSource::new_with_scenario(MockScenario::PrivilegeEscalation).with_loop(false);
+    let mut decoded_events: Vec<DecodedEvent> = Vec::new();
+    let mut alerts: Vec<Alert> = Vec::new();
+
+    while let Ok(Some(bytes)) = source.next_bytes().await {
+        let event = match aggregator.decode(&bytes) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        decoded_events.push(event.clone());
+
+        forensic.log_event(&event).unwrap();
+
+        let matches = detector.match_event(&event);
+        for m in &matches {
+            let alert = detector.generate_alert(m, &event);
+            forensic.log_alert(&alert).unwrap();
+            alerts.push(alert);
+        }
+    }
+    forensic.flush().unwrap();
+
+    // ===== 断言 1: 事件数 ≥ 3 (chmod +s / sudoers 写 / LD_PRELOAD + ptrace + chmod file = 5) =====
+    assert!(
+        decoded_events.len() >= 3,
+        "提权场景事件数应 >= 3, 实际: {}",
+        decoded_events.len()
+    );
+
+    // ===== 断言 2: 至少一条告警含 SUID 评分 (chmod +s / chmod 4755 模式) =====
+    let suid_alerts: Vec<_> = alerts
+        .iter()
+        .filter(|a| a.rule_name.contains("SUID"))
+        .collect();
+    assert!(
+        !suid_alerts.is_empty(),
+        "应至少有一条告警含 SUID 评分 (rule_name 含 'SUID'), 实际 SUID 告警数: {}",
+        suid_alerts.len()
+    );
+
+    // ===== 断言 3: 至少一条告警 severity 为 high =====
+    let has_high = alerts
+        .iter()
+        .any(|a| matches!(a.severity, Severity::High | Severity::Critical));
+    assert!(has_high, "应至少有一条告警 severity 为 high 或 critical");
+
+    // ===== 验证 LD_PRELOAD 告警生成 =====
+    let ldpreload_alerts: Vec<_> = alerts
+        .iter()
+        .filter(|a| a.rule_name.contains("LD_PRELOAD"))
+        .collect();
+    assert!(!ldpreload_alerts.is_empty(), "应有 LD_PRELOAD 劫持相关告警");
+
+    // ===== 验证 sudoers 篡改告警生成 =====
+    let sudoers_alerts: Vec<_> = alerts
+        .iter()
+        .filter(|a| a.rule_name.contains("sudo") || a.rule_name.contains("sudoers"))
+        .collect();
+    assert!(!sudoers_alerts.is_empty(), "应有 sudo 配置篡改相关告警");
+
+    // ===== 统计摘要 =====
+    assert!(forensic.event_count() >= 3, "forensic event_count 应 >= 3");
+    assert!(aggregator.seq() >= 3, "aggregator seq 应 >= 3");
+}
+
+// ========== Phase E4.4: 新探针事件集成测试 ==========
+//
+// E4.4.4: 验证 3 个新探针事件 (event_type=80/81/82) 的规则匹配与告警生成。
+//
+// 探针来源:
+//   - event_type=80 (EVENT_CONTAINER_ESCAPE) — ks_probes_container.h (kprobe/commit_creds)
+//   - event_type=81 (EVENT_LKM_LOAD)         — ks_probes_lkm.h (kprobe/do_init_module)
+//   - event_type=82 (EVENT_EBPF_TAMPER)      — ks_probes_self_protect.h (kprobe/security_bpf_prog_free)
+//
+// E4.4 重构后:
+//   - ks_core::event 已新增 ContainerEscapeEvent / LkmLoadEvent / EbpfTamperEvent 三个 #[repr(C)] struct
+//     (镜像 eBPF C 头)，并加入 RawEvent union。
+//   - ks_engine::aggregator::decode() 已新增 80/81/82 三个分支，自动解码 source_ns_inum /
+//     target_ns_inum / cap_eff / module_name / prog_name / action 等字段。
+//   - ks_core::rule::Field 枚举已新增对应变体，规则可直接引用 module_name / prog_name /
+//     action / source_ns_inum / target_ns_inum / cap_eff 字段。
+//   测试不再需要手动从原始字节提取 module_name 注入 DecodedEvent.args，
+//   直接通过 aggregator.decode() 解码后断言新字段。
+
+/// 构造 64 字节 C 字符串缓冲区 (用于 module_name / prog_name 字段)
+fn make_cstr_64(s: &str) -> [u8; 64] {
+    let mut buf = [0u8; 64];
+    let len = s.len().min(63);
+    buf[..len].copy_from_slice(s.as_bytes());
+    buf
+}
+
+/// Phase E4.4.1: 验证容器逃逸事件 (event_type=80) 触发 critical 告警。
+///
+/// 构造 mock container_escape_event:
+///   - comm="runc" (容器运行时进程，commit_creds 触发时高度可疑)
+///   - source_ns_inum=4026532185 (容器命名空间)
+///   - target_ns_inum=4026531837 (宿主命名空间，差异表示逃逸)
+///   - cap_eff=0x1fffffff (CAP_SYS_ADMIN 等全权限)
+///
+/// 验证: 规则匹配 → critical 告警生成 → MITRE TA0004/T1611
+#[tokio::test]
+async fn test_container_escape_rule_triggers_critical_alert() {
+    let (mut aggregator, mut detector, mut forensic, _chain, _dir) =
+        init_pipeline(&["container-escape.yml"]);
+
+    // 内联 fallback 规则 (保证规则文件缺失时仍能匹配)
+    let fallback_yaml = r#"
+- name: "容器逃逸检测"
+  description: "检测容器内进程通过 commit_creds 切换命名空间或提升权限 (event_type=80)"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(runc|docker|containerd|setns|unshare|podman|crio)"
+  alert_message: "检测到容器逃逸行为: 容器运行时进程触发 commit_creds"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1611"
+"#;
+    detector.load_rules_from_yaml(fallback_yaml).unwrap();
+
+    // 构造 mock container_escape_event (event_type=80)
+    let evt = ContainerEscapeEvent {
+        header: EventHeader {
+            event_type: 80,
+            _pad1: 0,
+            timestamp_ns: 700_000_000_000,
+            pid: 2345,
+            tid: 2345,
+            uid: 0,
+            ppid: 1,
+            comm: make_cstr_16("runc"),
+            syscall_nr: 0,
+            _pad2: 0,
+            retval: 0,
+        },
+        pid: 2345,
+        uid: 0,
+        source_ns_inum: 4026532185, // 容器 mnt_ns inum
+        target_ns_inum: 4026531837, // 宿主 mnt_ns inum (差异 = 逃逸)
+        cap_eff: 0x1fffffff,        // 全 cap (CAP_SYS_ADMIN 等)
+        _pad_container1: 0,
+        comm: make_cstr_16("runc"),
+    };
+    let bytes = encode_struct(&evt);
+
+    // 通过聚合器解码 (event_type=80 走新增的 container_escape 分支)
+    let event = aggregator.decode(&bytes).unwrap();
+    forensic.log_event(&event).unwrap();
+
+    // 验证解码: event_type=80, comm="runc", 以及 E4.4 新增字段
+    assert_eq!(
+        event.header.event_type, 80,
+        "event_type 应为 80 (EVENT_CONTAINER_ESCAPE)"
+    );
+    assert_eq!(event.comm, "runc", "comm 应解码为 runc");
+    assert_eq!(
+        event.source_ns_inum,
+        Some(4026532185),
+        "source_ns_inum 应解码为容器 mnt_ns inum"
+    );
+    assert_eq!(
+        event.target_ns_inum,
+        Some(4026531837),
+        "target_ns_inum 应解码为宿主 mnt_ns inum"
+    );
+    assert_eq!(event.cap_eff, Some(0x1fffffff), "cap_eff 应解码为全 cap 值");
+    assert!(
+        event.module_name.is_none(),
+        "container_escape 事件 module_name 应为 None"
+    );
+    assert!(
+        event.prog_name.is_none(),
+        "container_escape 事件 prog_name 应为 None"
+    );
+    assert!(
+        event.action.is_none(),
+        "container_escape 事件 action 应为 None"
+    );
+
+    // 规则匹配
+    let matches = detector.match_event(&event);
+    assert!(!matches.is_empty(), "容器逃逸事件 (comm=runc) 应触发规则");
+
+    // 验证告警 severity 为 critical
+    let has_critical = matches
+        .iter()
+        .any(|m| matches!(m.severity, Severity::Critical));
+    assert!(
+        has_critical,
+        "容器逃逸应触发 critical 告警, 实际匹配: {:?}",
+        matches.iter().map(|m| &m.severity).collect::<Vec<_>>()
+    );
+
+    // 生成告警并验证 MITRE 标注
+    let critical_match = matches
+        .iter()
+        .find(|m| matches!(m.severity, Severity::Critical))
+        .unwrap();
+    let alert = detector.generate_alert(critical_match, &event);
+    assert_eq!(alert.severity, Severity::Critical);
+    assert!(!alert.id.is_nil(), "告警 ID 应非 nil");
+    assert!(alert.mitre.is_some(), "告警应含 MITRE 标注");
+    let mitre = alert.mitre.as_ref().unwrap();
+    assert_eq!(
+        mitre.tactic, "TA0004",
+        "MITRE tactic 应为 TA0004 (Privilege Escalation)"
+    );
+    assert_eq!(
+        mitre.technique, "T1611",
+        "MITRE technique 应为 T1611 (Escape to Host)"
+    );
+
+    forensic.log_alert(&alert).unwrap();
+    forensic.flush().unwrap();
+
+    // 统计摘要
+    assert!(forensic.event_count() >= 1, "forensic event_count 应 >= 1");
+    assert!(aggregator.seq() >= 1, "aggregator seq 应 >= 1");
+}
+
+/// Phase E4.4.2: 验证 LKM Rootkit 加载 (module_name 含 rootkit) 触发 critical 告警。
+///
+/// 构造 mock lkm_load_event (event_type=81):
+///   - comm="insmod" (模块加载工具)
+///   - module_name="rootkit.ko" (含 rootkit 关键词)
+///
+/// 验证: critical 规则匹配 (comm=insmod AND module_name 含 rootkit) → critical 告警
+#[tokio::test]
+async fn test_lkm_load_rule_rootkit_critical() {
+    let (mut aggregator, mut detector, mut forensic, _chain, _dir) =
+        init_pipeline(&["lkm-load.yml"]);
+
+    // 内联 fallback 规则 (E4.4 重构后: module_name 字段直接由 aggregator 解码)
+    let fallback_yaml = r#"
+- name: "LKM Rootkit 加载检测"
+  description: "检测加载可疑内核模块 (rootkit/backdoor/nf_hook) (event_type=81)"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(insmod|modprobe)"
+    - field: module_name
+      operator: regex
+      value: "(rootkit|backdoor|nf_hook)"
+  alert_message: "检测到可疑内核模块加载 (rootkit/backdoor)"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547.006"
+
+- name: "LKM 普通模块加载"
+  description: "检测加载普通内核模块 (event_type=81)"
+  severity: low
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(insmod|modprobe)"
+  alert_message: "检测到内核模块加载操作 (普通模块)"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547.006"
+"#;
+    detector.load_rules_from_yaml(fallback_yaml).unwrap();
+
+    // 构造 mock lkm_load_event (event_type=81, module_name="rootkit.ko")
+    let module_name = "rootkit.ko";
+    let evt = LkmLoadEvent {
+        header: EventHeader {
+            event_type: 81,
+            _pad1: 0,
+            timestamp_ns: 800_000_000_000,
+            pid: 3456,
+            tid: 3456,
+            uid: 0,
+            ppid: 1,
+            comm: make_cstr_16("insmod"),
+            syscall_nr: 0,
+            _pad2: 0,
+            retval: 0,
+        },
+        pid: 3456,
+        uid: 0,
+        _pad_lkm1: 0,
+        module_name: make_cstr_64(module_name),
+        comm: make_cstr_16("insmod"),
+    };
+    let bytes = encode_struct(&evt);
+
+    // 通过聚合器解码 (event_type=81 走新增的 lkm_load 分支，自动解码 module_name)
+    let event = aggregator.decode(&bytes).unwrap();
+    forensic.log_event(&event).unwrap();
+
+    // 验证解码: event_type=81, comm="insmod", module_name="rootkit.ko"
+    assert_eq!(
+        event.header.event_type, 81,
+        "event_type 应为 81 (EVENT_LKM_LOAD)"
+    );
+    assert_eq!(event.comm, "insmod", "comm 应解码为 insmod");
+    assert_eq!(
+        event.module_name.as_deref(),
+        Some("rootkit.ko"),
+        "module_name 应解码为 rootkit.ko, 实际: {:?}",
+        event.module_name
+    );
+    assert!(
+        event.prog_name.is_none(),
+        "lkm_load 事件 prog_name 应为 None"
+    );
+    assert!(
+        event.source_ns_inum.is_none(),
+        "lkm_load 事件 source_ns_inum 应为 None"
+    );
+    assert!(
+        event.target_ns_inum.is_none(),
+        "lkm_load 事件 target_ns_inum 应为 None"
+    );
+    assert!(event.cap_eff.is_none(), "lkm_load 事件 cap_eff 应为 None");
+    assert!(event.action.is_none(), "lkm_load 事件 action 应为 None");
+
+    // 规则匹配
+    let matches = detector.match_event(&event);
+    assert!(
+        !matches.is_empty(),
+        "LKM rootkit 加载事件 (comm=insmod, module_name=rootkit.ko) 应触发规则"
+    );
+
+    // 验证含 critical 告警
+    let has_critical = matches
+        .iter()
+        .any(|m| matches!(m.severity, Severity::Critical));
+    assert!(
+        has_critical,
+        "rootkit 模块加载应触发 critical 告警, 实际匹配: {:?}",
+        matches.iter().map(|m| &m.severity).collect::<Vec<_>>()
+    );
+
+    // 生成告警并验证 MITRE
+    let critical_match = matches
+        .iter()
+        .find(|m| matches!(m.severity, Severity::Critical))
+        .unwrap();
+    let alert = detector.generate_alert(critical_match, &event);
+    assert_eq!(alert.severity, Severity::Critical);
+    let mitre = alert.mitre.as_ref().unwrap();
+    assert_eq!(
+        mitre.tactic, "TA0003",
+        "MITRE tactic 应为 TA0003 (Persistence)"
+    );
+    assert_eq!(
+        mitre.technique, "T1547.006",
+        "MITRE technique 应为 T1547.006 (Kernel Modules)"
+    );
+
+    forensic.log_alert(&alert).unwrap();
+    forensic.flush().unwrap();
+}
+
+/// Phase E4.4.2: 验证 LKM 普通模块加载 (非 rootkit) 仅触发 low 告警。
+///
+/// 构造 mock lkm_load_event (event_type=81):
+///   - comm="insmod"
+///   - module_name="ext4.ko" (不含 rootkit/backdoor/nf_hook 关键词)
+///
+/// 验证: 仅匹配 low 规则 (comm=insmod)，不触发 critical
+#[tokio::test]
+async fn test_lkm_load_rule_normal_info() {
+    let (mut aggregator, mut detector, mut forensic, _chain, _dir) =
+        init_pipeline(&["lkm-load.yml"]);
+
+    // 内联 fallback 规则 (与 test_lkm_load_rule_rootkit_critical 相同)
+    // E4.4 重构后: module_name 字段直接由 aggregator 解码
+    let fallback_yaml = r#"
+- name: "LKM Rootkit 加载检测"
+  description: "检测加载可疑内核模块 (rootkit/backdoor/nf_hook) (event_type=81)"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(insmod|modprobe)"
+    - field: module_name
+      operator: regex
+      value: "(rootkit|backdoor|nf_hook)"
+  alert_message: "检测到可疑内核模块加载 (rootkit/backdoor)"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547.006"
+
+- name: "LKM 普通模块加载"
+  description: "检测加载普通内核模块 (event_type=81)"
+  severity: low
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(insmod|modprobe)"
+  alert_message: "检测到内核模块加载操作 (普通模块)"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547.006"
+"#;
+    detector.load_rules_from_yaml(fallback_yaml).unwrap();
+
+    // 构造 mock lkm_load_event (module_name="ext4.ko" — 普通文件系统模块)
+    let module_name = "ext4.ko";
+    let evt = LkmLoadEvent {
+        header: EventHeader {
+            event_type: 81,
+            _pad1: 0,
+            timestamp_ns: 810_000_000_000,
+            pid: 3457,
+            tid: 3457,
+            uid: 0,
+            ppid: 1,
+            comm: make_cstr_16("modprobe"),
+            syscall_nr: 0,
+            _pad2: 0,
+            retval: 0,
+        },
+        pid: 3457,
+        uid: 0,
+        _pad_lkm1: 0,
+        module_name: make_cstr_64(module_name),
+        comm: make_cstr_16("modprobe"),
+    };
+    let bytes = encode_struct(&evt);
+
+    // 通过聚合器解码 (event_type=81 走新增的 lkm_load 分支，自动解码 module_name)
+    let event = aggregator.decode(&bytes).unwrap();
+    forensic.log_event(&event).unwrap();
+
+    // 验证解码
+    assert_eq!(
+        event.header.event_type, 81,
+        "event_type 应为 81 (EVENT_LKM_LOAD)"
+    );
+    assert_eq!(event.comm, "modprobe", "comm 应解码为 modprobe");
+    assert_eq!(
+        event.module_name.as_deref(),
+        Some("ext4.ko"),
+        "module_name 应解码为 ext4.ko, 实际: {:?}",
+        event.module_name
+    );
+
+    // 规则匹配
+    let matches = detector.match_event(&event);
+    assert!(
+        !matches.is_empty(),
+        "普通模块加载 (comm=modprobe) 应触发 low 规则"
+    );
+
+    // 验证不含 critical 告警 (ext4.ko 不含 rootkit/backdoor/nf_hook)
+    let has_critical = matches
+        .iter()
+        .any(|m| matches!(m.severity, Severity::Critical));
+    assert!(
+        !has_critical,
+        "普通模块加载 (ext4.ko) 不应触发 critical 告警, 实际匹配: {:?}",
+        matches.iter().map(|m| &m.severity).collect::<Vec<_>>()
+    );
+
+    // 验证含 low 告警
+    let has_low = matches.iter().any(|m| matches!(m.severity, Severity::Low));
+    assert!(
+        has_low,
+        "普通模块加载应触发 low 告警, 实际匹配: {:?}",
+        matches.iter().map(|m| &m.severity).collect::<Vec<_>>()
+    );
+
+    // 生成 low 告警
+    let low_match = matches
+        .iter()
+        .find(|m| matches!(m.severity, Severity::Low))
+        .unwrap();
+    let alert = detector.generate_alert(low_match, &event);
+    assert_eq!(alert.severity, Severity::Low);
+    assert!(!alert.id.is_nil());
+
+    forensic.log_alert(&alert).unwrap();
+    forensic.flush().unwrap();
+}
+
+/// Phase E4.4.3: 验证 eBPF 程序篡改事件 (event_type=82) 触发 critical 告警。
+///
+/// 构造 mock ebpf_tamper_event:
+///   - comm="bpftool" (BPF 管理工具，篡改 BPF 程序时高度可疑)
+///   - prog_name="kprobe_commit_creds" (本项目安全探针)
+///   - action="free" (卸载操作)
+///
+/// 验证: 规则匹配 → critical 告警 → MITRE TA0005/T1562
+#[tokio::test]
+async fn test_ebpf_tamper_rule_critical() {
+    let (mut aggregator, mut detector, mut forensic, _chain, _dir) =
+        init_pipeline(&["ebpf-tamper.yml"]);
+
+    // 内联 fallback 规则
+    let fallback_yaml = r#"
+- name: "eBPF 程序篡改检测"
+  description: "检测 BPF 程序被卸载/篡改 (event_type=82, 探针: kprobe/security_bpf_prog_free)"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(bpftool|rmmod|systemd|kill|bpftool_rls)"
+  alert_message: "检测到 eBPF 程序被篡改/卸载，疑似防御规避 (Impair Defenses)"
+  mitre_tactic: "TA0005"
+  mitre_technique: "T1562"
+"#;
+    detector.load_rules_from_yaml(fallback_yaml).unwrap();
+
+    // 构造 mock ebpf_tamper_event (event_type=82)
+    let mut action_buf = [0u8; 16];
+    let action = b"free";
+    action_buf[..action.len()].copy_from_slice(action);
+
+    let evt = EbpfTamperEvent {
+        header: EventHeader {
+            event_type: 82,
+            _pad1: 0,
+            timestamp_ns: 900_000_000_000,
+            pid: 4567,
+            tid: 4567,
+            uid: 0,
+            ppid: 1,
+            comm: make_cstr_16("bpftool"),
+            syscall_nr: 0,
+            _pad2: 0,
+            retval: 0,
+        },
+        pid: 4567,
+        uid: 0,
+        _pad_self1: 0,
+        prog_name: make_cstr_64("kprobe_commit_creds"),
+        comm: make_cstr_16("bpftool"),
+        action: action_buf,
+    };
+    let bytes = encode_struct(&evt);
+
+    // 通过聚合器解码 (event_type=82 走新增的 ebpf_tamper 分支，自动解码 prog_name/action)
+    let event = aggregator.decode(&bytes).unwrap();
+    forensic.log_event(&event).unwrap();
+
+    // 验证解码: event_type=82, comm="bpftool", 以及 E4.4 新增字段
+    assert_eq!(
+        event.header.event_type, 82,
+        "event_type 应为 82 (EVENT_EBPF_TAMPER)"
+    );
+    assert_eq!(event.comm, "bpftool", "comm 应解码为 bpftool");
+    assert_eq!(
+        event.prog_name.as_deref(),
+        Some("kprobe_commit_creds"),
+        "prog_name 应解码为 kprobe_commit_creds, 实际: {:?}",
+        event.prog_name
+    );
+    assert_eq!(
+        event.action.as_deref(),
+        Some("free"),
+        "action 应解码为 free, 实际: {:?}",
+        event.action
+    );
+    assert!(
+        event.module_name.is_none(),
+        "ebpf_tamper 事件 module_name 应为 None"
+    );
+    assert!(
+        event.source_ns_inum.is_none(),
+        "ebpf_tamper 事件 source_ns_inum 应为 None"
+    );
+    assert!(
+        event.target_ns_inum.is_none(),
+        "ebpf_tamper 事件 target_ns_inum 应为 None"
+    );
+    assert!(
+        event.cap_eff.is_none(),
+        "ebpf_tamper 事件 cap_eff 应为 None"
+    );
+
+    // 规则匹配
+    let matches = detector.match_event(&event);
+    assert!(
+        !matches.is_empty(),
+        "eBPF 篡改事件 (comm=bpftool) 应触发规则"
+    );
+
+    // 验证含 critical 告警
+    let has_critical = matches
+        .iter()
+        .any(|m| matches!(m.severity, Severity::Critical));
+    assert!(
+        has_critical,
+        "eBPF 篡改应触发 critical 告警, 实际匹配: {:?}",
+        matches.iter().map(|m| &m.severity).collect::<Vec<_>>()
+    );
+
+    // 生成告警并验证 MITRE
+    let critical_match = matches
+        .iter()
+        .find(|m| matches!(m.severity, Severity::Critical))
+        .unwrap();
+    let alert = detector.generate_alert(critical_match, &event);
+    assert_eq!(alert.severity, Severity::Critical);
+    assert!(!alert.id.is_nil(), "告警 ID 应非 nil");
+    let mitre = alert.mitre.as_ref().unwrap();
+    assert_eq!(
+        mitre.tactic, "TA0005",
+        "MITRE tactic 应为 TA0005 (Defense Evasion)"
+    );
+    assert_eq!(
+        mitre.technique, "T1562",
+        "MITRE technique 应为 T1562 (Impair Defenses)"
+    );
+
+    forensic.log_alert(&alert).unwrap();
+    forensic.flush().unwrap();
+
+    // 统计摘要
+    assert!(forensic.event_count() >= 1, "forensic event_count 应 >= 1");
+    assert!(aggregator.seq() >= 1, "aggregator seq 应 >= 1");
 }

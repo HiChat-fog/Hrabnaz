@@ -30,6 +30,123 @@ typedef __s64 i64;
     #define KS_LRU_HASH  1
 #endif
 
+/* ── C1: Ancient tier shim — bpf_probe_read_kernel 系列回退 ──
+ * 3.10 无 bpf_probe_read_kernel / bpf_probe_read_kernel_str helper，
+ * 回退到 bpf_probe_read / bpf_probe_read_str（语义等价）。
+ * BPF_CORE_READ 内部调用 bpf_probe_read_kernel，经此 shim 自动重定向。
+ *
+ * C0: 同时回退 bpf_probe_read_user / bpf_probe_read_user_str。
+ *      这两个 helper 同为 5.5+ 引入（vmlinux.h 编号 112/114），
+ *      ks_probes_syscall.h 中 trace_sys_exit 探针主动调用。
+ *      bpf_probe_read 对 __user 指针也能 fault-in 用户页，语义等价。
+ */
+#ifdef KS_TIER_ANCIENT
+    #define bpf_probe_read_kernel       bpf_probe_read
+    #define bpf_probe_read_kernel_str   bpf_probe_read_str
+    #define bpf_probe_read_user         bpf_probe_read
+    #define bpf_probe_read_user_str     bpf_probe_read_str
+#endif
+
+/* ── NOBTF: 无 BTF 环境下的 BPF_CORE_READ 替代 ──
+ * 3.10.0-1160 stock 内核有完整 eBPF 支持（bpf syscall + helpers + JIT），
+ * 但无 BTF（CONFIG_DEBUG_INFO_BTF 未启用）。
+ * BPF_CORE_READ 依赖 .BTF.ext 重定位，无 BTF 时加载失败。
+ *
+ * NOBTF 方案：用 bpf_probe_read + 硬编码 offset 替代 BPF_CORE_READ。
+ * Offset 通过 kernel module 在 3.10.0-1160.119.1.el7.x86_64 上实测获取。
+ *
+ * BPF_CORE_READ(ptr, field) → KS_NOREAD_##field(ptr) 分发
+ * 注意：d_name.name 含点号无法 token-paste，改用 KS_READ_DNAME(ptr)
+ */
+#ifdef KS_NOBTF
+    #undef BPF_CORE_READ
+
+    /* 实测 offset（3.10.0-1160.119.1.el7.x86_64） */
+    #define KS_OFF_INET_SADDR          776
+    #define KS_OFF_INET_SPORT          784
+    #define KS_OFF_SOCK_COMMON         0
+    #define KS_OFF_PATH_DENTRY         8
+    #define KS_OFF_DENTRY_DNAME_NAME   40
+    #define KS_OFF_FILE_FPATH          16
+    #define KS_OFF_SIN6_PORT           2
+
+    #define BPF_CORE_READ(ptr, field) KS_NOREAD_##field(ptr)
+
+    #define KS_NOREAD_inet_saddr(ptr)   ({ u32 _v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_INET_SADDR); _v; })
+    #define KS_NOREAD_inet_sport(ptr)   ({ u16 _v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_INET_SPORT); _v; })
+    #define KS_NOREAD___sk_common(ptr)  ({ struct sock_common _v={}; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_SOCK_COMMON); _v; })
+    #define KS_NOREAD_dentry(ptr)       ({ struct dentry *_v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_PATH_DENTRY); _v; })
+    #define KS_NOREAD_f_path(ptr)       ({ struct path _v={}; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_FILE_FPATH); _v; })
+    #define KS_NOREAD_sin6_port(ptr)    ({ u16 _v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_SIN6_PORT); _v; })
+
+    #define KS_READ_DNAME(ptr) ({ const char *_v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_DENTRY_DNAME_NAME); _v; })
+#else
+    /* 非 NOBTF：走标准 BPF_CORE_READ CO-RE 重定位 */
+    #define KS_READ_DNAME(ptr) BPF_CORE_READ(ptr, d_name.name)
+#endif
+
+/* ── C2: KS_D_PATH 宏 — 文件路径读取 ──
+ * 所有 tier 统一用手动 dentry 遍历（bpf_d_path 仅允许 tracing/LSM 程序使用，
+ * kprobe 程序不能用）。Ancient tier 依赖 BTF backport 使 BPF_CORE_READ 可用。
+ * 签名：KS_D_PATH(buf, buf_len, path_ptr)  返回 < 0 失败
+ */
+#define KS_D_PATH(buf, buf_len, path_ptr) ({ \
+    struct dentry *_d = BPF_CORE_READ((path_ptr), dentry); \
+    const char *_n = KS_READ_DNAME(_d); \
+    bpf_probe_read_kernel_str((char *)(buf), (buf_len), _n); \
+})
+
+/* ── C3: KS_LRU_HASH_MAP 宏 — LRU_HASH 声明兼容 ──
+ * Modern/Legacy: BPF_MAP_TYPE_LRU_HASH（自动 LRU 淘汰）
+ * Ancient: BPF_MAP_TYPE_HASH（3.10 无 LRU_HASH，HASH 是唯一选项）
+ * 签名：KS_LRU_HASH_MAP(name, key_type, value_type, max_entries)
+ */
+#if KS_LRU_HASH
+    #define KS_LRU_HASH_MAP(name, key_type, value_type, cap) \
+        struct { \
+            __uint(type, BPF_MAP_TYPE_LRU_HASH); \
+            __type(key, key_type); \
+            __type(value, value_type); \
+            __uint(max_entries, cap); \
+        } name SEC(".maps")
+#else
+    #define KS_LRU_HASH_MAP(name, key_type, value_type, cap) \
+        struct { \
+            __uint(type, BPF_MAP_TYPE_HASH); \
+            __type(key, key_type); \
+            __type(value, value_type); \
+            __uint(max_entries, cap); \
+        } name SEC(".maps")
+#endif
+
+/* ── C5: KS_PERCPU_ARRAY_MAP 宏 — PERCPU_ARRAY 声明兼容 ──
+ * Modern/Legacy: BPF_MAP_TYPE_PERCPU_ARRAY（4.6+，per-CPU 无锁）
+ * Ancient: BPF_MAP_TYPE_ARRAY + bpf_get_smp_processor_id() 作 key 模拟 per-CPU
+ *          （3.10 无 PERCPU_ARRAY，回退到普通 ARRAY + CPU 索引）
+ * 签名：KS_PERCPU_ARRAY_MAP(name, value_type)
+ *       配套 KS_PERCPU_KEY() 取当前 CPU 的 key
+ * 注意：Ancient 路径要求 ARRAY 容量 >= NR_CPUS（设 256，覆盖典型服务器）
+ */
+#if KS_LRU_HASH
+    #define KS_PERCPU_ARRAY_MAP(name, value_type) \
+        struct { \
+            __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); \
+            __uint(max_entries, 1); \
+            __type(key, u32); \
+            __type(value, value_type); \
+        } name SEC(".maps")
+    #define KS_PERCPU_KEY() ((u32)0)
+#else
+    #define KS_PERCPU_ARRAY_MAP(name, value_type) \
+        struct { \
+            __uint(type, BPF_MAP_TYPE_ARRAY); \
+            __uint(max_entries, 256); \
+            __type(key, u32); \
+            __type(value, value_type); \
+        } name SEC(".maps")
+    #define KS_PERCPU_KEY() ((u32)bpf_get_smp_processor_id())
+#endif
+
 /* ── 事件 Map 声明宏（ringbuf vs perf_event_array）────────── */
 #if KS_RINGBUF
     #define KS_EVENT_MAP(name, size) \
@@ -38,21 +155,38 @@ typedef __s64 i64;
             __uint(max_entries, size); \
         } name SEC(".maps")
 #else
+    /* PERF_EVENT_ARRAY: max_entries=0 是 4.6+ 特性，3.10 不支持。
+     * 设 256 覆盖典型服务器 NR_CPUS，aya 按 CPU 索引写入。 */
     #define KS_EVENT_MAP(name, size) \
         struct { \
             __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); \
-            __uint(max_entries, 0); \
+            __uint(max_entries, 256); \
             __type(key, i32); \
             __type(value, u32); \
         } name SEC(".maps")
 #endif
 
-/* ── 事件提交宏（ringbuf 路径已实现，perfbuf 路径 Phase B 实现）── */
+/* ── 事件提交宏（ringbuf + perfbuf 统一接口，tier-agnostic）──
+ * B1: perfbuf 路径用 PERCPU_ARRAY scratch 暂存事件结构体，
+ * 绕过 BPF 512 字节栈限制。BPF 程序 per-CPU 不可抢占，
+ * 一个 CPU 同时只有一个事件在飞，scratch 无竞争。
+ * KS_SUBMIT 签名统一为 (ctx, buf, evt)：ringbuf 路径忽略 ctx/buf，
+ * perfbuf 路径用 ctx 调 bpf_perf_event_output + buf 指定 perf_event_array map。
+ */
 #if KS_RINGBUF
     #define KS_RESERVE(buf, type) ((type *)bpf_ringbuf_reserve(&(buf), sizeof(type), 0))
-    #define KS_SUBMIT(evt)        bpf_ringbuf_submit((evt), 0)
+    #define KS_SUBMIT(ctx, buf, evt) bpf_ringbuf_submit((evt), 0)
 #else
-    #error "perfbuf 路径尚未实现，请在 Phase B 中完成 KS_RESERVE/KS_SUBMIT 的 perfbuf 分支"
+    /* PERCPU_ARRAY scratch：value=u8[1024] 覆盖最大事件结构体 exec_event(~816B)
+     * C5: 通过 KS_PERCPU_ARRAY_MAP 宏，Ancient tier 自动回退到 CPU-keyed ARRAY */
+    KS_PERCPU_ARRAY_MAP(ks_scratch, u8[1024]);
+
+    #define KS_RESERVE(buf, type) ({ \
+        u32 _k = KS_PERCPU_KEY(); \
+        (type *)bpf_map_lookup_elem(&ks_scratch, &_k); \
+    })
+    #define KS_SUBMIT(ctx, buf, evt) \
+        bpf_perf_event_output((ctx), &(buf), BPF_F_CURRENT_CPU, (evt), sizeof(*(evt)))
 #endif
 
 /* ── 事件类型常量 ───────────────────────────── */
@@ -74,6 +208,13 @@ typedef __s64 i64;
 #define EVENT_PROC_PTRACE   30
 #define EVENT_PROC_SIGNAL   31
 
+/* E4.1/E4.2/E4.3: 安全探针事件类型（提交到 events ringbuf）
+ * 避开 1-31 syscall/vfs/net/signal、40-43 tree、50-54 flow、60-61 freq、70-72 filter。
+ * 80-82 是新分配的安全事件段。 */
+#define EVENT_CONTAINER_ESCAPE 80
+#define EVENT_LKM_LOAD         81
+#define EVENT_EBPF_TAMPER      82
+
 /* ── 共享 BPF Maps ────────────────────────── */
 
 /* 推理配置 / 风险分 / IP白名单 / 网络连接历史 */
@@ -84,30 +225,76 @@ struct {
     __type(value, u32);
 } infer_config SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 4096);
-    __type(key, u32);
-    __type(value, u32);
-} risk_scores SEC(".maps");
+/* ── G2.1: 内核态阻断 block_decisions map ──
+ * 申报书第四阶段："阻断机制基于 bpf_send_signal 实现...探针调用 bpf_send_signal 发送 SIGKILL"
+ * 用户态 BlockManager.block_pid() 写入，内核态探针查询。
+ *   key=pid, value={expire_ns, reason}
+ *   expire_ns: 0=永久阻断；否则 bpf_ktime_get_ns() < expire_ns 阻断
+ * 阻断 reason 编码（与用户态 BlockReason 枚举对齐）：
+ *   1=RuleMatch / 2=BaselineDeviation / 3=MlAnomaly / 4=Correlation / 5=Manual
+ */
+struct block_key { u32 pid; u32 _pad_blk; };
+struct block_value {
+    u64 expire_ns;
+    u8  reason;
+    u8  _pad_bv[7];
+};
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 256);
-    __type(key, u32);
-    __type(value, u8);
-} ip_whitelist SEC(".maps");
+KS_LRU_HASH_MAP(block_decisions, struct block_key, struct block_value, 4096);
+
+/* G2.1: 内核态阻断查询 — 命中且未过期则 SIGKILL（仅 Modern tier）。
+ * Modern tier（5.8+）一定支持 bpf_send_signal（5.4+ helper）。
+ * Legacy/Ancient 不调 bpf_send_signal（兼容性未知），仅返回是否应阻断，
+ * 由用户态反向通道（BlockManager）补齐。
+ *
+ * 申报书第四阶段对齐：infer 返回 verdict==2（风险分≥70）时，探针在内核态
+ * 直接调 bpf_send_signal(SIGKILL) 终止恶意进程（零延迟阻断）。
+ * bpf_send_signal 发送给当前任务（即触发该 syscall 的进程本身），
+ * 监控系统自身不发起恶意 syscall，故不会"自杀"。
+ * 此外仍查 block_decisions map —— 用户态 BlockManager 显式写入的 PID 也阻断。 */
+#if KS_RINGBUF
+static __always_inline int ks_check_block(u32 pid) {
+    struct block_key bk = { .pid = pid, ._pad_blk = 0 };
+    struct block_value *bv = bpf_map_lookup_elem(&block_decisions, &bk);
+    if (!bv) return 0;
+    if (bv->expire_ns == 0 || bpf_ktime_get_ns() < bv->expire_ns) {
+        bpf_send_signal(9); /* SIGKILL */
+        return 1;
+    }
+    return 0;
+}
+
+#define KS_MAYBE_BLOCK(pid, verdict) do { \
+    if ((verdict) == 2) { bpf_send_signal(9); /* SIGKILL — verdict==2 内核态直接阻断(申报书第四阶段) */ } \
+    ks_check_block((pid)); \
+} while (0)
+#else
+/* Legacy/Ancient: 仅查询 map，不主动调 bpf_send_signal（兼容性未知） */
+static __always_inline int ks_check_block(u32 pid) {
+    struct block_key bk = { .pid = pid, ._pad_blk = 0 };
+    struct block_value *bv = bpf_map_lookup_elem(&block_decisions, &bk);
+    if (!bv) return 0;
+    if (bv->expire_ns == 0 || bpf_ktime_get_ns() < bv->expire_ns) {
+        return 1;
+    }
+    return 0;
+}
+
+#define KS_MAYBE_BLOCK(pid, verdict) do { \
+    (void)(verdict); \
+    ks_check_block((pid)); \
+} while (0)
+#endif
+
+KS_LRU_HASH_MAP(risk_scores, u32, u32, 4096);
+
+KS_LRU_HASH_MAP(ip_whitelist, u32, u8, 256);
 
 struct net_conn_key {
     u32 pid; u32 daddr; u16 dport; u8 proto;
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 8192);
-    __type(key, struct net_conn_key);
-    __type(value, u64);
-} net_conn_history SEC(".maps");
+KS_LRU_HASH_MAP(net_conn_history, struct net_conn_key, u64, 8192);
 
 /* 行为频率计数器（freq_counter / smart_filter 共享） */
 #define FREQ_ANOMALY_RANSOMWARE  (1 << 0)
@@ -123,12 +310,7 @@ struct freq_counter {
     u32 anomaly_flags, _pad_freq1;
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 4096);
-    __type(key, u32);
-    __type(value, struct freq_counter);
-} freq_counters SEC(".maps");
+KS_LRU_HASH_MAP(freq_counters, u32, struct freq_counter, 4096);
 
 /* ── 推理引擎 ──────────────────────────────── */
 
@@ -196,7 +378,8 @@ static __always_inline int infer_suspicious_net(u32 pid, u32 daddr, u16 dport, u
         dport != 27017 && dport != 33060)
         add_risk(pid, 10);
 
-    struct net_conn_key key = {.pid=pid, .daddr=daddr, .dport=dport, .proto=proto};
+    struct net_conn_key key = {};
+    key.pid = pid; key.daddr = daddr; key.dport = dport; key.proto = proto;
     u64 now = bpf_ktime_get_ns();
     u64 *prev = bpf_map_lookup_elem(&net_conn_history, &key);
     u64 window = 60000000000ULL; /* 60s 纳秒 */

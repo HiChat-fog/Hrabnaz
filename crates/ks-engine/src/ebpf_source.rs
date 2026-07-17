@@ -9,8 +9,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::loader::EbpfLoader;
 use crate::event_source::{EventSource, SourceKind};
+use crate::loader::EbpfLoader;
 
 /// 现代 eBPF tier 事件源：持有 EbpfLoader，round-robin 轮询 5 个 RingBuf。
 ///

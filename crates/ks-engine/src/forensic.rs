@@ -1,14 +1,14 @@
 //! JSONL 格式取证日志，带 SHA-256 哈希链防篡改。
 //! 支持自动轮转（按大小）+ gzip 归档 + 过期清理。
 
-use ks_core::alert::Alert;
 use crate::aggregator::DecodedEvent;
 use anyhow::Result;
-use sha2::{Sha256, Digest};
-use std::fs::{File, OpenOptions, read_dir, remove_file};
-use std::io::{BufWriter, Write, BufRead, BufReader};
-use std::path::{PathBuf, Path};
+use ks_core::alert::Alert;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::{read_dir, remove_file, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 pub trait HashAlgorithm: Send + Sync {
     fn hash(&self, data: &str) -> String;
@@ -33,7 +33,11 @@ pub struct RotationConfig {
 
 impl Default for RotationConfig {
     fn default() -> Self {
-        Self { max_file_size: 100 * 1024 * 1024, retain_days: 30, compress_archives: true }
+        Self {
+            max_file_size: 100 * 1024 * 1024,
+            retain_days: 30,
+            compress_archives: true,
+        }
     }
 }
 
@@ -59,12 +63,17 @@ impl ForensicLogger {
     }
 
     pub fn with_rotation(path: PathBuf, config: RotationConfig) -> Result<Self> {
-        let log_dir = path.parent()
+        let log_dir = path
+            .parent()
             .ok_or_else(|| anyhow::anyhow!("无法获取日志目录"))?
             .to_path_buf();
 
         let file_exists = path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false);
-        let current_file_size = if file_exists { path.metadata().map(|m| m.len()).unwrap_or(0) } else { 0 };
+        let current_file_size = if file_exists {
+            path.metadata().map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
 
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
@@ -80,27 +89,46 @@ impl ForensicLogger {
 
         Ok(Self {
             writer: BufWriter::with_capacity(65536, file),
-            path, prev_hash, event_count, alert_count: 0, last_flush_count: event_count,
-            hasher: Box::new(Sha256Hash), current_file_size, rotation_config: config, log_dir,
+            path,
+            prev_hash,
+            event_count,
+            alert_count: 0,
+            last_flush_count: event_count,
+            hasher: Box::new(Sha256Hash),
+            current_file_size,
+            rotation_config: config,
+            log_dir,
         })
     }
 
     /// 从已有日志恢复链尾哈希和事件计数
+    /// 跳过 alert 记录（只有 event 记录才有 seq 字段）
     fn recover_chain_state(path: &PathBuf) -> Result<(String, u64)> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let mut last_line = String::new();
-        for line in reader.lines().flatten() {
-            if !line.trim().is_empty() { last_line = line; }
+        let mut last_event_line = String::new();
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // 只保留含 "seq" 的行（event 记录），跳过 alert 记录
+            if line.contains("\"seq\"") {
+                last_event_line = line;
+            }
         }
-        if last_line.is_empty() {
+        if last_event_line.is_empty() {
             return Ok((GENESIS_HASH.to_string(), 0));
         }
-        let record: serde_json::Value = serde_json::from_str(&last_line)
+        let record: serde_json::Value = serde_json::from_str(&last_event_line)
             .map_err(|e| anyhow::anyhow!("最后记录 JSON 解析失败 — {}", e))?;
-        let hash = record.get("hash").and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("最后记录缺少 hash 字段"))?.to_string();
-        let seq = record.get("seq").and_then(|v| v.as_u64())
+        let hash = record
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("最后记录缺少 hash 字段"))?
+            .to_string();
+        let seq = record
+            .get("seq")
+            .and_then(|v| v.as_u64())
             .ok_or_else(|| anyhow::anyhow!("最后记录缺少 seq 字段"))?;
         Ok((hash, seq))
     }
@@ -112,11 +140,17 @@ impl ForensicLogger {
         }
         self.writer.flush()?;
 
-        let archive_name = format!("events_{}.jsonl", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+        let archive_name = format!(
+            "events_{}.jsonl",
+            chrono::Local::now().format("%Y%m%d_%H%M%S")
+        );
         let archive_path = self.log_dir.join(&archive_name);
         std::fs::rename(&self.path, &archive_path)?;
 
-        let new_file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let new_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         self.writer = BufWriter::with_capacity(65536, new_file);
         self.current_file_size = 0;
         log::info!("日志轮转: 归档至 {}", archive_path.display());
@@ -147,19 +181,40 @@ impl ForensicLogger {
             "comm": event.comm, "syscall_nr": event.header.syscall_nr, "retval": event.header.retval,
         });
 
-        if let Some(ref f) = event.filename { record["filename"] = serde_json::Value::String(f.clone()); }
-        if let Some(ref a) = event.args { record["args"] = serde_json::Value::String(a.clone()); }
-        if let Some(ref s) = event.saddr { record["saddr"] = serde_json::Value::String(s.clone()); }
-        if let Some(ref d) = event.daddr { record["daddr"] = serde_json::Value::String(d.clone()); }
-        if let Some(p) = event.sport { record["sport"] = serde_json::json!(p); }
-        if let Some(p) = event.dport { record["dport"] = serde_json::json!(p); }
-        if let Some(ref p) = event.proto { record["proto"] = serde_json::Value::String(p.clone()); }
-        if let Some(p) = event.target_pid { record["target_pid"] = serde_json::json!(p); }
-        if let Some(s) = event.signal { record["signal"] = serde_json::json!(s); }
-        if let Some(b) = event.file_bytes { record["file_bytes"] = serde_json::json!(b); }
+        if let Some(ref f) = event.filename {
+            record["filename"] = serde_json::Value::String(f.clone());
+        }
+        if let Some(ref a) = event.args {
+            record["args"] = serde_json::Value::String(a.clone());
+        }
+        if let Some(ref s) = event.saddr {
+            record["saddr"] = serde_json::Value::String(s.clone());
+        }
+        if let Some(ref d) = event.daddr {
+            record["daddr"] = serde_json::Value::String(d.clone());
+        }
+        if let Some(p) = event.sport {
+            record["sport"] = serde_json::json!(p);
+        }
+        if let Some(p) = event.dport {
+            record["dport"] = serde_json::json!(p);
+        }
+        if let Some(ref p) = event.proto {
+            record["proto"] = serde_json::Value::String(p.clone());
+        }
+        if let Some(p) = event.target_pid {
+            record["target_pid"] = serde_json::json!(p);
+        }
+        if let Some(s) = event.signal {
+            record["signal"] = serde_json::json!(s);
+        }
+        if let Some(b) = event.file_bytes {
+            record["file_bytes"] = serde_json::json!(b);
+        }
 
         // 用 BTreeMap 做序列化保证 key 排序一致，verify_chain 才不会因为 key 顺序不同报假错
-        let btree: BTreeMap<String, serde_json::Value> = record.as_object()
+        let btree: BTreeMap<String, serde_json::Value> = record
+            .as_object()
             .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
         let json_str = serde_json::to_string(&btree)?;
@@ -210,10 +265,18 @@ impl ForensicLogger {
         Ok(())
     }
 
-    pub fn path(&self) -> &PathBuf { &self.path }
-    pub fn event_count(&self) -> u64 { self.event_count }
-    pub fn alert_count(&self) -> u64 { self.alert_count }
-    pub fn chain_tail_hash(&self) -> &str { &self.prev_hash }
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+    pub fn event_count(&self) -> u64 {
+        self.event_count
+    }
+    pub fn alert_count(&self) -> u64 {
+        self.alert_count
+    }
+    pub fn chain_tail_hash(&self) -> &str {
+        &self.prev_hash
+    }
 
     /// 从头校验日志链完整性
     pub fn verify_chain(path: &PathBuf) -> Result<ChainVerification> {
@@ -224,11 +287,16 @@ impl ForensicLogger {
         let hasher = Sha256Hash;
 
         for line in content.lines() {
-            if line.trim().is_empty() { continue; }
+            if line.trim().is_empty() {
+                continue;
+            }
             total_records += 1;
 
             let record: serde_json::Value = serde_json::from_str(line)?;
-            let stored_prev = record.get("prev_hash").and_then(|v| v.as_str()).unwrap_or("");
+            let stored_prev = record
+                .get("prev_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let stored_hash = record.get("hash").and_then(|v| v.as_str()).unwrap_or("");
 
             if stored_prev != prev_hash && broken_at.is_none() {
@@ -236,12 +304,18 @@ impl ForensicLogger {
             }
 
             let mut clean = record.clone();
-            clean.as_object_mut().map(|m| { m.remove("hash"); m.remove("prev_hash"); });
+            if let Some(m) = clean.as_object_mut() {
+                m.remove("hash");
+                m.remove("prev_hash");
+            }
             let btree: BTreeMap<String, serde_json::Value> = match clean.as_object() {
                 Some(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 None => {
-                    let recomputed = hasher.hash(&serde_json::to_string(&clean).unwrap_or_default());
-                    if recomputed != stored_hash && broken_at.is_none() { broken_at = Some(total_records); }
+                    let recomputed =
+                        hasher.hash(&serde_json::to_string(&clean).unwrap_or_default());
+                    if recomputed != stored_hash && broken_at.is_none() {
+                        broken_at = Some(total_records);
+                    }
                     prev_hash = stored_hash.to_string();
                     continue;
                 }
@@ -254,7 +328,11 @@ impl ForensicLogger {
             prev_hash = stored_hash.to_string();
         }
 
-        Ok(ChainVerification { total_records, is_valid: broken_at.is_none(), broken_at })
+        Ok(ChainVerification {
+            total_records,
+            is_valid: broken_at.is_none(),
+            broken_at,
+        })
     }
 }
 
@@ -290,11 +368,14 @@ fn cleanup_old_archives(log_dir: &Path, retain_days: u32) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if name.starts_with("events_") && (name.ends_with(".jsonl.gz") || name.ends_with(".jsonl")) {
+        if name.starts_with("events_") && (name.ends_with(".jsonl.gz") || name.ends_with(".jsonl"))
+        {
             if let Ok(metadata) = entry.metadata() {
                 if let Ok(modified) = metadata.modified() {
-                    let mod_secs = modified.duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64).unwrap_or(0);
+                    let mod_secs = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
                     if mod_secs < cutoff_secs {
                         remove_file(&path)?;
                         log::info!("清理过期归档: {}", path.display());
@@ -316,10 +397,37 @@ mod tests {
         let mut comm = [0u8; 16];
         comm[..4].copy_from_slice(b"test");
         DecodedEvent {
-            seq, comm: "test".to_string(),
-            header: EventHeader { event_type: 2, _pad1: 0, timestamp_ns: seq * 1_000_000_000, pid, tid: 0, uid: 0, ppid: 0, comm, syscall_nr: 0, _pad2: 0, retval: 0 },
-            filename: None, args: None, saddr: None, daddr: None, sport: None, dport: None, proto: None,
-            target_pid: None, signal: None, file_bytes: None,
+            seq,
+            comm: "test".to_string(),
+            header: EventHeader {
+                event_type: 2,
+                _pad1: 0,
+                timestamp_ns: seq * 1_000_000_000,
+                pid,
+                tid: 0,
+                uid: 0,
+                ppid: 0,
+                comm,
+                syscall_nr: 0,
+                _pad2: 0,
+                retval: 0,
+            },
+            filename: None,
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
         }
     }
 
@@ -337,7 +445,7 @@ mod tests {
         assert_eq!(seq, 2);
         assert_ne!(hash, GENESIS_HASH);
         {
-            let mut logger = ForensicLogger::new(path.clone()).unwrap();
+            let logger = ForensicLogger::new(path.clone()).unwrap();
             assert_eq!(logger.chain_tail_hash(), hash);
         }
     }
@@ -348,7 +456,9 @@ mod tests {
         let path = dir.path().join("test.jsonl");
         {
             let mut logger = ForensicLogger::new(path.clone()).unwrap();
-            for i in 1..=10 { logger.log_event(&make_event(i, 100)).unwrap(); }
+            for i in 1..=10 {
+                logger.log_event(&make_event(i, 100)).unwrap();
+            }
             logger.flush().unwrap();
         }
         let result = ForensicLogger::verify_chain(&path).unwrap();
@@ -366,10 +476,16 @@ mod tests {
     fn test_log_rotation() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.jsonl");
-        let config = RotationConfig { max_file_size: 500, retain_days: 30, compress_archives: false };
+        let config = RotationConfig {
+            max_file_size: 500,
+            retain_days: 30,
+            compress_archives: false,
+        };
         {
             let mut logger = ForensicLogger::with_rotation(path.clone(), config).unwrap();
-            for i in 1..=50 { logger.log_event(&make_event(i, 100)).unwrap(); }
+            for i in 1..=50 {
+                logger.log_event(&make_event(i, 100)).unwrap();
+            }
             logger.flush().unwrap();
         }
         assert!(path.exists());

@@ -1,0 +1,40 @@
+# 检测规则 — 内核模块加载 (LKM Load)
+#
+# E4.4.2: 匹配 event_type=81 (EVENT_LKM_LOAD) 的安全探针事件。
+# 探针位置: ks_probes_lkm.h → kprobe/do_init_module
+# 探针在内核模块加载完成时触发，捕获 pid/uid/module_name[64]/comm[16]。
+#
+# 检测策略:
+#   - 模块名含 rootkit/backdoor/nf_hook → critical (高置信度恶意模块)
+#   - 其他模块加载 → low (正常运维操作，记录但低告警)
+#
+# E4.4 重构: Field 枚举新增 module_name 字段，规则直接匹配探针提交的 module_name
+# (此前通过 args 字段手动传递，现已废弃该绕过方式)。
+#
+# MITRE ATT&CK: TA0003 Persistence / T1547.006 Kernel Modules
+#               (Rootkit 同时兼有 TA0005 Defense Evasion 属性)
+
+- name: "LKM Rootkit 加载检测"
+  description: "检测加载可疑内核模块 (rootkit/backdoor/nf_hook) (event_type=81, 探针: kprobe/do_init_module)"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(insmod|modprobe)"
+    - field: module_name
+      operator: regex
+      value: "(rootkit|backdoor|nf_hook)"
+  alert_message: "检测到可疑内核模块加载 (rootkit/backdoor/nf_hook)，疑似 Rootkit 安装"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547.006"
+
+- name: "LKM 普通模块加载"
+  description: "检测加载普通内核模块 (非 rootkit/backdoor/nf_hook) (event_type=81)"
+  severity: low
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(insmod|modprobe)"
+  alert_message: "检测到内核模块加载操作 (普通模块)"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547.006"
