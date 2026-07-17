@@ -1,0 +1,47 @@
+# ==========================================================================
+# KernelSentinel Prometheus 采集配置
+# ==========================================================================
+# 用途:
+#   F2 (容器化) 与 F3 (监控) 共用。采集 ks-server 暴露的 /metrics 指标。
+#
+# 挂载:
+#   docker-compose.yml 将本文件只读挂载到 prometheus 容器:
+#     ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+#
+# 目标:
+#   ks-server:8080 (compose 网络内服务名解析)
+# ==========================================================================
+
+global:
+  scrape_interval: 15s          # 默认采集间隔
+  evaluation_interval: 15s      # 规则评估间隔
+  external_labels:
+    monitor: 'kernelsentinel-monitor'
+
+# 告警规则 (F3 阶段补充, 可选)
+# rule_files:
+#   - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # ── KernelSentinel 主服务 ──
+  - job_name: 'kernelsentinel'
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 'ks-server:8080'
+        labels:
+          service: 'ks-server'
+          component: 'ebpf-detector'
+
+  # ── Prometheus 自监控 ──
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+          - 'localhost:9090'
+
+# 告警推送 (F3 阶段补充 Alertmanager, 可选)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#             - 'alertmanager:9093'

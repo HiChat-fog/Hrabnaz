@@ -1,0 +1,24 @@
+# 检测规则 — 勒索软件
+# 勒索软件特征: 大量文件写入 (加密) + 文件删除 (删除原文件)
+
+- name: "勒索软件加密行为"
+  description: "检测文件写入加密后缀 (.encrypted/.locked/.crypto) 或批量文件删除操作"
+  severity: critical
+  conditions:
+    - field: filename
+      operator: regex
+      value: "(\\.encrypted|\\.locked|\\.crypto|\\.ryuk|\\.wanna|\\.cerber)$"
+  alert_message: "检测到可疑文件加密行为，疑似勒索软件活动"
+  mitre_tactic: "TA0040"
+  mitre_technique: "T1486"
+
+- name: "敏感文件访问"
+  description: "检测对 /etc/shadow 等敏感系统文件的访问"
+  severity: high
+  conditions:
+    - field: filename
+      operator: contains
+      value: "/etc/shadow"
+  alert_message: "检测到对 /etc/shadow 的访问，疑似权限提升或凭证窃取"
+  mitre_tactic: "TA0006"
+  mitre_technique: "T1003.008"

@@ -1,0 +1,31 @@
+[package]
+name = "ks-cli"
+version = "0.1.0"
+edition = "2021"
+description = "内核哨兵 - 命令行工具"
+
+[[bin]]
+name = "kernelsentinel"
+path = "src/main.rs"
+
+[dependencies]
+ks-engine = { path = "../ks-engine" }
+ks-core = { path = "../ks-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+ks-server = { path = "../ks-server" }
+# G1.3: CLI baseline/correlation/watch 子命令通过 HTTP 调用 ks-server REST API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures-util = "0.3"
+# G1.3: watch 子命令用 HashSet<uuid::Uuid> 对告警去重
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+sd-notify = "0.4"

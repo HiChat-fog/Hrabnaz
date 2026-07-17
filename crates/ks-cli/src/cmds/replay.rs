@@ -1,0 +1,440 @@
+use anyhow::Result;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
+fn mitre_phase_name(tactic: &str) -> &str {
+    match tactic {
+        "TA0001" => "初始入侵",
+        "TA0002" => "执行",
+        "TA0003" => "持久化",
+        "TA0004" => "提权",
+        "TA0005" => "防御规避",
+        "TA0006" => "凭据访问",
+        "TA0007" => "信息探测",
+        "TA0008" => "横向移动",
+        "TA0010" => "数据窃取",
+        "TA0011" => "命令控制",
+        _ => tactic,
+    }
+}
+
+fn event_type_label(etype: u32) -> &'static str {
+    match etype {
+        1 => "进程执行",
+        2 => "进程退出",
+        3 => "进程克隆",
+        10 => "文件打开",
+        11 => "文件读取",
+        12 => "文件写入",
+        13 => "文件删除",
+        14 => "文件重命名",
+        15 => "权限修改",
+        20 => "TCP连接",
+        21 => "连接接受",
+        22 => "数据发送",
+        23 => "数据接收",
+        24 => "DNS查询",
+        30 => "ptrace",
+        31 => "信号发送",
+        _ => "未知",
+    }
+}
+
+pub async fn run(file: &str) -> Result<()> {
+    let path = Path::new(file);
+    if !path.exists() {
+        anyhow::bail!("文件不存在: {}", file);
+    }
+
+    println!("╔══════════════════════════════════════════╗");
+    println!("║  内核哨兵 — 取证日志回放                   ║");
+    println!("╚══════════════════════════════════════════╝");
+    println!();
+    println!("日志文件: {}", file);
+
+    println!();
+    println!("── 阶段 1: 哈希链完整性校验 ──");
+    println!("  SHA-256 链式校验: 每条记录的 hash = SHA256(内容)");
+    println!("  prev_hash 机制:   每条记录包含上一条的 hash");
+    println!("  链断裂 = 日志被篡改 (插入/删除/修改任何记录)");
+    println!();
+
+    let path_buf = path.to_path_buf();
+    let verification = ks_engine::forensic::ForensicLogger::verify_chain(&path_buf)?;
+
+    if verification.is_valid {
+        println!(
+            "  [✓] 链完整性: 通过 — {} 条记录, 链完整无断裂",
+            verification.total_records
+        );
+    } else {
+        println!(
+            "  [✗] 链完整性: 断裂 — 第 {} 条记录处检测到篡改",
+            verification.broken_at.unwrap_or(0)
+        );
+        println!("  建议: 检查该记录是否被人为修改或插入");
+    }
+
+    println!();
+    println!("── 阶段 2: 事件/告警解析 ──");
+    println!();
+
+    let file_handle = File::open(path)?;
+    let reader = BufReader::new(file_handle);
+
+    let mut event_count: u64 = 0;
+    let mut alert_count: u64 = 0;
+    let mut event_types: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut severities: BTreeMap<String, u64> = BTreeMap::new();
+    let mut pids: HashSet<u32> = HashSet::new();
+    let mut pid_events: HashMap<u32, Vec<(u64, u32, String)>> = HashMap::new();
+    let mut mitre_tags: HashMap<String, Vec<String>> = HashMap::new();
+    let mut attack_chains: Vec<AttackChainEntry> = Vec::new();
+    let mut first_ts: Option<u64> = None;
+    let mut last_ts: Option<u64> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let record: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  [SKIP] 解析失败: {}", e);
+                continue;
+            }
+        };
+
+        let record_type = record
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("event");
+
+        if record_type == "alert" {
+            alert_count += 1;
+
+            if let Some(severity) = record.get("severity").and_then(|v| v.as_str()) {
+                *severities.entry(severity.to_string()).or_insert(0) += 1;
+            }
+
+            if let Some(tactic) = record
+                .get("mitre")
+                .and_then(|m| m.get("tactic"))
+                .and_then(|v| v.as_str())
+            {
+                let technique = record
+                    .get("mitre")
+                    .and_then(|m| m.get("technique"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                mitre_tags
+                    .entry(tactic.to_string())
+                    .or_default()
+                    .push(technique.to_string());
+            }
+
+            let title = record
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let severity = record
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let pid = record
+                .get("process")
+                .and_then(|p| p.get("pid"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let comm = record
+                .get("process")
+                .and_then(|p| p.get("comm"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+
+            let daddr = record
+                .get("network")
+                .and_then(|n| n.get("daddr"))
+                .and_then(|v| v.as_str());
+            let dport = record
+                .get("network")
+                .and_then(|n| n.get("dport"))
+                .and_then(|v| v.as_u64());
+            let proto = record
+                .get("network")
+                .and_then(|n| n.get("proto"))
+                .and_then(|v| v.as_str());
+
+            let filepath = record
+                .get("file")
+                .and_then(|f| f.get("path"))
+                .and_then(|v| v.as_str());
+
+            let mitre_tactic = record
+                .get("mitre")
+                .and_then(|m| m.get("tactic"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mitre_technique = record
+                .get("mitre")
+                .and_then(|m| m.get("technique"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            attack_chains.push(AttackChainEntry {
+                title: title.to_string(),
+                severity: severity.to_string(),
+                pid: pid as u32,
+                comm: comm.to_string(),
+                daddr: daddr.map(|s| s.to_string()),
+                dport: dport.map(|v| v as u16),
+                proto: proto.map(|s| s.to_string()),
+                filepath: filepath.map(|s| s.to_string()),
+                mitre_tactic: mitre_tactic.to_string(),
+                mitre_technique: mitre_technique.to_string(),
+            });
+        } else {
+            event_count += 1;
+
+            if let Some(etype) = record.get("event_type").and_then(|v| v.as_u64()) {
+                *event_types.entry(etype as u32).or_insert(0) += 1;
+            }
+
+            if let Some(pid) = record.get("pid").and_then(|v| v.as_u64()) {
+                pids.insert(pid as u32);
+                let seq = record.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                let etype = record
+                    .get("event_type")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let comm = record
+                    .get("comm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                pid_events
+                    .entry(pid as u32)
+                    .or_default()
+                    .push((seq, etype as u32, comm));
+            }
+
+            if let Some(ts) = record.get("timestamp_ns").and_then(|v| v.as_u64()) {
+                first_ts = Some(first_ts.map_or(ts, |f| f.min(ts)));
+                last_ts = Some(last_ts.map_or(ts, |f| f.max(ts)));
+            }
+        }
+    }
+
+    println!("── 阶段 3: 统计摘要 ──");
+    println!();
+    println!("  事件总数: {}", event_count);
+    println!("  告警总数: {}", alert_count);
+    println!("  唯一进程: {}", pids.len());
+    println!(
+        "  链完整性: {}",
+        if verification.is_valid {
+            "通过 ✓"
+        } else {
+            "断裂 ✗"
+        }
+    );
+
+    if let (Some(first), Some(last)) = (first_ts, last_ts) {
+        let duration_secs = (last - first) / 1_000_000_000;
+        println!(
+            "  时间跨度: {} 秒 ({} → {})",
+            duration_secs,
+            format_timestamp(first),
+            format_timestamp(last)
+        );
+    }
+
+    if !event_types.is_empty() {
+        println!();
+        println!("── 阶段 4: 事件类型分布 ──");
+        println!();
+        let max_count = event_types.values().max().unwrap_or(&0);
+        let bar_width = 30;
+        for (etype, count) in &event_types {
+            let name = event_type_label(*etype);
+            let bar_len = if *max_count > 0 {
+                ((*count as f64 / *max_count as f64) * bar_width as f64) as usize
+            } else {
+                0
+            };
+            let bar = "█".repeat(bar_len) + &"░".repeat(bar_width - bar_len);
+            println!("  {:<3} {:<10} │{}│ {:>4} 条", etype, name, bar, count);
+        }
+    }
+
+    if !severities.is_empty() {
+        println!();
+        println!("── 阶段 5: 告警等级分布 ──");
+        println!();
+        for (sev, count) in &severities {
+            let icon = match sev.as_str() {
+                "critical" => "🔴",
+                "high" => "🟠",
+                "medium" => "🟡",
+                "low" => "🟢",
+                _ => "⚪",
+            };
+            println!("  {} {:<10} {} 条", icon, sev, count);
+        }
+    }
+
+    if !mitre_tags.is_empty() {
+        println!();
+        println!("── 阶段 6: MITRE ATT&CK 映射 ──");
+        println!();
+        println!("  检测到的攻击战术 (按 MITRE ATT&CK 框架分类):");
+        println!();
+        for (tactic, techniques) in &mitre_tags {
+            let phase = mitre_phase_name(tactic);
+            println!("  {} ({})", tactic, phase);
+            for tech in techniques {
+                println!("    └─ {}", tech);
+            }
+        }
+    }
+
+    if !attack_chains.is_empty() {
+        println!();
+        println!("── 阶段 7: 攻击链还原 ──");
+        println!();
+        println!("  从离散告警中还原攻击者的行为链:");
+        println!();
+
+        let mut sorted_chains = attack_chains.clone();
+        sorted_chains.sort_by(|a, b| {
+            let sev_order = |s: &str| match s {
+                "critical" => 0,
+                "high" => 1,
+                "medium" => 2,
+                "low" => 3,
+                _ => 4,
+            };
+            sev_order(&a.severity).cmp(&sev_order(&b.severity))
+        });
+
+        let phase_order = [
+            "TA0001", "TA0002", "TA0003", "TA0004", "TA0005", "TA0006", "TA0007", "TA0008",
+            "TA0010", "TA0011",
+        ];
+        let mut phase_sorted: Vec<&AttackChainEntry> = Vec::new();
+        for phase in &phase_order {
+            for entry in &attack_chains {
+                if entry.mitre_tactic == *phase {
+                    phase_sorted.push(entry);
+                }
+            }
+        }
+        for entry in &attack_chains {
+            if entry.mitre_tactic.is_empty() || !phase_order.contains(&entry.mitre_tactic.as_str())
+            {
+                phase_sorted.push(entry);
+            }
+        }
+
+        if !phase_sorted.is_empty() {
+            for (i, entry) in phase_sorted.iter().enumerate() {
+                let connector = if i == 0 { "▶" } else { "│" };
+                let phase_label = if !entry.mitre_tactic.is_empty() {
+                    format!(
+                        "{} ({})",
+                        entry.mitre_tactic,
+                        mitre_phase_name(&entry.mitre_tactic)
+                    )
+                } else {
+                    "未映射".to_string()
+                };
+
+                println!(
+                    "  {} [{}] {} — PID:{} ({})",
+                    connector, entry.severity, entry.title, entry.pid, entry.comm
+                );
+
+                if let Some(ref daddr) = entry.daddr {
+                    let port_info = entry.dport.map(|p| format!(":{}", p)).unwrap_or_default();
+                    let proto_info = entry.proto.as_deref().unwrap_or("");
+                    println!("  │   └─ 目标: {}{} {}", daddr, port_info, proto_info);
+                }
+
+                if let Some(ref filepath) = entry.filepath {
+                    println!("  │   └─ 文件: {}", filepath);
+                }
+
+                if !entry.mitre_tactic.is_empty() {
+                    println!(
+                        "  │   └─ MITRE: {} / {}",
+                        phase_label, entry.mitre_technique
+                    );
+                }
+            }
+
+            println!("  └─ [链结束] 共 {} 个阶段", phase_sorted.len());
+        }
+    }
+
+    if !pid_events.is_empty() {
+        println!();
+        println!("── 阶段 8: 进程行为画像 (按 PID) ──");
+        println!();
+        println!("  每个进程的事件序列 (用于识别异常行为模式):");
+        println!();
+
+        for (pid, events) in pid_events.iter() {
+            if events.len() < 2 {
+                continue;
+            }
+            println!("  PID {} ({} 条事件):", pid, events.len());
+            for (_, etype, comm) in events.iter().take(5) {
+                println!("    └─ {} [type={}]", comm, etype);
+            }
+            if events.len() > 5 {
+                println!("    └─ ... (共 {} 条)", events.len());
+            }
+        }
+    }
+
+    println!();
+    println!("╔══════════════════════════════════════════╗");
+    println!("║  回放完成 — 上述分析基于 SHA-256 式校验   ║");
+    println!(
+        "║  链完整性={}",
+        if verification.is_valid {
+            "通过 ✓"
+        } else {
+            "断裂 ✗"
+        }
+    );
+    println!("║  所有结论均有哈希链佐证, 可用于司法取证     ║");
+    println!("╚══════════════════════════════════════════╝");
+
+    Ok(())
+}
+
+fn format_timestamp(ns: u64) -> String {
+    let secs = ns / 1_000_000_000;
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| format!("ts={}", ns))
+}
+
+#[derive(Clone)]
+struct AttackChainEntry {
+    title: String,
+    severity: String,
+    pid: u32,
+    comm: String,
+    daddr: Option<String>,
+    dport: Option<u16>,
+    proto: Option<String>,
+    filepath: Option<String>,
+    mitre_tactic: String,
+    mitre_technique: String,
+}

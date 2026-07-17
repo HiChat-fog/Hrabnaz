@@ -1,0 +1,71 @@
+# Rootkit 加载与隐藏进程检测规则
+#
+# 检测内核模块注入 (Rootkit) 和隐藏进程行为。
+# Rootkit 特征:
+#   - insmod/finit_module 加载可疑内核模块
+#   - /proc 下出现隐藏进程或异常条目
+#   - 修改系统调用表或内核数据结构
+#   - 隐藏文件/目录 (在 /proc 或 /sys 中消失)
+#
+# MITRE ATT&CK: TA0003 持久化 (T1547) + TA0005 防御规避 (T1014)
+
+- name: "rootkit_module_load"
+  description: "加载内核模块 (insmod/finit_module), 可能是 Rootkit"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: equals
+      value: "insmod"
+  alert_message: "内核模块加载 detected — 可能是 Rootkit 安装"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547"
+
+- name: "rootkit_finit_module"
+  description: "通过 finit_module 从文件加载内核模块 (比 insmod 更隐蔽)"
+  severity: critical
+  conditions:
+    - field: syscall_nr
+      operator: equals
+      value: "313"  # finit_module syscall number on x86_64
+  alert_message: "finit_module 内核模块加载 — 可能是 Rootkit (比 insmod 更隐蔽)"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547"
+
+- name: "rootkit_proc_anomaly"
+  description: "/proc 异常访问模式 (扫描隐藏进程/修改进程可见性)"
+  severity: high
+  conditions:
+    - field: filename
+      operator: regex
+      value: "^/proc/[0-9]+/(maps|mem|environ|cmdline)$"
+    - field: comm
+      operator: regex
+      value: "(python|perl|ruby|bash)"
+  alert_message: "/proc 异常访问 — 可能是 Rootkit 在扫描或修改进程可见性"
+  mitre_tactic: "TA0005"
+  mitre_technique: "T1014"
+
+- name: "rootkit_syscall_table_modify"
+  description: "异常的 /boot 或内核符号表访问 (可能准备修改系统调用表)"
+  severity: high
+  conditions:
+    - field: filename
+      operator: regex
+      value: "^/boot/(vmlinuz|System\\.map|config)"
+  alert_message: "内核启动文件访问 — 可能是 Rootkit 准备修改系统调用表"
+  mitre_tactic: "TA0005"
+  mitre_technique: "T1014"
+
+- name: "rootkit_hidden_process_kill"
+  description: "异常的 SIGKILL 发送模式 (Rootkit 可能通过 kill 隐藏进程)"
+  severity: medium
+  conditions:
+    - field: signal
+      operator: equals
+      value: "9"   # SIGKILL
+    - field: comm
+      operator: regex
+      value: "(kill|pkill|skill)"
+  alert_message: "批量 SIGKILL 发送 — 可能是 Rootkit 清理痕迹或隐藏进程"
+  mitre_tactic: "TA0005"
+  mitre_technique: "T1014"
