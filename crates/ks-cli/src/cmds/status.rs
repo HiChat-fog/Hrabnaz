@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ks_engine::loader::{BpfMapReader, MockBpfMapReader};
+use std::io::Write;
 use std::sync::Arc;
 
 pub async fn run(watch: bool, interval: u64) -> Result<()> {
@@ -213,6 +214,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
                 Ok(content) => println!("  运行实例: {}", content.trim().replace('\n', " ")),
                 Err(_) => println!("  运行实例: (未检测到 start 进程)"),
             }
+            let _ = std::io::stdout().flush(); // 非 TTY 管道下强制每 tick 刷新，避免块缓冲丢失
         }
     }
 
