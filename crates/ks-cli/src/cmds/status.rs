@@ -27,10 +27,30 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     );
 
     let probes = [
-        ("trace_sys_enter", "tracepoint", "raw_syscalls/sys_enter", "是"),
-        ("trace_sys_exit", "tracepoint", "raw_syscalls/sys_exit", "是"),
-        ("trace_sched_exec", "tracepoint", "sched/sched_process_exec", "是"),
-        ("trace_sched_exit", "tracepoint", "sched/sched_process_exit", "是"),
+        (
+            "trace_sys_enter",
+            "tracepoint",
+            "raw_syscalls/sys_enter",
+            "是",
+        ),
+        (
+            "trace_sys_exit",
+            "tracepoint",
+            "raw_syscalls/sys_exit",
+            "是",
+        ),
+        (
+            "trace_sched_exec",
+            "tracepoint",
+            "sched/sched_process_exec",
+            "是",
+        ),
+        (
+            "trace_sched_exit",
+            "tracepoint",
+            "sched/sched_process_exit",
+            "是",
+        ),
         ("kprobe_vfs_open", "kprobe", "vfs_open", "是"),
         ("kprobe_vfs_write", "kprobe", "vfs_write", "是"),
         ("kprobe_vfs_unlink", "kprobe", "vfs_unlink", "是"),

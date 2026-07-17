@@ -13,6 +13,6 @@ insmod /tmp/evil_rootkit.ko 2>/dev/null || {
 }
 
 # 模拟 /proc 异常探测（rootkit_detect 规则）
-cat /proc/modules 2>/dev/null | head -3 || true
-ls /proc/*/cmdline 2>/dev/null | head -3 || true
+head -3 /proc/modules 2>/dev/null || true
+find /proc -maxdepth 2 -name cmdline 2>/dev/null | head -3 || true
 echo "  (已触发 lkm-load + rootkit_detect 规则)"
