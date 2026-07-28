@@ -1,0 +1,5 @@
+# D2: musl静态构建配置——kernelsentinel守护进程可在CentOS 7 (glibc 2.17)等老内核运行（单二进制，无动态依赖）。
+# ring的C/asm用gcc编，由rust-lld链接成static-pie；这两个env只在target=x86_64-unknown-linux-musl时被cc-rs读取，不影响默认gnu构建（ks-engine的eBPF用clang，不走cc-rs）。
+[env]
+CC_x86_64_unknown_linux_musl = "gcc"
+AR_x86_64_unknown_linux_musl = "ar"

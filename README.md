@@ -12,6 +12,8 @@
 cd kernel-sentinel
 cargo build --release          # 同时编出4个tier的eBPF字节码
 cargo test --workspace         # 约164个测试 不需要root
+# 部署到老内核(CentOS 7/glibc 2.17)：静态 musl 二进制（单文件无动态依赖，eBPF .o 已内嵌）
+# rustup target add x86_64-unknown-linux-musl && scripts/build-musl.sh
 ```
 
 eBPF按4个tier编译（modern/legacy/ancient/ancient_nobtf） 运行时`tier_detect`自动挑 3.10之类没BTF的stock内核走C loader（`crates/ks-ebpf/scripts/ks_loader.c`） 不靠aya
@@ -28,8 +30,8 @@ sudo ./target/release/kernelsentinel start
 # 实时看map计数和运行实例（每秒刷新 Ctrl+C退出）
 ./target/release/kernelsentinel status --watch
 
-# 起数据服务 REST+WebSocket 默认8443
-sudo ./target/release/kernelsentinel start --serve 8443
+# 可选：启用 REST API demo（与检测同进程；serve 子命令按申报书为 CLI-first 声明，不绑端口）
+# sudo ./target/release/kernelsentinel start --serve 8443
 
 # 回放取证日志（哈希链校验+攻击链还原）
 ./target/release/kernelsentinel replay /var/log/ks/events_*.jsonl
@@ -47,7 +49,7 @@ crates/
   ks-core/    事件/规则/告警类型 C与Rust内存对齐 编译期size断言
   ks-ebpf/    探针C代码+推理引擎 4tier条件编译
   ks-engine/  聚合/规则/关联/基线/攻击链/取证/ML/阻断/tier路由
-  ks-server/  axum REST+WebSocket（Bearer+mTLS+限流+审计+Prometheus）
+  ks-server/  axum REST+WebSocket（可选 demo，非 serve 主入口；Bearer+mTLS+限流+审计+Prometheus）
   ks-cli/     命令行入口
 rules/        YAML检测规则
 scenarios/    攻击模拟脚本
@@ -67,6 +69,18 @@ deploy/       systemd/install/grafana/prometheus
 - 4tier eBPF编译通过 在6.17真机上端到端跑过（事件 告警 哈希链闭环）
 - 用户态引擎和12个攻击场景的e2e测试在`cargo test`里 不开root也能跑
 - 还没做的 5.15/6.1两个内核的对照性能数据 内核态阻断（verdict==2→SIGKILL）只在编译层验证过 没在真机上真正杀过进程
+
+## 7.29update
+
+eBPF字节码改成include_bytes!编进二进制。build.rs编译4个tier的.o后生成ebpf_objects.rs暴露常量，运行时tier_detect选内嵌字节码喂aya::Ebpf::load，不再从磁盘读.o，单二进制部署落地。install.sh相应改成只装预编二进制删掉cargo build，.o已内嵌无需额外安装。
+
+加了CentOS 7能跑的musl静态二进制。cargo build --release --target x86_64-unknown-linux-musl出单文件无动态依赖，.cargo/config.toml里设CC_x86_64_unknown_linux_musl=gcc让ring的C/asm用gcc编再由rust-lld self-contained musl crt链接，不用装musl-gcc。scp到CentOS 7那台glibc 2.17的机器能直接跑--version和serve。
+
+serve子命令改成CLI-first声明不绑端口，--serve留作可选REST demo，systemd ExecStart去掉--serve 8443，对齐申报书第51条。
+
+nobtf路径在3.10无BTF时走C loader。预编static ks_loader用gcc -static链接后include_bytes!嵌进二进制，运行时释放到/tmp，ancient_nobtf.o同样内嵌释放，整个路径不依赖目标机gcc也不从磁盘读.o。ks_loader.c补了原来缺的ATTACH步骤：3.10没有BPF_LINK_CREATE，用perf_event_open拿PERF_TYPE_TRACEPOINT再PERF_EVENT_IOC_SET_BPF把程序绑到tracepoint和kprobe，kprobe经kprobe_events创建。调试踩了两个坑，CentOS 7的3.10上bpf(BPF_MAP_CREATE)在memlock rlimit默认64KB时返回EPERM而非ENOMEM，setrlimit必须放在预检之前；common.h加的block_decisions map没同步进ks_loader.c的known_maps[]表，C loader报unknown map退出，已补并加了构建期同步检查脚本防回归。
+
+tier_detect加了nobtf release兼容检查，运行时内核release不匹配.o编译目标的3.10.0-1160就fail loud拒绝加载，避免在别的3.10子版本上用错偏移静默读错字段。
 
 ## 许可证
 
