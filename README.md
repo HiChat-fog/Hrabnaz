@@ -1,70 +1,86 @@
-# 内核哨兵 (KernelSentinel)
+# KernelSentinel · 内核哨兵
 
-基于 eBPF 的内核级终端威胁检测与行为观测系统。
+用eBPF在内核态做终端威胁检测 探针挂在系统调用/VFS/网络栈/进程调度路径上 内核里维护进程树拓扑 TCP流状态机和六维频率基线 命中后写SHA-256哈希链取证日志 用户态引擎用Rust做规则匹配 跨事件关联 z-score基线偏离和攻击链还原
 
-## 定位
+做这个的起因 Falco/Tetragon这类工具的感知层在用户态 从内核到规则引擎要经过几次上下文切换 短命进程和流级别行为容易漏 把感知放进内核能补这块盲区 它同时是个能拿来做信息安全教学演示的内核行为观测样例
 
-eBPF 内核级终端威胁检测与行为观测系统。用 eBPF 把感知探针植入系统调用、文件操作、网络协议栈等内核关键路径，做到用户态看不见的攻击它能看见，并在内核推理层纳秒级评估风险。当前在模拟环境下端到端验证完成，真实内核加载待 Linux 开发机到位后启用。
+## 构建
 
-## 赛道归属
-
-- 主攻：方向一（网络安全与攻防技术）
-- 副挂：方向五（智慧教学与教育信息化平台）
-
-## 快速开始
+要 Linux 5.8+ clang 18 bpftool Rust nightly
 
 ```bash
-# 1. 搭建开发环境 (需要 Linux 5.15+)
-chmod +x scripts/setup_dev.sh && ./scripts/setup_dev.sh
+cd kernel-sentinel
+cargo build --release          # 同时编出4个tier的eBPF字节码
+cargo test --workspace         # 约164个测试 不需要root
+# 部署到老内核(CentOS 7/glibc 2.17)：静态 musl 二进制（单文件无动态依赖，eBPF .o 已内嵌）
+# rustup target add x86_64-unknown-linux-musl && scripts/build-musl.sh
+```
 
-# 2. 编译
-cargo build --release
+eBPF按4个tier编译（modern/legacy/ancient/ancient_nobtf） 运行时`tier_detect`自动挑 3.10之类没BTF的stock内核走C loader（`crates/ks-ebpf/scripts/ks_loader.c`） 不靠aya
 
-# 3. 启动 (需要 root 权限)
+## 跑
+
+```bash
+# 加载探针+消费ringbuf 前台运行（要root）
 sudo ./target/release/kernelsentinel start
 
-# 4. 查看系统状态
-sudo ./target/release/kernelsentinel status
+# 看配置概览（不需要root）
+./target/release/kernelsentinel status
 
-# 5. 回放取证日志
-sudo ./target/release/kernelsentinel replay /var/log/ks/forensic.jsonl
+# 实时看map计数和运行实例（每秒刷新 Ctrl+C退出）
+./target/release/kernelsentinel status --watch
+
+# 可选：启用 REST API demo（与检测同进程；serve 子命令按申报书为 CLI-first 声明，不绑端口）
+# sudo ./target/release/kernelsentinel start --serve 8443
+
+# 回放取证日志（哈希链校验+攻击链还原）
+./target/release/kernelsentinel replay /var/log/ks/events_*.jsonl
+
+# 实时告警流
+./target/release/kernelsentinel watch
 ```
 
-## 项目结构
+systemd部署用`deploy/install.sh`（Type=notify capability限到CAP_BPF/CAP_PERFMON等几项） Docker见根目录`Dockerfile`+`docker-compose.yml`
+
+## 目录
 
 ```
-kernel-sentinel/
-├── crates/
-│   ├── ks-core/      # 核心数据类型 (事件/规则/告警)
-│   ├── ks-ebpf/      # eBPF 探针 (C 代码, 9组探针+推理引擎)
-│   ├── ks-engine/    # 用户态引擎 (Rust, 6个模块)
-│   └── ks-cli/       # 命令行工具 (5个子命令, CLI-first设计)
-├── rules/            # 检测规则 (YAML)
-├── scenarios/        # 攻击模拟脚本
-├── docs/             # 文档
-└── ARCHITECTURE.md   # 架构设计
+crates/
+  ks-core/    事件/规则/告警类型 C与Rust内存对齐 编译期size断言
+  ks-ebpf/    探针C代码+推理引擎 4tier条件编译
+  ks-engine/  聚合/规则/关联/基线/攻击链/取证/ML/阻断/tier路由
+  ks-server/  axum REST+WebSocket（可选 demo，非 serve 主入口；Bearer+mTLS+限流+审计+Prometheus）
+  ks-cli/     命令行入口
+rules/        YAML检测规则
+scenarios/    攻击模拟脚本
+deploy/       systemd/install/grafana/prometheus
 ```
 
-## 核心特性
+## 检测逻辑
 
-- **内核级感知**: eBPF 探针挂在系统调用入口、VFS 层、网络协议栈
-- **纳秒级响应**: 检测逻辑在内核态完成，无需数据拷贝
-- **零外部依赖**: 纯 Rust + eBPF C，单二进制部署，离线运行
-- **取证级日志**: JSONL 格式 + 哈希链，不可篡改
-- **CLI-first设计**: 面向运维人员，replay 8阶段取证回放 + 攻击链可视化 + 哈希链校验
+- 规则引擎用YAML+Field枚举 字段名拼错在加载时报错 不会静默不匹配
+- 跨事件关联分三种 窗口关联 序列检测 进程树关联 单事件规则查不了的组合（比如读过/etc/shadow之后外连4444）靠它
+- 基线偏离 每进程六维z-score 一次性训练锁定 异常数据不会反过来把基线拉偏
+- 内核态阻断 风险分到70以上直接`bpf_send_signal(SIGKILL)`（modern tier）
+- 取证 JSONL+SHA-256哈希链 改任意一条记录后面全断
 
-## 测试状态
+## 现状
 
-84 个测试全部通过（70 单元测试 + 6 集成测试 + 8 核心测试），0 编译警告。
+- 4tier eBPF编译通过 在6.17真机上端到端跑过（事件 告警 哈希链闭环）
+- 用户态引擎和12个攻击场景的e2e测试在`cargo test`里 不开root也能跑
+- 还没做的 5.15/6.1两个内核的对照性能数据 内核态阻断（verdict==2→SIGKILL）只在编译层验证过 没在真机上真正杀过进程
 
-## 实战价值
+## 7.29update
 
-| 价值 | 说明 |
-|------|------|
-| 补盲 | 填补公安终端在内核层的监控盲区 |
-| 固证 | SHA-256 哈希链取证日志，满足司法证据防篡改要求 |
-| 落地 | 轻量、离线、静默，单二进制部署，适配警务终端 |
-| 育人 | 内核行为观测与攻击链回放，用于信息安全教学 |
+eBPF字节码改成include_bytes!编进二进制。build.rs编译4个tier的.o后生成ebpf_objects.rs暴露常量，运行时tier_detect选内嵌字节码喂aya::Ebpf::load，不再从磁盘读.o，单二进制部署落地。install.sh相应改成只装预编二进制删掉cargo build，.o已内嵌无需额外安装。
+
+加了CentOS 7能跑的musl静态二进制。cargo build --release --target x86_64-unknown-linux-musl出单文件无动态依赖，.cargo/config.toml里设CC_x86_64_unknown_linux_musl=gcc让ring的C/asm用gcc编再由rust-lld self-contained musl crt链接，不用装musl-gcc。scp到CentOS 7那台glibc 2.17的机器能直接跑--version和serve。
+
+serve子命令改成CLI-first声明不绑端口，--serve留作可选REST demo，systemd ExecStart去掉--serve 8443，对齐申报书第51条。
+
+nobtf路径在3.10无BTF时走C loader。预编static ks_loader用gcc -static链接后include_bytes!嵌进二进制，运行时释放到/tmp，ancient_nobtf.o同样内嵌释放，整个路径不依赖目标机gcc也不从磁盘读.o。ks_loader.c补了原来缺的ATTACH步骤：3.10没有BPF_LINK_CREATE，用perf_event_open拿PERF_TYPE_TRACEPOINT再PERF_EVENT_IOC_SET_BPF把程序绑到tracepoint和kprobe，kprobe经kprobe_events创建。调试踩了两个坑，CentOS 7的3.10上bpf(BPF_MAP_CREATE)在memlock rlimit默认64KB时返回EPERM而非ENOMEM，setrlimit必须放在预检之前；common.h加的block_decisions map没同步进ks_loader.c的known_maps[]表，C loader报unknown map退出，已补并加了构建期同步检查脚本防回归。
+
+tier_detect加了nobtf release兼容检查，运行时内核release不匹配.o编译目标的3.10.0-1160就fail loud拒绝加载，避免在别的3.10子版本上用错偏移静默读错字段。
 
 ## 许可证
 

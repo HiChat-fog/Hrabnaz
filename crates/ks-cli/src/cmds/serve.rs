@@ -1,33 +1,25 @@
 use anyhow::Result;
-use std::sync::Arc;
 
-use crate::cmds::{build_server_config, SecurityArgs};
-
-/// F4: ks-cli `serve` 子命令入口 — 启动 standalone 数据服务模式。
+/// 申报书line 51: `serve` 子命令为CLI-first声明，不启动Web服务。
 ///
-/// 与 `start --serve <port>` 不同，此命令不加载 eBPF 探针，
-/// 仅启动 ks-server REST API + WebSocket。安全配置由 `SecurityArgs` 提供：
-/// - `--no-auth` / `--auth-token` / `KS_AUTH_TOKEN` 控制 API 鉴权
-/// - `--tls-cert` + `--tls-key` 启用 TLS；`--tls-client-ca` 启用 mTLS
-/// - `--rate-limit` 控制速率限制（默认 100/min/IP）
-/// - `--audit-log` 控制审计日志路径
-pub async fn run(port: u16, security: &SecurityArgs) -> Result<()> {
+/// CLI-first：检测与运维均通过CLI子命令完成，REST API仅作可选demo
+/// （通过 `start --serve <port>` 与eBPF检测同进程启用），不绑定端口。
+pub async fn run(port: u16) -> Result<()> {
     println!("╔══════════════════════════════════════════╗");
-    println!("║  内核哨兵 — 数据服务模式 (standalone)       ║");
+    println!("║  内核哨兵 — CLI-first 模式（不启动 Web 服务） ║");
     println!("╚══════════════════════════════════════════╝");
     println!();
-    println!("REST API:   http://127.0.0.1:{}/api/v1/", port);
-    println!("WebSocket:  ws://127.0.0.1:{}/ws/alerts", port);
+    println!("内核哨兵以 CLI-first 交付：检测与运维均通过 CLI 子命令完成。");
     println!();
-    println!("提示: 此模式不启动 eBPF 探针。");
-    println!(
-        "      如需实时检测 + 数据服务，请用: kernelsentinel start --serve {}",
-        port
-    );
+    println!("  检测主入口:  kernelsentinel start");
+    println!("  状态查看:    kernelsentinel status [--watch]");
+    println!("  取证回放:    kernelsentinel replay <file>");
+    println!("  基线偏离:    kernelsentinel baseline");
+    println!("  关联告警:    kernelsentinel correlation");
+    println!("  实时告警流:  kernelsentinel watch");
     println!();
-
-    // F4: 用 SecurityArgs 构建 ServerConfig（auth/tls/audit/rate_limit）
-    let server_config = build_server_config(security);
-    let state = Arc::new(ks_server::ServerState::new());
-    ks_server::run_server_with_config(state, port, server_config).await
+    println!("REST API 为可选 demo（不作为 serve 主入口，按申报书要求未绑定端口）:");
+    println!("  启用方式:    kernelsentinel start --serve {}", port);
+    println!();
+    Ok(())
 }

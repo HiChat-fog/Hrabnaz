@@ -1,9 +1,8 @@
 //! 事件源抽象 — 统一 eBPF ring buffer、mock、文件回放的数据获取接口。
 //!
-//! A6 重构：
-//! - trait 改为 async（next_bytes 返回 Future，避免 perfbuf/inotify 阻塞 tokio reactor）
-//! - 删 Sync 约束（RingBuf 是 Send 但不是 Sync；强加 Sync 会逼出 Mutex<RingBuf> 损失性能）
-//! - 加 SourceKind enum，用于运行时多态 + 配置展示 + 日志区分
+//! A6 重构：trait 改 async（next_bytes 返回 Future，避免 perfbuf/inotify 阻塞 tokio reactor）；
+//! 删 Sync 约束（RingBuf 是 Send 非 Sync，强加会逼出 Mutex<RingBuf> 损失性能）；
+//! 加 SourceKind enum 用于运行时多态与日志区分。
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -11,8 +10,7 @@ use ks_core::event::{af, EventHeader, ExecEvent, FileEvent, NetEvent, SignalEven
 
 /// 事件源种类。
 ///
-/// 与多 tier eBPF 架构对应：Modern (5.8+ ringbuf) / Legacy (4.x perfbuf) /
-/// Ancient (3.10+ BTF backport)。Mock/FileReplay 用于测试与离线分析。
+/// 与多 tier eBPF 架构对应：Modern(5.8+ ringbuf) / Legacy(4.x perfbuf) / Ancient(3.10+ BTF backport)。Mock/FileReplay 用于测试与离线分析。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     /// 现代 eBPF tier（5.8+，BPF_MAP_TYPE_RINGBUF）
@@ -21,8 +19,7 @@ pub enum SourceKind {
     EbpfLegacy,
     /// Ancient eBPF tier（3.10.0-1160+ BTF backport，HASH + 手动 LRU）— Phase C 研究性突破
     EbpfAncient,
-    /// Ancient NOBTF tier（3.10 stock 内核无 BTF，aya 无法加载，由 C loader sidecar
-    /// `ks_loader --stream` 子进程加载 .o 文件，Rust 父进程从 stdout 读帧）— Phase E2
+    /// Ancient NOBTF tier（3.10 stock 内核无 BTF，aya 无法加载，由 C loader sidecar `ks_loader --stream` 子进程加载 .o 文件，Rust 父进程从 stdout 读帧）— Phase E2
     EbpfAncientNoBtf,
     /// Mock 回放（测试/演示/CI 用）
     Mock,
@@ -46,12 +43,8 @@ impl SourceKind {
 /// 统一事件源 trait。
 ///
 /// 设计要点：
-/// - `Send` 不 `Sync`：RingBuf<MapData> 是 Send 但不是 Sync，强加 Sync 会逼出
-///   `Mutex<RingBuf>` 包装，每次 next_bytes 都 lock，无意义损失性能。
-///   去掉 Sync 后 `Box<dyn EventSource>` 不能跨 await share ref，但本架构里
-///   每个事件源由单 task 独占持有，无需跨 task 共享，删 Sync 安全。
-/// - `async` next_bytes：未来 Phase B 的 perfbuf / FileReplay 可能需 await
-///   epoll/AsyncFd，trait 一开始就 async 避免后续破坏性改动。
+/// - `Send` 不 `Sync`：RingBuf<MapData> 是 Send 非 Sync，强加 Sync 会逼出 `Mutex<RingBuf>` 包装每次 lock 损失性能。本架构每事件源由单 task 独占持有，删 Sync 安全。
+/// - `async` next_bytes：Phase B 的 perfbuf/FileReplay 可能需 await epoll/AsyncFd，trait 一开始就 async 避免后续破坏性改动。
 #[async_trait]
 pub trait EventSource: Send {
     /// 取下一条事件字节。Ok(None) 表示暂无数据（非错误，调用方应 sleep）。
@@ -69,7 +62,7 @@ pub trait EventSource: Send {
     }
 }
 
-// ========== Mock 事件源 ==========
+// Mock 事件源
 
 pub struct MockEventSource {
     events: Vec<Vec<u8>>,
@@ -366,10 +359,8 @@ impl EventSource for MockEventSource {
     }
 }
 
-// ========== Linux 真实事件源 (aya ring buffer) ==========
-// 注意：LinuxEventSource 已简化为 stub。
-// 真实 ring buffer 消费在 start.rs 中通过 loader.try_next_event() 直接调用。
-// A7 会用 EbpfModernSource 替换此 stub，真正通过 trait 路由 eBPF 事件。
+// Linux 真实事件源（aya ring buffer）
+// 注意：LinuxEventSource 已简化为 stub。真实 ring buffer 消费在 start.rs 中通过 loader.try_next_event() 直接调用。A7 会用 EbpfModernSource 替换此 stub。
 
 #[cfg(target_os = "linux")]
 pub struct LinuxEventSource;
@@ -391,8 +382,7 @@ impl LinuxEventSource {
 #[async_trait]
 impl EventSource for LinuxEventSource {
     async fn next_bytes(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        // stub — 真实消费由 start.rs 绕过此 trait 直接调 loader。
-        // A7 重构后由 EbpfModernSource 接管此职责。
+        // stub — 真实消费由 start.rs 绕过此 trait 直接调 loader，A7 重构后由 EbpfModernSource 接管。
         Ok(None)
     }
     fn kind(&self) -> SourceKind {
@@ -406,7 +396,7 @@ impl EventSource for LinuxEventSource {
     }
 }
 
-// ========== 辅助函数 ==========
+// 辅助函数
 
 fn make_header(event_type: u32, pid: u32, ts: u64, comm: &[u8], nr: i32) -> EventHeader {
     let mut buf = [0u8; 16];
@@ -442,8 +432,7 @@ fn make_cstr_512(s: &str) -> [u8; 512] {
 }
 
 fn ipv4_to_u32(addr: &str) -> u32 {
-    // 与内核 bpf_probe_read_kernel 一致：网络字节序的字节直接拷入 u32 字段，
-    // Rust 读出来是 native-endian。用 from_ne_bytes 匹配内核行为。
+    // 与内核 bpf_probe_read_kernel 一致：网络字节序字节直接拷入 u32 字段，Rust 读出是 native-endian，用 from_ne_bytes 匹配内核行为。
     let parts: Vec<u8> = addr
         .split('.')
         .filter_map(|p| p.parse::<u8>().ok())
@@ -458,7 +447,7 @@ fn ipv4_to_u32(addr: &str) -> u32 {
 fn encode_struct<T: Copy>(s: &T) -> Vec<u8> {
     let size = core::mem::size_of::<T>();
     let mut data = vec![0u8; size];
-    // 直接从引用拷贝到 Vec，避免 *s 在栈上产生大结构体副本（ExecEvent ~800B）
+    // 直接从引用拷贝到 Vec，避免 *s 在栈上产生大结构体副本（ExecEvent ~800B）。
     unsafe {
         core::ptr::copy_nonoverlapping(s as *const T as *const u8, data.as_mut_ptr(), size);
     }
@@ -476,7 +465,7 @@ pub enum MockScenario {
     All,
 }
 
-// ========== 平台导出 ==========
+// 平台导出
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::*;
@@ -494,9 +483,7 @@ mod linux_impl {
 
     /// 默认事件源 — 根据内核版本自动选择 eBPF tier。
     ///
-    /// Phase E1.2：返回元组 `(Box<dyn EventSource>, Option<Arc<dyn BpfMapReader>>)`，
-    /// 第二个元素是 BPF map 读取器（eBPF 加载成功时为 LinuxBpfMapReader，
-    /// fallback mock 时为 MockBpfMapReader），供 /api/v1/stats 端点读取 map_stats。
+    /// Phase E1.2：返回元组 `(Box<dyn EventSource>, Option<Arc<dyn BpfMapReader>>)`，第二元素是 BPF map 读取器（加载成功为 LinuxBpfMapReader，fallback mock 为 MockBpfMapReader），供 /api/v1/stats 端点读取 map_stats。
     ///
     /// - 5.8+ → EbpfModernSource（ringbuf，ks_main_modern.o）
     /// - 4.x  → EbpfPerfSource（perfbuf，ks_main_legacy.o）— B6
@@ -513,7 +500,7 @@ mod linux_impl {
                             "[tier-detect] eBPF Modern tier 加载成功，{} 个程序已 attach",
                             loader.loaded_probes().len()
                         );
-                        // Phase E1.2：在 move loader 到 source 之前先取 map_reader（克隆 Arc<Mutex<Ebpf>>）
+                        // 在 move loader 到 source 之前先取 map_reader
                         let map_reader = loader.map_reader();
                         return (Box::new(EbpfModernSource::new(loader)), map_reader);
                     }
@@ -551,9 +538,7 @@ mod linux_impl {
                 )
             }
             Some(SourceKind::EbpfAncient) => {
-                // Phase E2.3: Ancient+NOBTF 路径优先走 CLoaderSource（ks_loader --stream 子进程）。
-                // 3.10 stock 内核无 BTF 时 aya (依赖 libbpf 1.0+) 通常无法加载，
-                // 改由独立编译的 C loader 加载 .o 并把 perfbuf 事件按帧格式写 stdout。
+                // Ancient+NOBTF 路径优先走 CLoaderSource（ks_loader --stream 子进程）。3.10 stock 内核无 BTF 时 aya（依赖 libbpf 1.0+）通常无法加载，改由 C loader 加载 .o 并把 perfbuf 事件按帧写 stdout。
                 if !crate::tier_detect::btf_available() {
                     log::info!("[tier-detect] Ancient tier 无 BTF，尝试 CLoaderSource (ks_loader --stream)");
                     match try_cloader_source().await {
@@ -569,7 +554,7 @@ mod linux_impl {
                         }
                     }
                 }
-                // aya 加载路径（有 BTF，或 CLoaderSource 失败时的 fallback）
+                // aya 加载路径（有 BTF，或 CLoaderSource 失败时 fallback）
                 log::info!("[tier-detect] 当前内核走 Ancient tier (3.10+ BTF backport)");
                 let mut loader = EbpfLoader::new();
                 match loader.start_all(SourceKind::EbpfAncient).await {
@@ -603,21 +588,23 @@ mod linux_impl {
         }
     }
 
-    /// Phase E2.3：尝试启动 CLoaderSource（NOBTF 路径）。
-    ///
-    /// 在 Ancient tier 且内核无 BTF 时调用：
-    /// 1. 查找 `ks_loader` 二进制（环境变量 / PATH / 当前目录 / 系统路径 / 开发环境源码）
-    /// 2. 查找 `ks_main_ancient_nobtf.o`（环境变量 / build.rs OUT_DIR / 运行时 target 查找）
+    /// 尝试启动 CLoaderSource（NOBTF 路径），在 Ancient tier 且内核无 BTF 时调用：
+    /// 1. 查找 `ks_loader` 二进制（KS_LOADER_PATH 覆盖 / 内嵌 static 预编释放）
+    /// 2. 查找 `ks_main_ancient_nobtf.o`（KS_EBPF_DIR 覆盖 / 内嵌字节码释放）
     /// 3. `CLoaderSource::spawn` 启动子进程并返回事件源
     ///
-    /// CLoaderSource 不持有 EbpfLoader，无法提供 BpfMapReader（NOBTF 路径下 map 数据
-    /// 在 C loader 子进程内，Rust 父进程访问不到），返回 None — /api/v1/stats 端点
-    /// 会显示空 map_stats，这是可接受的（NOBTF 是研究性路径，生产环境应有 BTF）。
+    /// CLoaderSource 不持有 EbpfLoader，无法提供 BpfMapReader（map 数据在 C loader 子进程内，Rust 父进程访问不到），返回 None — stats 端点显示空 map_stats（NOBTF 是研究性路径，可接受）。
     async fn try_cloader_source() -> anyhow::Result<(
         crate::cloader_source::CLoaderSource,
         Option<Arc<dyn BpfMapReader>>,
     )> {
         use crate::cloader_source::CLoaderSource;
+
+        // nobtf .o 用硬编码 offset，仅对 3.10.0-1160 编译。release 不匹配则 fail loud，避免在别的 3.10 子版本上加载 wrong-offset .o 产生 silent wrong data。
+        if let Err(reason) = crate::tier_detect::nobtf_release_compatible() {
+            log::warn!("[cloader] {}", reason);
+            anyhow::bail!("{}", reason);
+        }
 
         // 1. 查找 ks_loader 二进制
         let loader_path = find_ks_loader_binary()?;
@@ -638,163 +625,94 @@ mod linux_impl {
             object_path.to_str().expect("object_path 非 UTF-8"),
         )?;
 
-        // 4. CLoaderSource 不持有 EbpfLoader，无法提供 BpfMapReader
-        //    返回 None，stats 端点会显示空 map_stats（NOBTF 路径可接受）
+        // 4. CLoaderSource 不持有 EbpfLoader，返回 None — stats 端点显示空 map_stats（NOBTF 路径可接受）
         Ok((source, None))
     }
 
-    /// 查找 `ks_loader` 二进制路径，按以下优先级：
-    /// 1. 环境变量 `KS_LOADER_PATH`（运维显式指定）
-    /// 2. `which ks_loader`（PATH 查找，已安装到 /usr/local/bin 等）
-    /// 3. `./ks_loader`（当前工作目录）
-    /// 4. `/usr/local/bin/ks_loader`（系统安装路径）
-    /// 5. `crates/ks-ebpf/scripts/ks_loader`（开发环境，需先 `gcc -std=c99 -O2 -o ks_loader ks_loader.c -lelf`）
-    ///
-    /// 第 5 项指向源码目录中已编译出的二进制；若该路径不存在但 `ks_loader.c` 存在，
-    /// 错误信息会提示先编译。若全部未命中，返回 `Err`。
-    fn find_ks_loader_binary() -> anyhow::Result<std::path::PathBuf> {
-        use std::path::PathBuf;
+    /// 把内嵌字节码释放到临时文件并设权限（单二进制部署：运行时从二进制内释放 ks_loader / .o）。
+    fn release_to_temp(name: &str, bytes: &[u8], mode: u32) -> anyhow::Result<std::path::PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
 
-        // 1. 环境变量 KS_LOADER_PATH
+        let dir = std::env::var_os("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let path = dir.join(format!("ks-{}-{}.bin", name, std::process::id()));
+
+        let mut f = std::fs::File::create(&path)
+            .map_err(|e| anyhow::anyhow!("创建临时文件 {} 失败: {}", path.display(), e))?;
+        f.write_all(bytes)
+            .map_err(|e| anyhow::anyhow!("写入临时文件 {} 失败: {}", path.display(), e))?;
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| anyhow::anyhow!("chmod {} 失败: {}", path.display(), e))?;
+
+        log::debug!(
+            "[cloader] 释放内嵌 {} 到 {} ({} bytes, mode {:o})",
+            name,
+            path.display(),
+            bytes.len(),
+            mode,
+        );
+        Ok(path)
+    }
+
+    /// 查找 `ks_loader` 二进制路径（nobtf C loader），按以下优先级：
+    /// 1. 环境变量 `KS_LOADER_PATH`（调试覆盖）
+    /// 2. 从二进制内嵌的 static ks_loader 释放到临时文件（单二进制，去 gcc/PATH 依赖）
+    ///
+    /// 内嵌 ks_loader 由 build.rs `gcc -static` 预编（libelf+libz+libzstd 静态链接），可在 CentOS 7(glibc 2.17) 运行。编译期未预编则返回 Err（提示设 KS_LOADER_PATH）。
+    fn find_ks_loader_binary() -> anyhow::Result<std::path::PathBuf> {
+        // 1. 环境变量 KS_LOADER_PATH（调试覆盖）
         if let Ok(p) = std::env::var("KS_LOADER_PATH") {
-            let path = PathBuf::from(&p);
+            let path = std::path::PathBuf::from(&p);
             if path.is_file() {
                 log::debug!("[cloader] ks_loader 来自 KS_LOADER_PATH={}", path.display());
                 return Ok(path);
             }
-            log::warn!("[cloader] KS_LOADER_PATH={} 但文件不存在，继续查找", p);
+            log::warn!("[cloader] KS_LOADER_PATH={} 但文件不存在，改用内嵌", p);
         }
 
-        // 2. which ks_loader（PATH 查找）
-        if let Ok(p) = which::which("ks_loader") {
-            log::debug!("[cloader] ks_loader 来自 PATH: {}", p.display());
-            return Ok(p);
-        }
-
-        // 3. ./ks_loader（当前目录）
-        let cwd = PathBuf::from("./ks_loader");
-        if cwd.is_file() {
-            log::debug!("[cloader] ks_loader 来自当前目录: {}", cwd.display());
-            return Ok(cwd);
-        }
-
-        // 4. /usr/local/bin/ks_loader（系统安装路径）
-        let sys = PathBuf::from("/usr/local/bin/ks_loader");
-        if sys.is_file() {
-            log::debug!("[cloader] ks_loader 来自系统路径: {}", sys.display());
-            return Ok(sys);
-        }
-
-        // 5. crates/ks-ebpf/scripts/ks_loader（开发环境二进制，需先编译 .c）
-        // CARGO_MANIFEST_DIR 在编译期指向 ks-engine crate 根，运行时仍嵌入为字面量，
-        // 由此定位源码目录中的 ks_loader 二进制。
-        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ks-ebpf/scripts/ks_loader");
-        if dev.is_file() {
-            log::debug!("[cloader] ks_loader 来自开发环境: {}", dev.display());
-            return Ok(dev);
-        }
-
-        // 全部未命中 — 给出明确的错误提示
-        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ks-ebpf/scripts/ks_loader.c");
-        let hint = if src.exists() {
-            format!(
-                "请先编译 ks_loader: gcc -std=c99 -O2 -o {} {} -lelf",
-                dev.display(),
-                src.display(),
+        // 2. 从二进制内嵌 static ks_loader 释放到临时文件（0500 可执行）
+        let bytes = crate::loader::ebpf_objects::ks_loader_static().ok_or_else(|| {
+            anyhow::anyhow!(
+                "二进制内无内嵌 ks_loader（编译期 static 预编失败）；\
+                 如需外部指定，设 KS_LOADER_PATH 环境变量"
             )
-        } else {
-            "未找到 ks_loader 源码，请检查 ks-ebpf/scripts/ks_loader.c 是否存在".to_string()
-        };
-        anyhow::bail!(
-            "未找到 ks_loader 二进制（已尝试 KS_LOADER_PATH / PATH / ./ks_loader / /usr/local/bin/ks_loader / crates/ks-ebpf/scripts/ks_loader）；{}",
-            hint,
-        )
+        })?;
+        release_to_temp("ks_loader", bytes, 0o500)
     }
 
-    /// 查找 `ks_main_ancient_nobtf.o`（NOBTF tier eBPF 字节码）。
-    ///
-    /// 优先级：
-    /// 1. 环境变量 `KS_EBPF_DIR` + `ks_main_ancient_nobtf.o`（运维显式指定目录）
-    /// 2. `env!("OUT_DIR")` + `ks_main_ancient_nobtf.o`（build.rs 编译期写入的绝对路径，
-    ///    仅当当前运行的二进制与编译时的 OUT_DIR 一致时有效）
-    /// 3. 运行时查找 `target/debug/build/ks-engine-*/out/ks_main_ancient_nobtf.o`
-    ///    （从 CARGO_MANIFEST_DIR 推出 workspace target 目录，glob 查找最新一份）
+    /// 查找 `ks_main_ancient_nobtf.o`（NOBTF tier eBPF 字节码），按以下优先级：
+    /// 1. 环境变量 `KS_EBPF_DIR` + `ks_main_ancient_nobtf.o`（调试覆盖）
+    /// 2. 从二进制内嵌字节码释放到临时文件（单二进制，去磁盘 .o 依赖）
     fn find_ancient_nobtf_object() -> anyhow::Result<std::path::PathBuf> {
-        use std::path::PathBuf;
-
         const OBJ_NAME: &str = "ks_main_ancient_nobtf.o";
 
-        // 1. 环境变量 KS_EBPF_DIR
+        // 1. 环境变量 KS_EBPF_DIR（调试覆盖）
         if let Ok(dir) = std::env::var("KS_EBPF_DIR") {
-            let p = PathBuf::from(&dir).join(OBJ_NAME);
+            let p = std::path::PathBuf::from(&dir).join(OBJ_NAME);
             if p.is_file() {
                 log::debug!("[cloader] {} 来自 KS_EBPF_DIR={}", OBJ_NAME, p.display());
                 return Ok(p);
             }
             log::warn!(
-                "[cloader] KS_EBPF_DIR={} 但 {} 不存在，继续查找",
+                "[cloader] KS_EBPF_DIR={} 但 {} 不存在，改用内嵌",
                 dir,
                 OBJ_NAME,
             );
         }
 
-        // 2. env!("OUT_DIR")（编译期写入的绝对路径）
-        let out_obj = PathBuf::from(env!("OUT_DIR")).join(OBJ_NAME);
-        if out_obj.is_file() {
-            log::debug!(
-                "[cloader] {} 来自编译期 OUT_DIR: {}",
-                OBJ_NAME,
-                out_obj.display()
-            );
-            return Ok(out_obj);
-        }
-
-        // 3. 运行时 glob 查找 target/debug/build/ks-engine-*/out/<OBJ_NAME>
-        // CARGO_MANIFEST_DIR = crates/ks-engine → workspace root = ../..
-        let workspace_target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-        // 尝试 debug 与 release 两个 profile 目录，每个下 glob ks-engine-*/out/<OBJ_NAME>
-        for profile in ["debug", "release"] {
-            let search_dir = workspace_target.join(profile).join("build");
-            if !search_dir.is_dir() {
-                continue;
-            }
-            // 手动遍历 ks-engine-* 子目录，按修改时间选最新的（不引入 glob crate 依赖）
-            let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&search_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !name.starts_with("ks-engine-") {
-                        continue;
-                    }
-                    let obj = path.join("out").join(OBJ_NAME);
-                    if obj.is_file() {
-                        if let Ok(meta) = std::fs::metadata(&obj) {
-                            if let Ok(mtime) = meta.modified() {
-                                candidates.push((mtime, obj));
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((_, newest)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
-                log::debug!(
-                    "[cloader] {} 来自运行时查找: {}",
+        // 2. 从二进制内嵌字节码释放到临时文件（0400 只读，ks_loader 读取即可）
+        let bytes =
+            crate::loader::ebpf_objects::ebpf_object_for("ancient_nobtf").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "二进制内无内嵌 {}（编译期 ancient_nobtf tier 未成功编译）；\
+                     如需外部指定，设 KS_EBPF_DIR 环境变量",
                     OBJ_NAME,
-                    newest.display(),
-                );
-                return Ok(newest);
-            }
-        }
-
-        anyhow::bail!(
-            "未找到 {}（已尝试 KS_EBPF_DIR / 编译期 OUT_DIR={} / target/{{debug,release}}/build/ks-engine-*/out/）",
-            OBJ_NAME,
-            env!("OUT_DIR"),
-        )
+                )
+            })?;
+        release_to_temp(OBJ_NAME, bytes, 0o400)
     }
 }
 
@@ -804,7 +722,7 @@ mod mock_only {
     use crate::loader::{BpfMapReader, MockBpfMapReader};
     use std::sync::Arc;
 
-    /// Phase E1.2：非 Linux 平台返回 mock 事件源 + MockBpfMapReader。
+    /// 非 Linux 平台返回 mock 事件源 + MockBpfMapReader。
     pub async fn default_event_source() -> (Box<dyn EventSource>, Option<Arc<dyn BpfMapReader>>) {
         (
             Box::new(MockEventSource::new_with_all_scenarios().with_loop(true)),
