@@ -263,6 +263,19 @@ impl Default for EbpfLoader {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Drop for EbpfLoader {
+    fn drop(&mut self) {
+        // 压测诊断：进程退出时打印内核侧 syscall 计数，对比用户态"已处理"定位吞吐瓶颈。
+        if let Some((enter, exit, drop)) = self.read_syscount() {
+            eprintln!(
+                "[syscount] kernel enter={} exit={} ringbuf_drop={}",
+                enter, exit, drop
+            );
+        }
+    }
+}
+
 /// 把自身 tgid 及其父进程链(sshd/systemd 等)写入 protected_pids 豁免 map，
 /// 防止 eBPF 阻断逻辑冷启动误杀自身及连接会话的系统进程。
 /// 在程序全部 attach 完成后、事件开始流动前调用。
@@ -677,9 +690,29 @@ impl EbpfLoader {
             None
         }
     }
-}
 
-// 测试
+    /// 读取内核侧 sys_enter/sys_exit 触发计数及 ringbuf drop 数(percpu 求和)。
+    /// 压测诊断用：返回 (enter, exit, drop)。
+    #[cfg(target_os = "linux")]
+    pub fn read_syscount(&self) -> Option<(u64, u64, u64)> {
+        use aya::maps::PerCpuArray;
+        let bpf = self.bpf.as_ref()?.lock().ok()?;
+        let arr = PerCpuArray::<_, [u64; 3]>::try_from(bpf.map("syscount_map")?).ok()?;
+        let vals = arr.get(&0, 0).ok()?;
+        let (mut enter, mut exit, mut drop) = (0u64, 0u64, 0u64);
+        for v in vals.iter() {
+            enter += v[0];
+            exit += v[1];
+            drop += v[2];
+        }
+        Some((enter, exit, drop))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn read_syscount(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {

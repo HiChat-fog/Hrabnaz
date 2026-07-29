@@ -15,10 +15,30 @@ struct {
     __type(value, struct syscall_ctx);
 } syscall_ctxs SEC(".maps");
 
+/* 压测诊断：统计内核侧 sys_enter/sys_exit 触发次数及 ringbuf reserve 失败(drop)数。
+ * 对比三者定位吞吐瓶颈：enter=内核捕获syscall数，exit=生成事件数，drop=ringbuf满丢数，
+ * 用户态"已处理"=实际收到数。drop>0 说明 ringbuf 太小或用户态消费太慢。 */
+struct syscount { u64 enter; u64 exit; u64 drop; };
+KS_PERCPU_ARRAY_MAP(syscount_map, struct syscount);
+
+/* 压测诊断：ringbuf reserve 失败时调用，累加 drop 计数。 */
+static __always_inline void ks_count_drop(void) {
+    u32 k = 0;
+    struct syscount *sc = bpf_map_lookup_elem(&syscount_map, &k);
+    if (sc) sc->drop++;
+}
+
 SEC("tracepoint/raw_syscalls/sys_enter")
 int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 syscall_nr = ctx->id;
+
+    /* 压测诊断：统计内核侧 sys_enter 触发次数 */
+    {
+        u32 _k = 0;
+        struct syscount *sc = bpf_map_lookup_elem(&syscount_map, &_k);
+        if (sc) sc->enter++;
+    }
 
     switch (syscall_nr) {
     case 59:  case 2:   case 257:
@@ -47,6 +67,14 @@ int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
 SEC("tracepoint/raw_syscalls/sys_exit")
 int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    /* 压测诊断：统计内核侧 sys_exit 触发次数 */
+    {
+        u32 _k = 0;
+        struct syscount *sc = bpf_map_lookup_elem(&syscount_map, &_k);
+        if (sc) sc->exit++;
+    }
+
     struct syscall_ctx *sctx = bpf_map_lookup_elem(&syscall_ctxs, &pid_tgid);
     if (!sctx) return 0;
 
@@ -57,7 +85,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if (syscall_nr == 59 && ret >= 0) {
         struct exec_event *evt = KS_RESERVE(events, struct exec_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_PROCESS_EXEC);
         evt->header.syscall_nr = 59;
@@ -92,7 +120,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if ((syscall_nr == 2 || syscall_nr == 257) && ret >= 0) {
         struct file_event *evt = KS_RESERVE(events, struct file_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_FILE_OPEN);
         evt->header.syscall_nr = syscall_nr;
@@ -117,7 +145,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if (syscall_nr == 42) {
         struct net_event *evt = KS_RESERVE(events, struct net_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_NET_CONNECT);
         evt->header.syscall_nr = 42;
@@ -162,7 +190,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if (syscall_nr == 101 && ret >= 0) {
         struct signal_event *evt = KS_RESERVE(events, struct signal_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_PROC_PTRACE);
         evt->header.syscall_nr = 101;
@@ -178,7 +206,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if (syscall_nr == 62 && ret >= 0) {
         struct signal_event *evt = KS_RESERVE(events, struct signal_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_PROC_SIGNAL);
         evt->header.syscall_nr = 62;

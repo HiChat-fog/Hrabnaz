@@ -145,6 +145,7 @@ static const struct known_map known_maps[] = {
     {"ks_scratch",        BPF_MAP_TYPE_ARRAY, 4, 1024, 256},
     {"pt_scratch_map",    BPF_MAP_TYPE_ARRAY, 4, 936, 256},
     {"filter_stats_map",  BPF_MAP_TYPE_ARRAY, 4, 24, 256},
+    {"syscount_map",      BPF_MAP_TYPE_ARRAY, 4, 24, 256},
     /* 直接ARRAY声明 */
     {"infer_config",      BPF_MAP_TYPE_ARRAY, 4, 4, 32},
     {"freq_thresholds",   BPF_MAP_TYPE_ARRAY, 4, 4, 16},
