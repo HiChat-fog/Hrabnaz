@@ -78,7 +78,9 @@ static int nprog_fds = 0;
 /* 每个程序的ELF section name（attach用：tracepoint/<cat>/<name> / kprobe/<func>）*/
 static char prog_sec_names[MAX_PROGS][128];
 /* attach perf_event fd（绑程序到tracepoint/kprobe；关闭即分离）*/
-static int attach_fds[MAX_PROGS];
+/* per-CPU attach:每程序每CPU一个perf_fd */
+#define MAX_ATTACH_FDS (MAX_PROGS * MAX_CPUS)
+static int attach_fds[MAX_ATTACH_FDS];
 static int nattach_fds = 0;
 
 /* perfbuf per-CPU buffer */
@@ -614,10 +616,9 @@ static void print_usage(const char *prog) {
 }
 
 /* 程序attach (3.10-era: 无BPF_LINK_CREATE, 改用perf_event_open + PERF_EVENT_IOC_SET_BPF):
- * tracepoint/<cat>/<name>、kprobe/<func>两类section: 读event id → perf_event_open → SET_BPF+ENABLE;
- * kprobe需先写kprobe_events("p:ks_<func> <func>"). 返回0=成功/跳过(*out_perf_fd=-1), -1=失败; attach失败非致命。 */
-static int attach_program(int prog_fd, const char *sec_name, int *out_perf_fd) {
-    *out_perf_fd = -1;
+ * tracepoint/kprobe:读event id→per-CPU perf_event_open+SET_BPF+ENABLE;
+ * kprobe先写kprobe_events。每CPU一个perf_fd存attach_fds;失败非致命。 */
+static int attach_program(int prog_fd, const char *sec_name) {
     char id_path[256];
     const char *tracing = "/sys/kernel/debug/tracing";
 
@@ -663,7 +664,7 @@ static int attach_program(int prog_fd, const char *sec_name, int *out_perf_fd) {
     idbuf[n] = 0;
     unsigned long long event_id = strtoull(idbuf, NULL, 10);
 
-    /* perf_event_open(PERF_TYPE_TRACEPOINT, config=event_id)绑程序到hook; sample_period=1+sample_type=RAW|TIME与内核samples/bpf一致(sample_period=0在3.10会EINVAL) */
+    /* 3.10要求cpu=具体核,cpu=-1返EINVAL;per-CPU循环每核开perf_event+SET_BPF+ENABLE */
     struct perf_event_attr pe;
     memset(&pe, 0, sizeof(pe));
     pe.type = PERF_TYPE_TRACEPOINT;
@@ -671,24 +672,36 @@ static int attach_program(int prog_fd, const char *sec_name, int *out_perf_fd) {
     pe.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_TIME;
     pe.sample_period = 1;
     pe.wakeup_events = 1;
-    int perf_fd = perf_event_open_syscall(&pe, -1, -1, -1, PERF_FLAG_FD_CLOEXEC);
-    if (perf_fd < 0) {
-        fprintf(stderr, "  [!] attach %s: perf_event_open: %s\n", sec_name, strerror(errno));
-        return -1;
+
+    int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpus < 1) ncpus = 1;
+    int attached = 0;
+    for (int cpu = 0; cpu < ncpus; cpu++) {
+        int perf_fd = perf_event_open_syscall(&pe, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+        if (perf_fd < 0) continue;
+        if (ioctl(perf_fd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) {
+            fprintf(stderr, "  [!] attach %s cpu=%d: SET_BPF: %s\n", sec_name, cpu, strerror(errno));
+            close(perf_fd);
+            continue;
+        }
+        if (ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
+            fprintf(stderr, "  [!] attach %s cpu=%d: ENABLE: %s\n", sec_name, cpu, strerror(errno));
+            close(perf_fd);
+            continue;
+        }
+        if (nattach_fds < MAX_ATTACH_FDS) {
+            attach_fds[nattach_fds++] = perf_fd;
+        } else {
+            close(perf_fd);
+        }
+        attached++;
     }
-    if (ioctl(perf_fd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) {
-        fprintf(stderr, "  [!] attach %s: SET_BPF: %s\n", sec_name, strerror(errno));
-        close(perf_fd);
-        return -1;
+    if (attached > 0) {
+        fprintf(stderr, "  [+] attached %s on %d/%d CPUs (event_id=%llu)\n", sec_name, attached, ncpus, event_id);
+        return 0;
     }
-    if (ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
-        fprintf(stderr, "  [!] attach %s: ENABLE: %s\n", sec_name, strerror(errno));
-        close(perf_fd);
-        return -1;
-    }
-    *out_perf_fd = perf_fd;
-    fprintf(stderr, "  [+] attached %s (event_id=%llu)\n", sec_name, event_id);
-    return 0;
+    fprintf(stderr, "  [!] attach %s: 全部CPU失败\n", sec_name);
+    return -1;
 }
 
 int main(int argc, char **argv) {
@@ -842,19 +855,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[!] no PERF_EVENT_ARRAY maps found, nothing to poll\n");
         }
 
-        /* Step 3.5: attach程序到tracepoint/kprobe（perfbuf已就绪后，程序运行时输出到perfbuf）*/
-        fprintf(stderr, "\n=== Step 3.5: Attach programs ===\n");
+        /* Step 3.5:attach(per-CPU) */
+        fprintf(stderr, "\n=== Step 3.5: Attach programs (per-CPU) ===\n");
         for (int i = 0; i < nprog_fds; i++) {
-            int afd = -1;
-            attach_program(prog_fds[i], prog_sec_names[i], &afd);
-            if (afd >= 0) {
-                if (nattach_fds < MAX_PROGS) {
-                    attach_fds[nattach_fds++] = afd;
-                } else {
-                    close(afd);
-                }
-            }
-            /* attach失败非致命（如security_bpf_prog_free在3.10不存在）— 继续 */
+            attach_program(prog_fds[i], prog_sec_names[i]);
+            /* attach_program内部per-CPU循环+存attach_fds;失败非致命 */
         }
 
         /* Step 4: 轮询循环 + 心跳 */
