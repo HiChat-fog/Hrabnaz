@@ -82,6 +82,8 @@ nobtf路径在3.10无BTF时走C loader。预编static ks_loader用gcc -static链
 
 tier_detect加了nobtf release兼容检查，运行时内核release不匹配.o编译目标的3.10.0-1160就fail loud拒绝加载，避免在别的3.10子版本上用错偏移静默读错字段。
 
+nobtf路径在3.10上加载16条探针全部通过但事件流不出来，排查发现attach阶段perf_event_open返EINVAL。最初判断是云虚机hypervisor封了perf_event_open，因为几台云服务器都带hypervisor标志且perf全失败。但本地KVM虚机也复现了同样的EINVAL，而KVM没有云厂商的hypervisor策略，说明问题不在hypervisor层。在dev机6.17内核上跑同样的测试程序返回EACCES而非EINVAL，EACCES说明内核接受了参数只是非root拒绝权限，EINVAL说明3.10内核拒绝参数本身，两者errno不同排除了参数错误的可能。装perf工具跑perf stat -e raw_syscalls:sys_enter成功计数115次，说明3.10内核能开tracepoint perf事件，测试程序失败而perf成功说明测试程序有bug。strace perf stat抓到perf的perf_event_open调用，发现perf用的是cpu=0而非cpu=-1。3.10内核的perf_event_open对PERF_TYPE_TRACEPOINT要求cpu参数为具体核号，cpu=-1返EINVAL，6.17接受cpu=-1所以dev机上没暴露这个问题。改成per-CPU循环每核开一个perf_event加SET_BPF加ENABLE，attach成功。本地KVM虚机8秒3360条事件，并行智算云32核虚机8秒1670条事件。云虚机用per-CPU修复也能跑通，说明之前hypervisor封perf的判断从头到尾是误判，真因是cpu参数。
+
 ## 许可证
 
 GPL-3.0
