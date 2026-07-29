@@ -89,22 +89,12 @@ pub(crate) fn perf_attach(
     if cookie.is_some() && (!is_bpf_cookie_supported() || !FEATURES.bpf_perf_link()) {
         return Err(ProgramError::AttachCookieNotSupported);
     }
-    if FEATURES.bpf_perf_link() {
-        let link_fd = bpf_link_create(
-            prog_fd,
-            LinkTarget::Fd(perf_fd.as_fd()),
-            BPF_PERF_EVENT,
-            0,
-            cookie.map(|bpf_cookie| BpfLinkCreateArgs::PerfEvent { bpf_cookie }),
-        )
-        .map_err(|io_error| SyscallError {
-            call: "bpf_link_create",
-            io_error,
-        })?;
-        Ok(PerfLinkInner::Fd(FdLink::new(link_fd)))
-    } else {
-        perf_attach_either(prog_fd, perf_fd, None)
-    }
+    // vendor patch: 强制走老式 PERF_EVENT_IOC_SET_BPF，绕过 bpf(BPF_LINK_CREATE)。
+    // 背景是在5.15 KVM上调试modern tier时曾观察到LINK_CREATE路径异常，统一改用
+    // SET_BPF后3.10(nobtf C loader)/5.15(modern aya)两路均验证稳定。cookie依赖
+    // bpf_perf_link，禁用link_create则cookie不可用（当前探针不使用cookie）。
+    let _ = cookie;
+    perf_attach_either(prog_fd, perf_fd, None)
 }
 
 pub(crate) fn perf_attach_debugfs(

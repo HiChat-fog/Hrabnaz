@@ -242,6 +242,12 @@ struct block_value {
 
 KS_LRU_HASH_MAP(block_decisions, struct block_key, struct block_value, 4096);
 
+/* 自身进程豁免白名单：用户态启动时写入 kernelsentinel 自身 pid(及关键系统 pid)，
+ * KS_MAYBE_BLOCK 在 bpf_send_signal 前判断当前 tgid 命中即跳过，
+ * 避免分类器冷启动误报把自身/系统进程 SIGKILL(Tetragon 无此硬保险，本项目多加一层)。
+ * key=tgid, value=1(受保护)。Array 不足以存任意 pid，用 LRU_HASH。 */
+KS_LRU_HASH_MAP(protected_pids, u32, u8, 256);
+
 /* G2.1: 内核态阻断查询 — 命中且未过期则 SIGKILL（仅 Modern tier）。
  * Modern tier（5.8+）一定支持 bpf_send_signal（5.4+ helper）。
  * Legacy/Ancient 不调 bpf_send_signal（兼容性未知），仅返回是否应阻断，
@@ -253,19 +259,37 @@ KS_LRU_HASH_MAP(block_decisions, struct block_key, struct block_value, 4096);
  * 监控系统自身不发起恶意 syscall，故不会"自杀"。
  * 此外仍查 block_decisions map —— 用户态 BlockManager 显式写入的 PID 也阻断。 */
 #if KS_RINGBUF
+/* 受保护进程豁免：bpf_send_signal 发给当前任务，故以当前 tgid 判断。
+ * protected_pids 由用户态启动时写入自身/关键系统 pid。命中则绝不杀，
+ * 防止分类器冷启动误报把自身或系统进程 SIGKILL。 */
+static __always_inline int ks_current_protected(void) {
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    u8 *p = bpf_map_lookup_elem(&protected_pids, &tgid);
+    return p && *p == 1;
+}
+
 static __always_inline int ks_check_block(u32 pid) {
     struct block_key bk = { .pid = pid, ._pad_blk = 0 };
     struct block_value *bv = bpf_map_lookup_elem(&block_decisions, &bk);
     if (!bv) return 0;
     if (bv->expire_ns == 0 || bpf_ktime_get_ns() < bv->expire_ns) {
-        bpf_send_signal(9); /* SIGKILL */
+        if (!ks_current_protected())
+            bpf_send_signal(9); /* SIGKILL */
         return 1;
     }
     return 0;
 }
 
+/* Modern tier 阻断：
+ *   enforce_mode=1(默认0=monitor)：verdict==2 内核态直接 bpf_send_signal。
+ *   monitor 模式仅查 block_decisions(用户态显式阻断)，不因 verdict 主动杀。
+ * monitor 默认避免冷启动误报误杀正常进程/自身；用户态显式置 enforce 才真阻断。
+ * 两条 kill 路径都先过 ks_current_protected() 豁免自身。 */
 #define KS_MAYBE_BLOCK(pid, verdict) do { \
-    if ((verdict) == 2) { bpf_send_signal(9); /* SIGKILL — verdict==2 内核态直接阻断(申报书第四阶段) */ } \
+    if (get_config(CFG_ENFORCE_MODE, 0) == 1 && (verdict) == 2) { \
+        if (!ks_current_protected()) \
+            bpf_send_signal(9); /* SIGKILL — verdict==2 内核态直接阻断(申报书第四阶段) */ \
+    } \
     ks_check_block((pid)); \
 } while (0)
 #else
@@ -320,6 +344,11 @@ enum infer_config_key {
     CFG_TIME_WINDOW_NS      = 2,
     CFG_MAX_NEW_FILES       = 3,
     CFG_NEW_FILE_WINDOW_NS  = 4,
+    /* 5: enforce_mode — 0=monitor(只告警/记block_decisions，不主动SIGKILL)，
+     * 1=enforce(verdict==2 内核态直接 bpf_send_signal)。默认 0，
+     * 冷启动误报高时避免误杀正常进程/自身；用户态显式置 1 才真阻断。
+     * 对齐 Tetragon POLICY_MODE_ENFORCE/MONITOR 设计。 */
+    CFG_ENFORCE_MODE        = 5,
 };
 
 static __always_inline u32 get_config(u32 key, u32 default_val) {

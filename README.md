@@ -61,14 +61,15 @@ deploy/       systemd/install/grafana/prometheus
 - 规则引擎用YAML+Field枚举 字段名拼错在加载时报错 不会静默不匹配
 - 跨事件关联分三种 窗口关联 序列检测 进程树关联 单事件规则查不了的组合（比如读过/etc/shadow之后外连4444）靠它
 - 基线偏离 每进程六维z-score 一次性训练锁定 异常数据不会反过来把基线拉偏
-- 内核态阻断 风险分到70以上直接`bpf_send_signal(SIGKILL)`（modern tier）
+- 内核态阻断 风险分到70以上(verdict==2)直接`bpf_send_signal(SIGKILL)`（modern tier，enforce模式，默认monitor只告警）
 - 取证 JSONL+SHA-256哈希链 改任意一条记录后面全断
 
 ## 现状
 
-- 4tier eBPF编译通过 在6.17真机上端到端跑过（事件 告警 哈希链闭环）
+- 4tier eBPF编译通过 在6.17真机和5.15(申报书硬指标)Ubuntu 22.04 KVM上端到端跑过（事件 告警 哈希链闭环）
+- 5.15上monitor模式45秒soak 34660事件778告警 0次SIGKILL 稳定收尾
 - 用户态引擎和12个攻击场景的e2e测试在`cargo test`里 不开root也能跑
-- 还没做的 5.15/6.1两个内核的对照性能数据 内核态阻断（verdict==2→SIGKILL）只在编译层验证过 没在真机上真正杀过进程
+- 还没做的 5.15/6.1两个内核的对照性能数据 内核态阻断enforce模式(KS_ENFORCE=1)已验证能真杀进程但冷启动分类器对高频系统进程(sshd/cron)误判verdict==2需配合基线建立后再用 默认monitor只告警不杀
 
 ## 7.29update
 
@@ -83,6 +84,8 @@ nobtf路径在3.10无BTF时走C loader。预编static ks_loader用gcc -static链
 tier_detect加了nobtf release兼容检查，运行时内核release不匹配.o编译目标的3.10.0-1160就fail loud拒绝加载，避免在别的3.10子版本上用错偏移静默读错字段。
 
 nobtf路径在3.10上加载16条探针全部通过但事件流不出来，排查发现attach阶段perf_event_open返EINVAL。最初判断是云虚机hypervisor封了perf_event_open，因为几台云服务器都带hypervisor标志且perf全失败。但本地KVM虚机也复现了同样的EINVAL，而KVM没有云厂商的hypervisor策略，说明问题不在hypervisor层。在dev机6.17内核上跑同样的测试程序返回EACCES而非EINVAL，EACCES说明内核接受了参数只是非root拒绝权限，EINVAL说明3.10内核拒绝参数本身，两者errno不同排除了参数错误的可能。装perf工具跑perf stat -e raw_syscalls:sys_enter成功计数115次，说明3.10内核能开tracepoint perf事件，测试程序失败而perf成功说明测试程序有bug。strace perf stat抓到perf的perf_event_open调用，发现perf用的是cpu=0而非cpu=-1。3.10内核的perf_event_open对PERF_TYPE_TRACEPOINT要求cpu参数为具体核号，cpu=-1返EINVAL，6.17接受cpu=-1所以dev机上没暴露这个问题。改成per-CPU循环每核开一个perf_event加SET_BPF加ENABLE，attach成功。本地KVM虚机8秒3360条事件，并行智算云32核虚机8秒1670条事件。云虚机用per-CPU修复也能跑通，说明之前hypervisor封perf的判断从头到尾是误判，真因是cpu参数。
+
+5.15是申报书硬指标，modern tier在Ubuntu 22.04(5.15.0-128)KVM上加载时trace_sys_exit程序(2441 insns)attach永久挂起。strace确认trace_sys_enter(49 insns)的attach秒过、trace_sys_exit(2441 insns)的attach卡死，用空程序实验把trace_sys_exit体掏空后attach立即成功，定位到是程序内容而非attach点或aya或KVM的问题。进一步发现不是attach卡死而是attach成功后程序立刻被触发执行：trace_sys_exit里KS_MAYBE_BLOCK在verdict==2时调bpf_send_signal(9)杀当前进程，分类器冷启动对系统正常exec误判高风险，把kernelsentinel进程自身SIGKILL了(退出码137=SIGKILL)。根因是内核态自动阻断在无基线冷启动下误杀面太大。修复加了protected_pids豁免map，用户态启动时写自身pid加父进程链(sshd等)到豁免表，KS_MAYBE_BLOCK在bpf_send_signal前查当前tgid命中就跳过(Tetragon没这层硬保险，参考了jingpin里tetragon源码的POLICY_MODE_ENFORCE/MONITOR设计后加的)，再加CFG_ENFORCE_MODE配置默认monitor只告警不杀，KS_ENFORCE=1才开enforce真杀。monitor默认模式下5.15上45秒soak跑34660事件0次SIGKILL稳定。enforce模式自身和会话链不再被杀，但冷启动对非豁免高频系统进程(cron等)仍会误判，需建好基线后再用。
 
 ## 许可证
 

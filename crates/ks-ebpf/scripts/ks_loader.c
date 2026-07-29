@@ -129,6 +129,7 @@ static const struct known_map known_maps[] = {
     /* KS_LRU_HASH_MAP → HASH */
     {"risk_scores",       BPF_MAP_TYPE_HASH, 4, 4, 4096},
     {"block_decisions",   BPF_MAP_TYPE_HASH, 8, 16, 4096},  /* G2.1: block_key(8)/block_value(16) */
+    {"protected_pids",   BPF_MAP_TYPE_HASH, 4, 1, 256},   /* 自身/系统pid豁免(防冷启动误杀) */
     {"ip_whitelist",      BPF_MAP_TYPE_HASH, 4, 1, 256},
     {"net_conn_history",  BPF_MAP_TYPE_HASH, 12, 8, 8192},
     {"freq_counters",     BPF_MAP_TYPE_HASH, 4, 48, 4096},
