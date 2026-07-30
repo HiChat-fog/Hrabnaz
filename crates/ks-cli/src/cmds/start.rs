@@ -265,8 +265,10 @@ pub async fn run(
                     Ok(Some(b)) => b,
                     Ok(None) => {
                         if continue_on_empty {
-                            // eBPF ringbuf 暂空，sleep 1ms 后继续轮询
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            // eBPF ringbuf 暂空：yield 让出调度而非 sleep 1ms。
+                            // 压测显示用户态 CPU 0% 却 drop 高，sleep 1ms 让消费跟不上 ringbuf 产出。
+                            // yield_now 不阻塞，高压时立即重试，空载时让出避免 busy loop。
+                            tokio::task::yield_now().await;
                             return Ok(true);
                         } else {
                             // mock 耗尽，退出循环
