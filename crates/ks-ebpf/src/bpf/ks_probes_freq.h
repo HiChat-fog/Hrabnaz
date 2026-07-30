@@ -33,7 +33,7 @@ enum freq_threshold_key {
     TH_REPORT_EVERY = 6,  TH_WINDOW_NS = 7,
 };
 
-KS_EVENT_MAP(freq_events, 256 * 1024);
+KS_EVENT_MAP(freq_events, 1024 * 1024);
 
 static __always_inline u32 get_threshold(u32 key, u32 default_val) {
     u32 *val = bpf_map_lookup_elem(&freq_thresholds, &key);

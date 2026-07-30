@@ -49,7 +49,7 @@ enum filter_config_key {
 /* C6: KS_PERCPU_ARRAY_MAP 宏声明，Ancient tier 自动回退到 CPU-keyed ARRAY */
 KS_PERCPU_ARRAY_MAP(filter_stats_map, struct filter_stats);
 
-KS_EVENT_MAP(filter_events, 256 * 1024);
+KS_EVENT_MAP(filter_events, 1024 * 1024);
 
 static __always_inline u32 get_filter_config(u32 key, u32 default_val) {
     u32 *val = bpf_map_lookup_elem(&filter_config, &key);

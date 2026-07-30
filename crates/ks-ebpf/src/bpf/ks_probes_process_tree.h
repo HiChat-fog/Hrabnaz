@@ -37,7 +37,7 @@ struct process_tree_event {
 
 KS_LRU_HASH_MAP(process_tree, u32, struct process_node, 65536);
 
-KS_EVENT_MAP(tree_events, 256 * 1024);
+KS_EVENT_MAP(tree_events, 1024 * 1024);
 
 struct anomaly_relation_key {
     u8 parent_comm[16], child_comm[16];
