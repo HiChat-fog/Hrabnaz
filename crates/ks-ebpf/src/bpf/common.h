@@ -242,30 +242,49 @@ struct block_value {
 
 KS_LRU_HASH_MAP(block_decisions, struct block_key, struct block_value, 4096);
 
-/* G2.1: 内核态阻断查询 — 命中且未过期则 SIGKILL（仅 Modern tier）。
- * Modern tier（5.8+）一定支持 bpf_send_signal（5.4+ helper）。
- * Legacy/Ancient 不调 bpf_send_signal（兼容性未知），仅返回是否应阻断，
- * 由用户态反向通道（BlockManager）补齐。
+/* 自身进程豁免白名单：用户态启动时写入自身及关键系统pid，
+ * KS_MAYBE_BLOCK在bpf_send_signal前判断当前tgid命中即跳过，
+ * 避免分类器冷启动误报把自身或系统进程SIGKILL。key=tgid,value=1。 */
+KS_LRU_HASH_MAP(protected_pids, u32, u8, 256);
+
+/* G2.1: 内核态阻断查询 — 命中且未过期则SIGKILL(仅Modern tier)。
+ * Modern tier(5.8+)一定支持bpf_send_signal(5.4+ helper)。
+ * Legacy/Ancient不调bpf_send_signal(兼容性未知)，仅返回是否应阻断，
+ * 由用户态反向通道(BlockManager)补齐。
  *
- * 申报书第四阶段对齐：infer 返回 verdict==2（风险分≥70）时，探针在内核态
- * 直接调 bpf_send_signal(SIGKILL) 终止恶意进程（零延迟阻断）。
- * bpf_send_signal 发送给当前任务（即触发该 syscall 的进程本身），
- * 监控系统自身不发起恶意 syscall，故不会"自杀"。
- * 此外仍查 block_decisions map —— 用户态 BlockManager 显式写入的 PID 也阻断。 */
+ * 申报书第四阶段对齐：infer返回verdict==2(风险分≥70)时，探针在内核态
+ * 直接调bpf_send_signal(SIGKILL)终止恶意进程(零延迟阻断)。
+ * bpf_send_signal发送给当前任务(即触发该syscall的进程本身)，
+ * 监控系统自身不发起恶意syscall，故不会自杀。
+ * 此外仍查block_decisions map —— 用户态BlockManager显式写入的PID也阻断。 */
 #if KS_RINGBUF
+/* 受保护进程豁免：bpf_send_signal发给当前任务，故以当前tgid判断。 */
+static __always_inline int ks_current_protected(void) {
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    u8 *p = bpf_map_lookup_elem(&protected_pids, &tgid);
+    return p && *p == 1;
+}
+
 static __always_inline int ks_check_block(u32 pid) {
     struct block_key bk = { .pid = pid, ._pad_blk = 0 };
     struct block_value *bv = bpf_map_lookup_elem(&block_decisions, &bk);
     if (!bv) return 0;
     if (bv->expire_ns == 0 || bpf_ktime_get_ns() < bv->expire_ns) {
-        bpf_send_signal(9); /* SIGKILL */
+        if (!ks_current_protected())
+            bpf_send_signal(9); /* SIGKILL */
         return 1;
     }
     return 0;
 }
 
+/* Modern tier阻断：enforce_mode=1时verdict==2内核态直接bpf_send_signal；
+ * 默认0=monitor只查block_decisions(用户态显式阻断)不因verdict主动杀，
+ * 避免冷启动误报误杀正常进程或自身。两条kill路径都先过ks_current_protected()豁免。 */
 #define KS_MAYBE_BLOCK(pid, verdict) do { \
-    if ((verdict) == 2) { bpf_send_signal(9); /* SIGKILL — verdict==2 内核态直接阻断(申报书第四阶段) */ } \
+    if (get_config(CFG_ENFORCE_MODE, 0) == 1 && (verdict) == 2) { \
+        if (!ks_current_protected()) \
+            bpf_send_signal(9); /* SIGKILL */ \
+    } \
     ks_check_block((pid)); \
 } while (0)
 #else
@@ -320,6 +339,9 @@ enum infer_config_key {
     CFG_TIME_WINDOW_NS      = 2,
     CFG_MAX_NEW_FILES       = 3,
     CFG_NEW_FILE_WINDOW_NS  = 4,
+    /* 5: enforce_mode — 0=monitor(只告警/记block_decisions不主动SIGKILL)，
+     * 1=enforce(verdict==2内核态直接bpf_send_signal)。默认0避免冷启动误杀。 */
+    CFG_ENFORCE_MODE        = 5,
 };
 
 static __always_inline u32 get_config(u32 key, u32 default_val) {

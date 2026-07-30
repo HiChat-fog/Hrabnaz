@@ -263,6 +263,76 @@ impl Default for EbpfLoader {
     }
 }
 
+/// 把自身tgid及父进程链(sshd等)写入protected_pids豁免map，
+/// 防止eBPF阻断逻辑冷启动误杀自身及连接会话的系统进程。
+#[cfg(target_os = "linux")]
+fn inject_protected_pid(bpf: &mut aya::Ebpf, self_pid: u32) {
+    use aya::maps::HashMap;
+    // 收集需要豁免的pid：自身+父进程链(到init)+pid 1(systemd)。
+    // enforce模式下分类器冷启动会对高频系统进程(sshd/cron)误判verdict==2，
+    // 不豁免会导致ssh会话进程被SIGKILL，连接断裂。自身链含父sshd故一并豁免。
+    let mut pids: Vec<u32> = vec![self_pid, 1];
+    let mut cur = self_pid;
+    for _ in 0..8 {
+        match std::fs::read_to_string(format!("/proc/{}/status", cur)) {
+            Ok(s) => {
+                let ppid = s
+                    .lines()
+                    .find_map(|l| l.strip_prefix("PPid:").map(|v| v.trim().parse::<u32>().ok()))
+                    .flatten();
+                match ppid {
+                    Some(p) if p > 1 && !pids.contains(&p) => {
+                        pids.push(p);
+                        cur = p;
+                    }
+                    _ => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let val: u8 = 1;
+    match bpf.map_mut("protected_pids") {
+        Some(m) => match HashMap::<_, u32, u8>::try_from(m) {
+            Ok(mut hm) => {
+                for &pid in &pids {
+                    if let Err(e) = hm.insert(&pid, &val, 0) {
+                        log::warn!("写入 protected_pids 失败(pid={}): {:?}", pid, e);
+                    }
+                }
+                log::info!("已注入 protected_pids 豁免 map: {:?}", pids);
+            }
+            Err(e) => log::warn!("打开 protected_pids map 失败: {:?}（豁免未生效）", e),
+        },
+        None => log::warn!("protected_pids map 不存在（豁免未生效）"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inject_protected_pid(_bpf: &mut (), _self_pid: u32) {}
+
+/// infer_config map的CFG_ENFORCE_MODE索引(与common.h enum infer_config_key对齐)。
+const CFG_ENFORCE_MODE_IDX: u32 = 5;
+
+/// 写infer_config Array<u32>，用于设置enforce_mode等运行时配置。
+#[cfg(target_os = "linux")]
+fn set_infer_config(bpf: &mut aya::Ebpf, idx: u32, val: u32) {
+    use aya::maps::Array;
+    match bpf.map_mut("infer_config") {
+        Some(m) => match Array::<_, u32>::try_from(m) {
+            Ok(mut arr) => match arr.set(idx, val, 0) {
+                Ok(_) => log::info!("infer_config[{}]={}", idx, val),
+                Err(e) => log::warn!("写 infer_config[{}] 失败: {:?}", idx, e),
+            },
+            Err(e) => log::warn!("打开 infer_config map 失败: {:?}", e),
+        },
+        None => log::warn!("infer_config map 不存在"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_infer_config(_bpf: &mut (), _idx: u32, _val: u32) {}
+
 impl EbpfLoader {
     pub fn new() -> Self {
         let probes: Vec<String> = vec![
@@ -469,6 +539,18 @@ impl EbpfLoader {
                     cpus.len(),
                     RING_NAMES.len()
                 );
+            }
+
+            // 注入自身pid到protected_pids豁免map，避免分类器冷启动误报时
+            // bpf_send_signal杀掉自身。enforce_mode默认0(monitor)只告警不杀。
+            inject_protected_pid(&mut bpf, std::process::id());
+            // enforce开关：KS_ENFORCE=1时verdict==2内核态直接SIGKILL(申报书
+            // 第四阶段零延迟阻断)；默认monitor只告警不杀，冷启动误报不误伤。
+            if std::env::var("KS_ENFORCE").map(|v| v == "1").unwrap_or(false) {
+                set_infer_config(&mut bpf, CFG_ENFORCE_MODE_IDX, 1);
+                log::info!("阻断模式: enforce(verdict==2 内核态 SIGKILL)");
+            } else {
+                log::info!("阻断模式: monitor(默认，KS_ENFORCE=1 切换为 enforce)");
             }
 
             self.bpf = Some(Arc::new(Mutex::new(bpf)));
