@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ks_core::alert::{Alert, MitreInfo, ProcessInfo};
 use ks_core::rule::Severity;
-use ks_engine::aggregator::EventAggregator;
+use ks_engine::aggregator::{DecodedEvent, EventAggregator};
 use ks_engine::baseline::BaselineManager;
 use ks_engine::chain::ChainReconstructor;
 use ks_engine::config::Config;
@@ -19,6 +19,59 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::cmds::{build_server_config, SecurityArgs};
+
+/// 异步取证写：主循环通过 channel 把事件/告警发给 forensic worker task，
+/// worker 串行消费（保证 SHA-256 哈希链顺序），主循环不等磁盘 IO。
+/// 收益：去掉每事件同步 jsonl 写 + 哈希计算的阻塞，吞吐预期 5-10 倍。
+enum ForensicOp {
+    Event(DecodedEvent),
+    Alert(Alert),
+    Flush,
+}
+
+/// 主循环持有的 sink，把操作非阻塞地发给 forensic worker。
+#[derive(Clone)]
+struct ForensicSink {
+    tx: tokio::sync::mpsc::Sender<ForensicOp>,
+}
+
+impl ForensicSink {
+    async fn log_event(&self, event: &DecodedEvent) {
+        if self.tx.send(ForensicOp::Event(event.clone())).await.is_err() {
+            log::warn!("forensic worker 已退出，事件丢失");
+        }
+    }
+    async fn log_alert(&self, alert: &Alert) {
+        if self.tx.send(ForensicOp::Alert(alert.clone())).await.is_err() {
+            log::warn!("forensic worker 已退出，告警丢失");
+        }
+    }
+    async fn flush(&self) {
+        let _ = self.tx.send(ForensicOp::Flush).await;
+    }
+}
+
+/// forensic worker task：串行消费 channel，保证哈希链顺序。
+/// sender drop 时 recv 返回 None，worker flush 后退出。
+async fn forensic_worker(
+    forensic: Arc<Mutex<ForensicLogger>>,
+    mut rx: tokio::sync::mpsc::Receiver<ForensicOp>,
+) {
+    while let Some(op) = rx.recv().await {
+        let r = match op {
+            ForensicOp::Event(e) => forensic.lock().await.log_event(&e),
+            ForensicOp::Alert(a) => forensic.lock().await.log_alert(&a),
+            ForensicOp::Flush => forensic.lock().await.flush(),
+        };
+        if let Err(e) = r {
+            log::warn!("forensic 写入失败: {}", e);
+        }
+    }
+    // sender 全部 drop，flush 落盘后退出
+    if let Err(e) = forensic.lock().await.flush() {
+        log::warn!("forensic flush 失败: {}", e);
+    }
+}
 
 #[cfg(target_os = "linux")]
 const STATUS_FILE: &str = "/tmp/ks-status.json";
@@ -149,6 +202,14 @@ pub async fn run(
         log_path,
         rotation_config,
     )?));
+    // 异步取证写：worker task 串行消费 channel，主循环不阻塞磁盘 IO。
+    // channel 容量给足(65536)避免高压时主循环背压；满了则 warn 丢老事件保检测主路径。
+    let (forensic_tx, forensic_rx) = tokio::sync::mpsc::channel::<ForensicOp>(65536);
+    let forensic_sink = ForensicSink { tx: forensic_tx };
+    let forensic_worker_handle = {
+        let f = forensic.clone();
+        tokio::spawn(async move { forensic_worker(f, forensic_rx).await; })
+    };
     let chain_reconstructor = ChainReconstructor::new();
 
     println!("      聚合器缓冲区: {} 条", config.engine.buffer_size);
@@ -214,7 +275,7 @@ pub async fn run(
                     }
                     Err(e) => return Err(e),
                 };
-                process_event_bytes(&bytes, &aggregator, &detector, &forensic, &chain_reconstructor, &mut stats, anomaly_threshold, &serve_state, &baseline_mgr, &correlation_engine, &process_tree_mgr, &ml_detector, &block_mgr, block_ttl, &block_severity_threshold).await
+                process_event_bytes(&bytes, &aggregator, &detector, &forensic_sink, &chain_reconstructor, &mut stats, anomaly_threshold, &serve_state, &baseline_mgr, &correlation_engine, &process_tree_mgr, &ml_detector, &block_mgr, block_ttl, &block_severity_threshold).await
             } => {
                 match result {
                     Ok(true) => {}
@@ -241,7 +302,9 @@ pub async fn run(
     // loader 内部 rings/bpf fd 自动关闭，无需显式 stop_all。
     drop(source);
     println!("      Flush 取证日志...");
-    forensic.lock().await.flush()?;
+    // drop sink 让 forensic worker 的 recv 返回 None，worker flush 落盘后退出。
+    drop(forensic_sink);
+    let _ = forensic_worker_handle.await;
 
     let elapsed = start_time.elapsed();
     let event_count = forensic.lock().await.event_count();
@@ -269,7 +332,7 @@ async fn process_event_bytes(
     bytes: &[u8],
     aggregator: &Arc<Mutex<EventAggregator>>,
     detector: &Arc<Mutex<DetectionEngine>>,
-    forensic: &Arc<Mutex<ForensicLogger>>,
+    forensic: &ForensicSink,
     chain_reconstructor: &ChainReconstructor,
     stats: &mut EventStats,
     anomaly_threshold: f64,
@@ -285,7 +348,7 @@ async fn process_event_bytes(
     let event = aggregator.lock().await.decode(bytes)?;
     stats.consumed += 1;
 
-    forensic.lock().await.log_event(&event)?;
+    forensic.log_event(&event).await;
 
     // G1.1/G1.2: 三引擎接线 — 在规则检测之前，更新基线/进程树/关联引擎
     // G1.2: ProcessTree 关联规则需查询进程树获取父进程信息，故 lock 顺序为
@@ -310,7 +373,7 @@ async fn process_event_bytes(
             event.header.pid,
             ca.confidence * 100.0
         );
-        forensic.lock().await.log_alert(&alert)?;
+        forensic.log_alert(&alert).await;
         if let Some(st) = serve_state {
             st.push_alert(alert.clone()).await;
             st.push_correlation_alert(ca.clone()).await;
@@ -339,7 +402,7 @@ async fn process_event_bytes(
             "  [规则告警] [{}] {} — PID: {}, COMM: {}",
             alert.severity, alert.title, alert.process.pid, event.comm
         );
-        forensic.lock().await.log_alert(&alert)?;
+        forensic.log_alert(&alert).await;
         stats.rule_alerts += 1;
         if let Some(st) = serve_state {
             st.push_alert(alert.clone()).await;
@@ -415,7 +478,7 @@ async fn process_event_bytes(
                 "  [基线偏离] PID {} — 评分: {:.2}, 维度: {}",
                 event.header.pid, dev.overall_score, dim
             );
-            forensic.lock().await.log_alert(&alert)?;
+            forensic.log_alert(&alert).await;
             if let Some(st) = serve_state {
                 st.push_alert(alert.clone()).await;
             }
@@ -453,7 +516,7 @@ async fn process_event_bytes(
                 "  [ML异常] PID {} — 评分: {:.2}, 模型: {}, 维度: {}",
                 event.header.pid, ml_result.overall_score, model_str, dim_str
             );
-            forensic.lock().await.log_alert(&alert)?;
+            forensic.log_alert(&alert).await;
             if let Some(st) = serve_state {
                 st.push_alert(alert.clone()).await;
             }
@@ -480,7 +543,7 @@ async fn process_event_bytes(
                     "  [进程树异常] {} → {} — {}",
                     rel.parent_comm, rel.child_comm, rel.anomaly_type
                 );
-                forensic.lock().await.log_alert(&alert)?;
+                forensic.log_alert(&alert).await;
                 if let Some(st) = serve_state {
                     st.push_alert(alert.clone()).await;
                 }
