@@ -42,7 +42,7 @@ impl DetectionEngine {
         self.rules.len()
     }
 
-    /// 单事件匹配所有规则，返回命中的规则列表
+    /// 单事件匹配所有规则,返回命中的规则列表
     pub fn match_event(&self, event: &DecodedEvent) -> Vec<MatchResult> {
         let mut results = Vec::new();
         for rule in &self.rules {
@@ -70,6 +70,7 @@ impl DetectionEngine {
 
     fn condition_matches(&self, cond: &Condition, event: &DecodedEvent) -> bool {
         match &cond.field {
+            Field::EventType => match_u32(event.header.event_type, &cond.operator, &cond.value),
             Field::SyscallNr => match_i32(event.header.syscall_nr, &cond.operator, &cond.value),
             Field::Pid => match_u32(event.header.pid, &cond.operator, &cond.value),
             Field::Uid => match_u32(event.header.uid, &cond.operator, &cond.value),
@@ -101,7 +102,7 @@ impl DetectionEngine {
                         .map(|a| if a.contains(':') { "IPv6" } else { "IPv4" });
                 match_family_field(inferred_family, &cond.operator, &cond.value)
             }
-            // E4.4 新增字段: 容器逃逸 / LKM 加载 / eBPF 篡改
+            // 新增字段:容器逃逸、LKM加载、eBPF篡改
             Field::ModuleName => {
                 match_opt_str(event.module_name.as_deref(), &cond.operator, &cond.value)
             }
@@ -203,19 +204,12 @@ impl DetectionEngine {
     }
 
     /// 轻量异常评分: 频率 + 敏感文件 + 可疑命令 + 网络异常
-    pub fn anomaly_score(&self, event: &DecodedEvent, history: &[DecodedEvent]) -> f64 {
+    /// recent_syscalls是调用方增量维护的60秒窗口syscall计数(O(1)查询),
+    /// 替代遍历history的O(n)扫描。
+    pub fn anomaly_score(&self, event: &DecodedEvent, recent_syscalls: usize) -> f64 {
         let mut score: f64 = 0.0;
-        let window_ns: u64 = 60_000_000_000;
-        let now_ns = event.header.timestamp_ns;
 
         // 系统调用频率
-        let recent_syscalls = history
-            .iter()
-            .filter(|e| {
-                e.header.pid == event.header.pid
-                    && now_ns.saturating_sub(e.header.timestamp_ns) < window_ns
-            })
-            .count();
         if recent_syscalls > 500 {
             score += 0.4;
         } else if recent_syscalls > 100 {
@@ -350,7 +344,7 @@ fn match_i32(value: i32, op: &Operator, target: &str) -> bool {
                 _ => unreachable!(),
             }
         }
-        Operator::Regex | Operator::Contains | Operator::StartsWith => {
+        Operator::Regex | Operator::Contains | Operator::StartsWith | Operator::NotRegex => {
             match_str(&value.to_string(), op, target)
         }
     }
@@ -381,7 +375,7 @@ fn match_u32(value: u32, op: &Operator, target: &str) -> bool {
                 _ => unreachable!(),
             }
         }
-        Operator::Regex | Operator::Contains | Operator::StartsWith => {
+        Operator::Regex | Operator::Contains | Operator::StartsWith | Operator::NotRegex => {
             match_str(&value.to_string(), op, target)
         }
     }
@@ -431,6 +425,13 @@ fn match_str(value: &str, op: &Operator, target: &str) -> bool {
         Operator::StartsWith => value.starts_with(target),
         Operator::Regex => match regex::Regex::new(target) {
             Ok(re) => re.is_match(value),
+            Err(e) => {
+                warn!("正则无效: '{}' — {}", target, e);
+                false
+            }
+        },
+        Operator::NotRegex => match regex::Regex::new(target) {
+            Ok(re) => !re.is_match(value),
             Err(e) => {
                 warn!("正则无效: '{}' — {}", target, e);
                 false
@@ -497,6 +498,7 @@ fn op_to_str(op: &Operator) -> &str {
         Operator::GreaterThanOrEqual => ">=",
         Operator::LessThanOrEqual => "<=",
         Operator::NotEquals => "!=",
+        Operator::NotRegex => "!~",
     }
 }
 
@@ -626,7 +628,7 @@ mod tests {
             cap_eff: None,
             action: None,
         };
-        assert_eq!(engine.anomaly_score(&event, &[]), 0.0);
+        assert_eq!(engine.anomaly_score(&event, 0), 0.0);
     }
 
     #[test]
@@ -653,7 +655,7 @@ mod tests {
             cap_eff: None,
             action: None,
         };
-        assert!(engine.anomaly_score(&event, &[]) >= 0.5);
+        assert!(engine.anomaly_score(&event, 0) >= 0.5);
     }
 
     #[test]

@@ -1,22 +1,19 @@
-//! G1.3: `kernelsentinel correlation` 子命令 — 查看最近的跨事件关联告警。
+//! `kernelsentinel correlation`子命令,查看最近的跨事件关联告警。
 //!
-//! 通过 HTTP GET /api/v1/correlations 拉取 ServerState 中的关联告警存储
-//! （由 start.rs 在 correlation_engine 产生告警时推送）。
-//!
-//! 申报书承诺的 8 个 CLI 子命令之一。
+//! 通过HTTP GET /api/v1/correlations拉取ServerState中的关联告警存储(由start.rs在correlation_engine产生告警时推送)。
 
 use anyhow::Result;
 use ks_engine::correlation::CorrelationAlert;
 
 #[derive(clap::Args, Debug)]
 pub struct CorrelationArgs {
-    /// ks-server 地址
+    /// ks-server地址
     #[arg(short, long, default_value = "http://127.0.0.1:3000")]
     pub server: String,
-    /// 拉取条数（默认 50）
+    /// 拉取条数(默认50)
     #[arg(short, long, default_value_t = 50)]
     pub limit: usize,
-    /// 输出 JSON
+    /// 输出JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }

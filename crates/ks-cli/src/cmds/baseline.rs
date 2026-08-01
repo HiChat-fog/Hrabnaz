@@ -1,19 +1,16 @@
-//! G1.3: `kernelsentinel baseline` 子命令 — 查看各进程的 z-score 行为基线快照。
+//! `kernelsentinel baseline`子命令,查看各进程的z-score行为基线快照。
 //!
-//! 通过 HTTP GET /api/v1/baselines 拉取 ServerState 中的基线快照（由 start.rs
-//! 在周期触发时推送），以表格形式展示各进程的六维基线（均值/标准差）。
-//!
-//! 申报书承诺的 8 个 CLI 子命令之一。
+//! 通过HTTP GET /api/v1/baselines拉取ServerState中的基线快照(由start.rs在周期触发时推送),以表格形式展示各进程的六维基线(均值和标准差)。
 
 use anyhow::Result;
 use ks_engine::baseline::BehaviorBaseline;
 
 #[derive(clap::Args, Debug)]
 pub struct BaselineArgs {
-    /// ks-server 地址（默认本机 3000）
+    /// ks-server地址(默认本机3000)
     #[arg(short, long, default_value = "http://127.0.0.1:3000")]
     pub server: String,
-    /// 输出 JSON 而非表格
+    /// 输出JSON而非表格
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }

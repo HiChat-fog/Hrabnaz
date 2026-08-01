@@ -30,8 +30,8 @@ typedef __s64 i64;
     #define KS_LRU_HASH  1
 #endif
 
-/* ── C1: Ancient tier shim — bpf_probe_read_kernel 系列回退 ──
- * 3.10 无 bpf_probe_read_kernel / bpf_probe_read_kernel_str helper，
+/* ── C1: Ancient/Legacy-NOBTF tier shim — bpf_probe_read_kernel 系列回退 ──
+ * 3.10 与 4.19 均无 bpf_probe_read_kernel / bpf_probe_read_kernel_str helper（5.5+ 引入），
  * 回退到 bpf_probe_read / bpf_probe_read_str（语义等价）。
  * BPF_CORE_READ 内部调用 bpf_probe_read_kernel，经此 shim 自动重定向。
  *
@@ -39,8 +39,10 @@ typedef __s64 i64;
  *      这两个 helper 同为 5.5+ 引入（vmlinux.h 编号 112/114），
  *      ks_probes_syscall.h 中 trace_sys_exit 探针主动调用。
  *      bpf_probe_read 对 __user 指针也能 fault-in 用户页，语义等价。
+ *
+ * Phase F: 4.19 无 BTF（legacy_nobtf）同样需要此 shim——4.19 原版内核无 5.5+ helper。
  */
-#ifdef KS_TIER_ANCIENT
+#if defined(KS_TIER_ANCIENT) || (defined(KS_TIER_LEGACY) && defined(KS_NOBTF))
     #define bpf_probe_read_kernel       bpf_probe_read
     #define bpf_probe_read_kernel_str   bpf_probe_read_str
     #define bpf_probe_read_user         bpf_probe_read
@@ -61,14 +63,25 @@ typedef __s64 i64;
 #ifdef KS_NOBTF
     #undef BPF_CORE_READ
 
-    /* 实测 offset（3.10.0-1160.119.1.el7.x86_64） */
-    #define KS_OFF_INET_SADDR          776
-    #define KS_OFF_INET_SPORT          784
+    /* 跨版本稳定的 offset（4.19 与 3.10 一致） */
     #define KS_OFF_SOCK_COMMON         0
     #define KS_OFF_PATH_DENTRY         8
     #define KS_OFF_DENTRY_DNAME_NAME   40
     #define KS_OFF_FILE_FPATH          16
     #define KS_OFF_SIN6_PORT           2
+
+    /* inet_saddr/inet_sport 依赖 struct sock 布局，跨内核版本变化，按 tier 区分 */
+    #if defined(KS_TIER_LEGACY)
+        /* 4.19 实测 offset（pahole on 4.19.0-20-dbg vmlinux: inet_sock.inet_saddr=728, inet_sport=736） */
+        #define KS_OFF_INET_SADDR          728
+        #define KS_OFF_INET_SPORT          736
+    #elif defined(KS_TIER_ANCIENT)
+        /* 3.10.0-1160.119.1.el7.x86_64 实测 offset */
+        #define KS_OFF_INET_SADDR          776
+        #define KS_OFF_INET_SPORT          784
+    #else
+        #error "KS_NOBTF 需要 KS_TIER_LEGACY 或 KS_TIER_ANCIENT 之一确定 inet offset"
+    #endif
 
     #define BPF_CORE_READ(ptr, field) KS_NOREAD_##field(ptr)
 
@@ -242,23 +255,26 @@ struct block_value {
 
 KS_LRU_HASH_MAP(block_decisions, struct block_key, struct block_value, 4096);
 
-/* 自身进程豁免白名单：用户态启动时写入自身及关键系统pid，
- * KS_MAYBE_BLOCK在bpf_send_signal前判断当前tgid命中即跳过，
- * 避免分类器冷启动误报把自身或系统进程SIGKILL。key=tgid,value=1。 */
+/* 自身进程豁免白名单：用户态启动时写入 kernelsentinel 自身 pid(及关键系统 pid)，
+ * KS_MAYBE_BLOCK 在 bpf_send_signal 前判断当前 tgid 命中即跳过，
+ * 避免分类器冷启动误报把自身/系统进程 SIGKILL(Tetragon 无此硬保险，本项目多加一层)。
+ * key=tgid, value=1(受保护)。Array 不足以存任意 pid，用 LRU_HASH。 */
 KS_LRU_HASH_MAP(protected_pids, u32, u8, 256);
 
-/* G2.1: 内核态阻断查询 — 命中且未过期则SIGKILL(仅Modern tier)。
- * Modern tier(5.8+)一定支持bpf_send_signal(5.4+ helper)。
- * Legacy/Ancient不调bpf_send_signal(兼容性未知)，仅返回是否应阻断，
- * 由用户态反向通道(BlockManager)补齐。
+/* G2.1: 内核态阻断查询 — 命中且未过期则 SIGKILL（仅 Modern tier）。
+ * Modern tier（5.8+）一定支持 bpf_send_signal（5.4+ helper）。
+ * Legacy/Ancient 不调 bpf_send_signal（兼容性未知），仅返回是否应阻断，
+ * 由用户态反向通道（BlockManager）补齐。
  *
- * 申报书第四阶段对齐：infer返回verdict==2(风险分≥70)时，探针在内核态
- * 直接调bpf_send_signal(SIGKILL)终止恶意进程(零延迟阻断)。
- * bpf_send_signal发送给当前任务(即触发该syscall的进程本身)，
- * 监控系统自身不发起恶意syscall，故不会自杀。
- * 此外仍查block_decisions map —— 用户态BlockManager显式写入的PID也阻断。 */
+ * 申报书第四阶段对齐：infer 返回 verdict==2（风险分≥70）时，探针在内核态
+ * 直接调 bpf_send_signal(SIGKILL) 终止恶意进程（零延迟阻断）。
+ * bpf_send_signal 发送给当前任务（即触发该 syscall 的进程本身），
+ * 监控系统自身不发起恶意 syscall，故不会"自杀"。
+ * 此外仍查 block_decisions map —— 用户态 BlockManager 显式写入的 PID 也阻断。 */
 #if KS_RINGBUF
-/* 受保护进程豁免：bpf_send_signal发给当前任务，故以当前tgid判断。 */
+/* 受保护进程豁免：bpf_send_signal 发给当前任务，故以当前 tgid 判断。
+ * protected_pids 由用户态启动时写入自身/关键系统 pid。命中则绝不杀，
+ * 防止分类器冷启动误报把自身或系统进程 SIGKILL。 */
 static __always_inline int ks_current_protected(void) {
     u32 tgid = bpf_get_current_pid_tgid() >> 32;
     u8 *p = bpf_map_lookup_elem(&protected_pids, &tgid);
@@ -277,13 +293,15 @@ static __always_inline int ks_check_block(u32 pid) {
     return 0;
 }
 
-/* Modern tier阻断：enforce_mode=1时verdict==2内核态直接bpf_send_signal；
- * 默认0=monitor只查block_decisions(用户态显式阻断)不因verdict主动杀，
- * 避免冷启动误报误杀正常进程或自身。两条kill路径都先过ks_current_protected()豁免。 */
+/* Modern tier 阻断：
+ *   enforce_mode=1(默认0=monitor)：verdict==2 内核态直接 bpf_send_signal。
+ *   monitor 模式仅查 block_decisions(用户态显式阻断)，不因 verdict 主动杀。
+ * monitor 默认避免冷启动误报误杀正常进程/自身；用户态显式置 enforce 才真阻断。
+ * 两条 kill 路径都先过 ks_current_protected() 豁免自身。 */
 #define KS_MAYBE_BLOCK(pid, verdict) do { \
     if (get_config(CFG_ENFORCE_MODE, 0) == 1 && (verdict) == 2) { \
         if (!ks_current_protected()) \
-            bpf_send_signal(9); /* SIGKILL */ \
+            bpf_send_signal(9); /* SIGKILL — verdict==2 内核态直接阻断(申报书第四阶段) */ \
     } \
     ks_check_block((pid)); \
 } while (0)
@@ -339,8 +357,10 @@ enum infer_config_key {
     CFG_TIME_WINDOW_NS      = 2,
     CFG_MAX_NEW_FILES       = 3,
     CFG_NEW_FILE_WINDOW_NS  = 4,
-    /* 5: enforce_mode — 0=monitor(只告警/记block_decisions不主动SIGKILL)，
-     * 1=enforce(verdict==2内核态直接bpf_send_signal)。默认0避免冷启动误杀。 */
+    /* 5: enforce_mode — 0=monitor(只告警/记block_decisions，不主动SIGKILL)，
+     * 1=enforce(verdict==2 内核态直接 bpf_send_signal)。默认 0，
+     * 冷启动误报高时避免误杀正常进程/自身；用户态显式置 1 才真阻断。
+     * 对齐 Tetragon POLICY_MODE_ENFORCE/MONITOR 设计。 */
     CFG_ENFORCE_MODE        = 5,
 };
 

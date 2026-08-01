@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ks_core::alert::{Alert, MitreInfo, ProcessInfo};
 use ks_core::rule::Severity;
-use ks_engine::aggregator::EventAggregator;
+use ks_engine::aggregator::{DecodedEvent, EventAggregator};
 use ks_engine::baseline::BaselineManager;
 use ks_engine::chain::ChainReconstructor;
 use ks_engine::config::Config;
@@ -20,15 +20,92 @@ use tokio::sync::Mutex;
 
 use crate::cmds::{build_server_config, SecurityArgs};
 
+/// 异步取证写:主循环通过channel把事件和告警发给forensic worker task,worker串行消费(保证SHA-256哈希链顺序),主循环不等磁盘IO。这样去掉每事件同步jsonl写加哈希计算的阻塞,吞吐预期能到5到10倍。
+enum ForensicOp {
+    Event(DecodedEvent),
+    Alert(Alert),
+    Flush,
+}
+
+/// 主循环持有的sink,把操作非阻塞地发给forensic worker。
+#[derive(Clone)]
+struct ForensicSink {
+    tx: tokio::sync::mpsc::Sender<ForensicOp>,
+}
+
+impl ForensicSink {
+    async fn log_event(&self, event: &DecodedEvent) {
+        if self.tx.send(ForensicOp::Event(event.clone())).await.is_err() {
+            log::warn!("forensic worker已退出,事件丢失");
+        }
+    }
+    async fn log_alert(&self, alert: &Alert) {
+        if self.tx.send(ForensicOp::Alert(alert.clone())).await.is_err() {
+            log::warn!("forensic worker已退出,告警丢失");
+        }
+    }
+    async fn flush(&self) {
+        let _ = self.tx.send(ForensicOp::Flush).await;
+    }
+}
+
+/// forensic worker task,串行消费channel,保证哈希链顺序。sender drop时recv返回None,worker flush后退出。
+async fn forensic_worker(
+    forensic: Arc<Mutex<ForensicLogger>>,
+    mut rx: tokio::sync::mpsc::Receiver<ForensicOp>,
+) {
+    while let Some(op) = rx.recv().await {
+        let r = match op {
+            ForensicOp::Event(e) => forensic.lock().await.log_event(&e),
+            ForensicOp::Alert(a) => forensic.lock().await.log_alert(&a),
+            ForensicOp::Flush => forensic.lock().await.flush(),
+        };
+        if let Err(e) = r {
+            log::warn!("forensic写入失败: {}", e);
+        }
+    }
+    // sender全部drop,flush落盘后退出
+    if let Err(e) = forensic.lock().await.flush() {
+        log::warn!("forensic flush失败: {}", e);
+    }
+}
+
 #[cfg(target_os = "linux")]
 const STATUS_FILE: &str = "/tmp/ks-status.json";
 #[cfg(not(target_os = "linux"))]
 const STATUS_FILE: &str = "./ks-status.json";
 
-/// F4: ks-cli `start` 子命令入口 — 启动 eBPF 探针 + 检测引擎 + 数据服务。
+/// 性能诊断:累计各阶段纳秒加调用次数。index 0是decode,1是forensic_log,2是baseline,3是process_tree,4是correlation,5是ml,6是detector_match,7是forensic_alert,8是总事件处理。用atomic避免lock自身成为瓶颈。
+static PROF_NS: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static PROF_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn prof_add(idx: usize, ns: u64) {
+    PROF_NS[idx].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn prof_print() {
+    let cnt = PROF_CNT.load(std::sync::atomic::Ordering::Relaxed);
+    if cnt == 0 { return; }
+    let names = ["decode","forensic_log","baseline","process_tree+corr","ml","detector_match","anomaly_score(incr)","forensic_alert","total"];
+    let mut s = String::from(format!("[prof] events={}\n", cnt));
+    for (i, n) in names.iter().enumerate() {
+        let ns = PROF_NS[i].load(std::sync::atomic::Ordering::Relaxed);
+        let avg_ns = ns / cnt.max(1);
+        s.push_str(&format!("  {:<28} total={:>10}μs  avg={:>8}ns\n", n, ns/1000, avg_ns));
+    }
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/ks-prof.log")
+        .and_then(|mut f| std::io::Write::write_all(&mut f, s.as_bytes()));
+}
+
+/// ks-cli start子命令入口,启动eBPF探针加检测引擎加数据服务。
 ///
-/// `security` 参数仅在 `serve_port=Some(port)` 时生效（即 `--serve` 指定端口时
-/// 才启动 ks-server）。当 `serve_port=None` 时，`security` 被忽略。
+/// security参数只在serve_port为Some(port)时生效,即--serve指定端口时才启动ks-server。serve_port为None时security被忽略。
 pub async fn run(
     rules_dir: &str,
     log_dir: &str,
@@ -47,9 +124,9 @@ pub async fn run(
     println!("      取证日志目录: {}", config.forensic.log_dir);
     println!("      取证保留天数: {}", config.forensic.retention_days);
 
-    // ── A7: 统一事件源 ──
-    // Linux 上：EbpfModernSource 包装 loader，事件循环通过 trait 路由
-    // 非 Linux：mock 回放（CI/演示）
+    // 统一事件源
+    // Linux上EbpfModernSource包装loader,事件循环通过trait路由
+    // 非Linux平台用mock回放(CI和演示)
     println!("[2/6] 加载 eBPF 探针（自动 tier 检测）...");
     let detected_tier = ks_engine::tier_detect::detect_ebpf_tier();
     let tier_label: &'static str = detected_tier.map(|t| t.as_str()).unwrap_or("unknown");
@@ -65,10 +142,9 @@ pub async fn run(
         println!("      (非 Linux 平台，使用 mock 事件源)");
         default_event_source().await
     };
-    // D6: 持有 Arc<ServerState> 而非仅 broadcast::Sender，
-    // 使告警同时写入 REST 存储 + 广播给 WebSocket 订阅者。
-    // Phase E1.2：将 map_reader 注入 ServerState，供 /api/v1/stats 端点读取 map_stats。
-    // F4：用 SecurityArgs 构建 ServerConfig（auth/tls/audit/rate_limit），由 ks-server 应用。
+    // 持有Arc<ServerState>而非仅broadcast::Sender,使告警同时写入REST存储和广播给WebSocket订阅者。
+    // map_reader注入ServerState,供/api/v1/stats端点读map_stats。
+    // 用SecurityArgs构建ServerConfig(auth/tls/audit/rate_limit),由ks-server应用。
     let serve_state: Option<std::sync::Arc<ks_server::ServerState>> = match serve_port {
         Some(port) => {
             let state = match map_reader {
@@ -102,21 +178,21 @@ pub async fn run(
 
     println!("[4/6] 初始化引擎组件...");
     let aggregator = Arc::new(Mutex::new(EventAggregator::new(config.engine.buffer_size)));
-    // G1.1: 三引擎接线 — baseline（z-score 基线偏离）/ correlation（跨事件关联）/ process_tree（进程树异常）
+    // 三引擎接线:baseline(z-score基线偏离)、correlation(跨事件关联)、process_tree(进程树异常)
     let baseline_mgr = Arc::new(Mutex::new(BaselineManager::new()));
     let correlation_engine = Arc::new(Mutex::new(CorrelationEngine::new(300)));
     let process_tree_mgr = Arc::new(Mutex::new(ProcessTreeManager::new()));
-    // G4.1: EWMA 自适应检测器 — 与 ServerState 共享（feedback 端点可联动调整阈值）
+    // EWMA自适应检测器,与ServerState共享(feedback端点可联动调整阈值)
     let ml_detector: Arc<Mutex<AdaptiveDetector>> = match &serve_state {
         Some(st) => st.ml_detector.clone(),
         None => Arc::new(Mutex::new(AdaptiveDetector::new())),
     };
-    // G2.2: 用户态阻断管理器 — 与 ServerState 共享（REST 端点可手动阻断/解除）
+    // 用户态阻断管理器,与ServerState共享(REST端点可手动阻断或解除)
     let block_mgr: Arc<Mutex<ks_engine::blocker::BlockManager>> = match &serve_state {
         Some(st) => st.block_manager.clone(),
         None => Arc::new(Mutex::new(ks_engine::blocker::BlockManager::new())),
     };
-    // G2.3: 从配置初始化阻断策略
+    // 从配置初始化阻断策略
     {
         let mut bm = block_mgr.lock().await;
         bm.set_enabled(config.detection.block_enabled);
@@ -149,6 +225,14 @@ pub async fn run(
         log_path,
         rotation_config,
     )?));
+    // 异步取证写:worker task串行消费channel,主循环不阻塞磁盘IO。
+    // channel容量给足65536避免高压时主循环背压,满了则warn丢老事件保检测主路径。
+    let (forensic_tx, forensic_rx) = tokio::sync::mpsc::channel::<ForensicOp>(65536);
+    let forensic_sink = ForensicSink { tx: forensic_tx };
+    let forensic_worker_handle = {
+        let f = forensic.clone();
+        tokio::spawn(async move { forensic_worker(f, forensic_rx).await; })
+    };
     let chain_reconstructor = ChainReconstructor::new();
 
     println!("      聚合器缓冲区: {} 条", config.engine.buffer_size);
@@ -171,30 +255,38 @@ pub async fn run(
     println!("      按 Ctrl+C 停止");
     println!();
 
-    // 所有初始化完成（配置/eBPF/规则/引擎/状态/热加载/ks-server），
-    // 进入事件循环前通知 systemd 服务就绪（Type=notify）。
-    // 非 systemd 环境（无 NOTIFY_SOCKET）下 notify 静默失败，不影响运行。
+    // 所有初始化完成(配置、eBPF、规则、引擎、状态、热加载、ks-server),进入事件循环前通知systemd服务就绪(Type=notify)。
+    // 非systemd环境(无NOTIFY_SOCKET)下notify静默失败,不影响运行。
     if sd_notify {
         #[cfg(target_os = "linux")]
         {
-            // unset_environment=false 保留 NOTIFY_SOCKET 供后续 STATUS= 调用复用
+            // unset_environment=false保留NOTIFY_SOCKET供后续STATUS=调用复用
             let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
-            log::info!("已通知 systemd 服务就绪");
+            log::info!("已通知systemd服务就绪");
         }
         #[cfg(not(target_os = "linux"))]
         {
-            log::debug!("sd-notify 标志已忽略（非 Linux 平台，sd-notify crate 不可用）");
+            log::debug!("sd-notify标志已忽略(非Linux平台,sd-notify crate不可用)");
         }
     }
 
     let mut stats = EventStats::new();
     let anomaly_threshold = config.detection.anomaly_threshold;
-    // mock 耗尽（loop_mode=false）时退出；eBPF ringbuf 暂空时 sleep 1ms 继续
+    // mock耗尽(loop_mode=false)时退出,eBPF ringbuf暂空时sleep 1ms继续
     let continue_on_empty = !source.is_mock();
+
+    // 自身及父进程链pid豁免集合,baseline/ML/anomaly检测跳过这些pid,
+    // 避免哨兵消费变忙时自身syscall频率升高被判定异常(自指误报)。
+    let protected_pids: std::collections::HashSet<u32> =
+        source.protected_pids().iter().copied().collect();
+
+    // 循环外创建一次signal future并pin,避免每轮select!新建和丢弃ctrl_c
+    // future导致信号处理不稳定(SIGINT不退出)。
+    let mut sig = std::pin::pin!(tokio::signal::ctrl_c());
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut sig => {
                 println!();
                 println!("收到 Ctrl+C 信号，准备安全关闭...");
                 break;
@@ -204,17 +296,15 @@ pub async fn run(
                     Ok(Some(b)) => b,
                     Ok(None) => {
                         if continue_on_empty {
-                            // eBPF ringbuf 暂空，sleep 1ms 后继续轮询
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            tokio::task::yield_now().await;
                             return Ok(true);
                         } else {
-                            // mock 耗尽，退出循环
                             return Ok(false);
                         }
                     }
                     Err(e) => return Err(e),
                 };
-                process_event_bytes(&bytes, &aggregator, &detector, &forensic, &chain_reconstructor, &mut stats, anomaly_threshold, &serve_state, &baseline_mgr, &correlation_engine, &process_tree_mgr, &ml_detector, &block_mgr, block_ttl, &block_severity_threshold).await
+                process_event_bytes(&bytes, &aggregator, &detector, &forensic_sink, &chain_reconstructor, &mut stats, anomaly_threshold, &serve_state, &baseline_mgr, &correlation_engine, &process_tree_mgr, &ml_detector, &block_mgr, block_ttl, &block_severity_threshold, &protected_pids).await
             } => {
                 match result {
                     Ok(true) => {}
@@ -224,7 +314,7 @@ pub async fn run(
                     }
                     Err(e) => {
                         log::warn!("事件处理失败: {}", e);
-                        // eBPF 路径：错误后短暂 sleep 避免 busy loop
+                        // eBPF路径:错误后短暂sleep避免busy loop
                         if continue_on_empty {
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         }
@@ -237,11 +327,13 @@ pub async fn run(
     println!();
     println!("安全关闭...");
     println!("      释放事件源（含 eBPF 探针 fd）...");
-    // A7: source drop 时 EbpfModernSource 自动 drop EbpfLoader，
-    // loader 内部 rings/bpf fd 自动关闭，无需显式 stop_all。
+    // source drop时EbpfModernSource自动drop EbpfLoader,
+    // loader内部rings/bpf fd自动关闭,不需要显式stop_all。
     drop(source);
     println!("      Flush 取证日志...");
-    forensic.lock().await.flush()?;
+    // drop sink让forensic worker的recv返回None,worker flush落盘后退出。
+    drop(forensic_sink);
+    let _ = forensic_worker_handle.await;
 
     let elapsed = start_time.elapsed();
     let event_count = forensic.lock().await.event_count();
@@ -258,18 +350,19 @@ pub async fn run(
     println!("      运行时长: {:.1}s", elapsed.as_secs_f64());
 
     cleanup_status_file();
+    prof_print();
     println!("      内核哨兵已安全退出");
 
     Ok(())
 }
 
-/// 处理单条事件字节（统一入口，eBPF/mock 共用）
+/// 处理单条事件字节(统一入口,eBPF/mock共用)
 #[allow(clippy::too_many_arguments)]
 async fn process_event_bytes(
     bytes: &[u8],
     aggregator: &Arc<Mutex<EventAggregator>>,
     detector: &Arc<Mutex<DetectionEngine>>,
-    forensic: &Arc<Mutex<ForensicLogger>>,
+    forensic: &ForensicSink,
     chain_reconstructor: &ChainReconstructor,
     stats: &mut EventStats,
     anomaly_threshold: f64,
@@ -281,17 +374,28 @@ async fn process_event_bytes(
     block_mgr: &Arc<Mutex<ks_engine::blocker::BlockManager>>,
     block_ttl: u64,
     block_severity_threshold: &str,
+    protected_pids: &std::collections::HashSet<u32>,
 ) -> Result<bool> {
+    let t0 = std::time::Instant::now();
+    let t = std::time::Instant::now();
     let event = aggregator.lock().await.decode(bytes)?;
+    prof_add(0, t.elapsed().as_nanos() as u64);
+    // 自身及父进程链豁免:跳过baseline/ML/anomaly检测,避免自指误报。
+    let is_protected = protected_pids.contains(&event.header.pid);
     stats.consumed += 1;
 
-    forensic.lock().await.log_event(&event)?;
+    let t = std::time::Instant::now();
+    forensic.log_event(&event).await;
+    prof_add(1, t.elapsed().as_nanos() as u64);
 
-    // G1.1/G1.2: 三引擎接线 — 在规则检测之前，更新基线/进程树/关联引擎
-    // G1.2: ProcessTree 关联规则需查询进程树获取父进程信息，故 lock 顺序为
-    // baseline → process_tree → correlation；调用完立即 drop pt_guard 避免后续
-    // baseline_mgr.detect_deviation 时死锁。
-    baseline_mgr.lock().await.update_from_event(&event);
+    // 三引擎接线,在规则检测之前更新基线、进程树、关联引擎。
+    // ProcessTree关联规则要查询进程树获取父进程信息,所以lock顺序是baseline、process_tree、correlation,调用完立即drop pt_guard避免后续baseline_mgr.detect_deviation时死锁。
+    let t = std::time::Instant::now();
+    if !is_protected {
+        baseline_mgr.lock().await.update_from_event(&event);
+    }
+    prof_add(2, t.elapsed().as_nanos() as u64);
+    let t = std::time::Instant::now();
     let mut pt_guard = process_tree_mgr.lock().await;
     pt_guard.update_from_event(&event);
     let corr_alerts = correlation_engine
@@ -299,8 +403,16 @@ async fn process_event_bytes(
         .await
         .detect_correlations_with_tree(&event, Some(&*pt_guard));
     drop(pt_guard);
-    // G4.1: EWMA 自适应检测 — 更新在线学习模型
-    ml_detector.lock().await.update_from_event(&event);
+    prof_add(3, t.elapsed().as_nanos() as u64);
+    // EWMA自适应检测,更新在线学习模型
+    let t = std::time::Instant::now();
+    let mut ml_guard = ml_detector.lock().await;
+    let t_lock = t.elapsed().as_nanos() as u64;
+    let t = std::time::Instant::now();
+    ml_guard.update_from_event(&event);
+    let t_upd = t.elapsed().as_nanos() as u64;
+    prof_add(4, t_lock + t_upd);
+    drop(ml_guard); // 立即释放ml锁,避免下方is_multiple_of(50)分支里再次lock造成自死锁
     for ca in &corr_alerts {
         let alert = correlation_to_alert(ca);
         println!(
@@ -310,7 +422,7 @@ async fn process_event_bytes(
             event.header.pid,
             ca.confidence * 100.0
         );
-        forensic.lock().await.log_alert(&alert)?;
+        forensic.log_alert(&alert).await;
         if let Some(st) = serve_state {
             st.push_alert(alert.clone()).await;
             st.push_correlation_alert(ca.clone()).await;
@@ -319,7 +431,7 @@ async fn process_event_bytes(
         if let Some(mitre) = &alert.mitre {
             println!("    MITRE: {} / {}", mitre.tactic, mitre.technique);
         }
-        // G2.2: 关联告警触发阻断
+        // 关联告警触发阻断
         if severity_meets_threshold(&alert.severity, block_severity_threshold)
             && block_mgr.lock().await.block_pid(
                 event.header.pid,
@@ -332,14 +444,16 @@ async fn process_event_bytes(
         }
     }
 
+    let t = std::time::Instant::now();
     let matches = detector.lock().await.match_event(&event);
+    prof_add(5, t.elapsed().as_nanos() as u64);
     for m in &matches {
         let alert = detector.lock().await.generate_alert(m, &event);
         println!(
             "  [规则告警] [{}] {} — PID: {}, COMM: {}",
             alert.severity, alert.title, alert.process.pid, event.comm
         );
-        forensic.lock().await.log_alert(&alert)?;
+        forensic.log_alert(&alert).await;
         stats.rule_alerts += 1;
         if let Some(st) = serve_state {
             st.push_alert(alert.clone()).await;
@@ -348,7 +462,7 @@ async fn process_event_bytes(
         if let Some(mitre) = &alert.mitre {
             println!("    MITRE: {} / {}", mitre.tactic, mitre.technique);
         }
-        // G2.2: 规则告警触发阻断
+        // 规则告警触发阻断
         if severity_meets_threshold(&alert.severity, block_severity_threshold)
             && block_mgr.lock().await.block_pid(
                 alert.process.pid,
@@ -364,14 +478,19 @@ async fn process_event_bytes(
         }
     }
 
-    let history: Vec<_> = aggregator
-        .lock()
-        .await
-        .recent(1000)
-        .into_iter()
-        .cloned()
-        .collect();
-    let score = detector.lock().await.anomaly_score(&event, &history);
+    let t = std::time::Instant::now();
+    // 增量查询:per-PID滑动窗口syscall计数,O(1)替代遍历recent(1000)。
+    // 自身豁免:哨兵自己的高频消费不算异常,避免自指误报。
+    let score = if is_protected {
+        0.0
+    } else {
+        let recent_count = aggregator
+            .lock()
+            .await
+            .recent_syscall_count(event.header.pid, event.header.timestamp_ns);
+        detector.lock().await.anomaly_score(&event, recent_count)
+    };
+    prof_add(6, t.elapsed().as_nanos() as u64);
     if score > anomaly_threshold {
         println!(
             "  [异常告警] 评分: {:.2} (阈值: {:.2}) — PID: {}, COMM: {}",
@@ -381,7 +500,7 @@ async fn process_event_bytes(
     }
 
     if stats.consumed.is_multiple_of(50) || !matches.is_empty() {
-        // G1.3: 周期推送基线快照到 ServerState（供 /api/v1/baselines 端点）
+        // 周期推送基线快照到ServerState(供/api/v1/baselines端点)
         if let Some(st) = serve_state {
             let snapshots: std::collections::HashMap<u32, _> = baseline_mgr
                 .lock()
@@ -392,8 +511,9 @@ async fn process_event_bytes(
                 .collect();
             st.update_baselines(snapshots).await;
         }
-        // G1.1: baseline 偏离检测 — z-score 超阈值时告警
-        if let Some(dev) = baseline_mgr.lock().await.detect_deviation(event.header.pid) {
+        // baseline偏离检测,z-score超阈值时告警(自身豁免)
+        if !is_protected {
+            if let Some(dev) = baseline_mgr.lock().await.detect_deviation(event.header.pid) {
             let dim = dev
                 .most_deviated_dimension
                 .map(|d| format!("{:?}", d))
@@ -411,19 +531,17 @@ async fn process_event_bytes(
                     cmdline: None,
                 },
             );
-            println!(
-                "  [基线偏离] PID {} — 评分: {:.2}, 维度: {}",
-                event.header.pid, dev.overall_score, dim
-            );
-            forensic.lock().await.log_alert(&alert)?;
+            forensic.log_alert(&alert).await;
             if let Some(st) = serve_state {
                 st.push_alert(alert.clone()).await;
             }
             stats.anomaly_alerts += 1;
+            }
         }
 
-        // G4.1: EWMA 自适应检测 — 双模型并行，任一触发即告警
-        if let Some(ml_result) = ml_detector.lock().await.detect(event.header.pid) {
+        // EWMA自适应检测,双模型并行,任一触发即告警(自身豁免)
+        if !is_protected {
+            if let Some(ml_result) = ml_detector.lock().await.detect(event.header.pid) {
             let dim_str = ml_result
                 .dimensions
                 .first()
@@ -449,18 +567,15 @@ async fn process_event_bytes(
                     cmdline: None,
                 },
             );
-            println!(
-                "  [ML异常] PID {} — 评分: {:.2}, 模型: {}, 维度: {}",
-                event.header.pid, ml_result.overall_score, model_str, dim_str
-            );
-            forensic.lock().await.log_alert(&alert)?;
+            forensic.log_alert(&alert).await;
             if let Some(st) = serve_state {
                 st.push_alert(alert.clone()).await;
             }
             stats.anomaly_alerts += 1;
+            }
         }
 
-        // G1.1: process_tree 异常族检测 — 进程树中出现异常父子关系时告警
+        // process_tree异常族检测,进程树中出现异常父子关系时告警
         for family in process_tree_mgr.lock().await.anomalous_families() {
             for rel in &family.anomaly_relations {
                 let alert = Alert::new(
@@ -480,7 +595,7 @@ async fn process_event_bytes(
                     "  [进程树异常] {} → {} — {}",
                     rel.parent_comm, rel.child_comm, rel.anomaly_type
                 );
-                forensic.lock().await.log_alert(&alert)?;
+                forensic.log_alert(&alert).await;
                 if let Some(st) = serve_state {
                     st.push_alert(alert.clone()).await;
                 }
@@ -523,10 +638,13 @@ async fn process_event_bytes(
         );
     }
 
+    prof_add(8, t0.elapsed().as_nanos() as u64);
+    PROF_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     Ok(true)
 }
 
-/// G1.1: 将 CorrelationAlert 转换为 ks_core::alert::Alert，复用现有告警管道。
+/// 将CorrelationAlert转换为ks_core::alert::Alert,复用现有告警管道。
 fn correlation_to_alert(ca: &CorrelationAlert) -> Alert {
     let proc = ca
         .events
@@ -566,7 +684,7 @@ fn correlation_to_alert(ca: &CorrelationAlert) -> Alert {
     alert
 }
 
-/// G2.3: 检查告警严重度是否达到阻断阈值。
+/// 检查告警严重度是否达到阻断阈值。
 fn severity_meets_threshold(severity: &Severity, threshold: &str) -> bool {
     let order = ["low", "medium", "high", "critical"];
     let sev_str = match severity {

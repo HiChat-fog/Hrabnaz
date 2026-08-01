@@ -2,8 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// 配置来源优先级: CLI > KS_* 环境变量 > YAML 配置文件 > 内置默认值。
-/// 绝大多数情况默认值就能跑，生产环境再上配置文件。
+/// 配置来源优先级:CLI > KS_*环境变量 > YAML配置文件 > 内置默认值。
+/// 绝大多数情况默认值就能跑,生产环境再上配置文件。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -56,13 +56,13 @@ pub struct DetectionConfig {
     pub anomaly_threshold: f64,
     #[serde(default = "default_detection_kernel_inference")]
     pub kernel_inference: bool,
-    /// G2.3: 是否启用内核态阻断（默认 false 防误杀）
+    /// 是否启用内核态阻断(默认false防误杀)
     #[serde(default = "default_detection_block_enabled")]
     pub block_enabled: bool,
-    /// G2.3: 阻断 TTL（秒，默认 300）
+    /// 阻断TTL(秒,默认300)
     #[serde(default = "default_detection_block_ttl_secs")]
     pub block_ttl_secs: u64,
-    /// G2.3: 触发阻断的严重度阈值（"critical" / "high" / "medium"）
+    /// 触发阻断的严重度阈值(critical、high、medium)
     #[serde(default = "default_detection_block_severity_threshold")]
     pub block_severity_threshold: String,
 }
@@ -212,7 +212,7 @@ impl Config {
         Ok(config)
     }
 
-    /// 环境变量覆盖：KS_<SECTION>_<KEY>，比如 KS_ENGINE_BUFFER_SIZE=20000
+    /// 环境变量覆盖:KS_<SECTION>_<KEY>,比如KS_ENGINE_BUFFER_SIZE=20000
     pub fn apply_env_overrides(&mut self) -> &mut Self {
         if let Ok(v) = std::env::var("KS_ENGINE_BUFFER_SIZE") {
             if let Ok(parsed) = v.parse::<usize>() {

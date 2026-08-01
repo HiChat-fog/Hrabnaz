@@ -51,7 +51,7 @@ struct port_scan_tracker {
 
 KS_LRU_HASH_MAP(port_scan_map, u32, struct port_scan_tracker, 4096);
 
-KS_EVENT_MAP(flow_events, 256 * 1024);
+KS_EVENT_MAP(flow_events, 1024 * 1024);
 
 static __always_inline void netflow_handle_tcp_v4_connect(void *ctx, struct sock *sk, struct sockaddr *uaddr) {
     u64 pid_tgid = bpf_get_current_pid_tgid();

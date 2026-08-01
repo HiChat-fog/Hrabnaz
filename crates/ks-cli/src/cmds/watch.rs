@@ -1,9 +1,6 @@
-//! G1.3: `kernelsentinel watch` 子命令 — 实时监控告警流。
+//! `kernelsentinel watch`子命令,实时监控告警流。
 //!
-//! 通过 HTTP 轮询 /api/v1/alerts?limit=20（每秒一次），打印新告警。
-//! 不使用 WebSocket 客户端以避免额外依赖；轮询间隔 1s 对告警展示足够。
-//!
-//! 申报书承诺的 8 个 CLI 子命令之一。
+//! 通过HTTP轮询/api/v1/alerts?limit=20(每秒一次)打印新告警。不使用WebSocket客户端以避免额外依赖,轮询间隔1s对告警展示足够。
 
 use anyhow::Result;
 use ks_core::alert::Alert;
@@ -12,13 +9,13 @@ use std::time::Duration;
 
 #[derive(clap::Args, Debug)]
 pub struct WatchArgs {
-    /// ks-server 地址
+    /// ks-server地址
     #[arg(short, long, default_value = "http://127.0.0.1:3000")]
     pub server: String,
-    /// 轮询间隔（秒，默认 1）
+    /// 轮询间隔(秒,默认1)
     #[arg(short, long, default_value_t = 1)]
     pub interval: u64,
-    /// 最多显示 N 条后退出（0 表示持续）
+    /// 最多显示N条后退出(0表示持续)
     #[arg(long, default_value_t = 0)]
     pub max: usize,
 }

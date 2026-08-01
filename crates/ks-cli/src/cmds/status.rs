@@ -27,30 +27,10 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     );
 
     let probes = [
-        (
-            "trace_sys_enter",
-            "tracepoint",
-            "raw_syscalls/sys_enter",
-            "是",
-        ),
-        (
-            "trace_sys_exit",
-            "tracepoint",
-            "raw_syscalls/sys_exit",
-            "是",
-        ),
-        (
-            "trace_sched_exec",
-            "tracepoint",
-            "sched/sched_process_exec",
-            "是",
-        ),
-        (
-            "trace_sched_exit",
-            "tracepoint",
-            "sched/sched_process_exit",
-            "是",
-        ),
+        ("trace_sys_enter", "tracepoint", "raw_syscalls/sys_enter", "是"),
+        ("trace_sys_exit", "tracepoint", "raw_syscalls/sys_exit", "是"),
+        ("trace_sched_exec", "tracepoint", "sched/sched_process_exec", "是"),
+        ("trace_sched_exit", "tracepoint", "sched/sched_process_exit", "是"),
         ("kprobe_vfs_open", "kprobe", "vfs_open", "是"),
         ("kprobe_vfs_write", "kprobe", "vfs_write", "是"),
         ("kprobe_vfs_unlink", "kprobe", "vfs_unlink", "是"),
@@ -77,8 +57,8 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!();
 
     let loader = ks_engine::loader::EbpfLoader::new();
-    // status 不加载 eBPF（不调 start） map_reader() 返回 None 时用 MockBpfMapReader
-    // 兜底显示 map 配置 is_mock 标记让输出如实标注是 mock 统计而非真实计数
+    // status不加载eBPF(不调start),map_reader()返回None时用MockBpfMapReader
+    // 兜底显示map配置,is_mock标记让输出如实标注是mock统计而非真实计数
     let (map_reader, is_mock): (Arc<dyn BpfMapReader>, bool) = match loader.map_reader() {
         Some(mr) => (mr, false),
         None => (Arc::new(MockBpfMapReader), true),
@@ -135,7 +115,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("── 5. 检测规则集 ──");
     println!();
     println!("  规则格式: YAML + Field 枚举 字段名拼写错误会在加载时报错");
-    // 动态读 rules/ 目录 数量始终与实际一致
+    // 动态读rules/目录,数量始终与实际一致
     let mut rule_files: Vec<String> = std::fs::read_dir("rules/")
         .map(|rd| {
             rd.filter_map(|e| e.ok())
@@ -196,7 +176,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("  kernelsentinel start       → 启动实时监控");
     println!("  kernelsentinel replay <file> → 取证回放 含哈希链校验 + 攻击链可视化");
 
-    // 申报书第七步：status 动态监控模式 定期清屏重绘 map 配置与运行实例
+    // status动态监控模式,定期清屏重绘map配置与运行实例
     if watch {
         println!();
         println!("── 动态刷新 每 {}s Ctrl+C 退出 ──", interval);
@@ -211,7 +191,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
                 _ = tokio::time::sleep(dur) => {}
             }
             tick += 1;
-            print!("\x1B[2J\x1B[H"); // 清屏 + 光标归位
+            print!("\x1B[2J\x1B[H"); // 清屏加光标归位
             println!("╔ 动态刷新 第 {} 次 ╗", tick);
             for map_name in &maps {
                 if let Ok(s) = map_reader.read_map(map_name) {
@@ -222,7 +202,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
                 Ok(content) => println!("  运行实例: {}", content.trim().replace('\n', " ")),
                 Err(_) => println!("  运行实例: (未检测到 start 进程)"),
             }
-            let _ = std::io::stdout().flush(); // 非 TTY 管道下强制每 tick 刷新 避免块缓冲丢失
+            let _ = std::io::stdout().flush(); // 非TTY管道下强制每tick刷新,避免块缓冲丢失
         }
     }
 

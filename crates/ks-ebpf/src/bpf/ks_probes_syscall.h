@@ -6,6 +6,14 @@ struct syscall_ctx {
     u64 start_ns;
     u32 pid;
     u32 syscall_nr;
+    /* execve 的 argv 必须在 sys_enter 读取（exec 前，argv 仍在原地址空间）。
+     * sys_exit 时 exec 已替换地址空间，原 argv 指针失效 → args 读空。
+     * 这里在 enter 时把 argv[0..4] 拼成字符串缓存，exit 时直接拷贝到事件。
+     * NOBTF(3.10) 不含此字段：verifier 对 map value 内大数组偏移访问失败，
+     * 该 tier 放弃 exec args 捕获（args 类规则在 3.10 不生效）。 */
+#ifndef KS_NOBTF
+    char exec_args[320];
+#endif
 };
 
 struct {
@@ -15,10 +23,30 @@ struct {
     __type(value, struct syscall_ctx);
 } syscall_ctxs SEC(".maps");
 
+/* 压测诊断：统计内核侧 sys_enter/sys_exit 触发次数及 ringbuf reserve 失败(drop)数。
+ * 对比三者定位吞吐瓶颈：enter=内核捕获syscall数，exit=生成事件数，drop=ringbuf满丢数，
+ * 用户态"已处理"=实际收到数。drop>0 说明 ringbuf 太小或用户态消费太慢。 */
+struct syscount { u64 enter; u64 exit; u64 drop; };
+KS_PERCPU_ARRAY_MAP(syscount_map, struct syscount);
+
+/* 压测诊断：ringbuf reserve 失败时调用，累加 drop 计数。 */
+static __always_inline void ks_count_drop(void) {
+    u32 k = 0;
+    struct syscount *sc = bpf_map_lookup_elem(&syscount_map, &k);
+    if (sc) sc->drop++;
+}
+
 SEC("tracepoint/raw_syscalls/sys_enter")
 int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 syscall_nr = ctx->id;
+
+    /* 压测诊断：统计内核侧 sys_enter 触发次数 */
+    {
+        u32 _k = 0;
+        struct syscount *sc = bpf_map_lookup_elem(&syscount_map, &_k);
+        if (sc) sc->enter++;
+    }
 
     switch (syscall_nr) {
     case 59:  case 2:   case 257:
@@ -40,6 +68,29 @@ int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
     sctx.args[4] = ctx->args[4];
     sctx.args[5] = ctx->args[5];
 
+    /* execve: 在 sys_enter 读取 argv 字符串缓存（exec 前地址空间未替换）。
+     * 手动展开 5 次读取，编译期常量偏移，规避 verifier 变量偏移限制。
+     * 3.10 NOBTF verifier 对 map value 内数组偏移访问有 bug（value_size=64 off=64 越界），
+     * 该 tier 跳过 enter 缓存，exit 时 argv 已失效（args 空），args 类规则在 3.10 不生效。 */
+    if (syscall_nr == 59) {
+#ifndef KS_NOBTF
+        const char __user *const *argv_ptr = (const char __user *const *)sctx.args[1];
+        if (argv_ptr) {
+            const char __user *arg_ptr;
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[0]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args,        64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[1]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 64,   64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[2]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 128,  64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[3]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 192,  64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[4]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 256,  64, arg_ptr);
+        }
+#endif
+    }
+
     bpf_map_update_elem(&syscall_ctxs, &pid_tgid, &sctx, BPF_ANY);
     return 0;
 }
@@ -47,6 +98,14 @@ int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
 SEC("tracepoint/raw_syscalls/sys_exit")
 int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    /* 压测诊断：统计内核侧 sys_exit 触发次数 */
+    {
+        u32 _k = 0;
+        struct syscount *sc = bpf_map_lookup_elem(&syscount_map, &_k);
+        if (sc) sc->exit++;
+    }
+
     struct syscall_ctx *sctx = bpf_map_lookup_elem(&syscall_ctxs, &pid_tgid);
     if (!sctx) return 0;
 
@@ -57,7 +116,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if (syscall_nr == 59 && ret >= 0) {
         struct exec_event *evt = KS_RESERVE(events, struct exec_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_PROCESS_EXEC);
         evt->header.syscall_nr = 59;
@@ -66,22 +125,12 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         const char __user *filename_ptr = (const char __user *)sctx->args[0];
         bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), filename_ptr);
 
-        // 3.10 verifier 无法追踪 map value 指针上的变量偏移 bounds，
-        // 手动展开 5 次调用，使用编译期常量偏移（0/64/128/192/256）。
-        const char __user *const *argv_ptr = (const char __user *const *)sctx->args[1];
-        if (argv_ptr) {
-            const char __user *arg_ptr;
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[0]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args,       64, arg_ptr);
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[1]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args + 64,  64, arg_ptr);
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[2]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args + 128, 64, arg_ptr);
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[3]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args + 192, 64, arg_ptr);
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[4]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args + 256, 64, arg_ptr);
-        }
+        /* argv 已在 sys_enter 缓存到 sctx->exec_args（exec 前读取）。
+         * 直接拷贝到事件，避免 sys_exit 时地址空间已替换导致 argv 失效读空。
+         * NOBTF(3.10) 跳过：verifier 对 map value 内 exec_args 数组偏移访问失败。 */
+#ifndef KS_NOBTF
+        __builtin_memcpy(evt->args, sctx->exec_args, sizeof(sctx->exec_args));
+#endif
 
         int verdict = infer_event(evt->header.pid, EVENT_PROCESS_EXEC,
                     (const char *)evt->filename, 0, 0, 0, 0);
@@ -92,7 +141,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if ((syscall_nr == 2 || syscall_nr == 257) && ret >= 0) {
         struct file_event *evt = KS_RESERVE(events, struct file_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_FILE_OPEN);
         evt->header.syscall_nr = syscall_nr;
@@ -117,7 +166,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if (syscall_nr == 42) {
         struct net_event *evt = KS_RESERVE(events, struct net_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_NET_CONNECT);
         evt->header.syscall_nr = 42;
@@ -162,7 +211,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if (syscall_nr == 101 && ret >= 0) {
         struct signal_event *evt = KS_RESERVE(events, struct signal_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_PROC_PTRACE);
         evt->header.syscall_nr = 101;
@@ -178,7 +227,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
     if (syscall_nr == 62 && ret >= 0) {
         struct signal_event *evt = KS_RESERVE(events, struct signal_event);
-        if (!evt) goto cleanup;
+        if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_PROC_SIGNAL);
         evt->header.syscall_nr = 62;

@@ -1,7 +1,7 @@
-//! G5.1: correlation 性能压测 — CorrelationEngine::detect_correlations_with_tree 单次。
+//! correlation性能压测:CorrelationEngine::detect_correlations_with_tree单次。
 //!
-//! 目标：<100μs/次
-//! 运行：cargo bench --workspace -p ks-engine --bench correlation_bench
+//! 目标低于100μs/次
+//! 运行:cargo bench --workspace -p ks-engine --bench correlation_bench
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ks_core::event::EventHeader;
@@ -54,7 +54,7 @@ fn make_event(pid: u32, ppid: u32, comm: &str, event_type: u32) -> DecodedEvent 
 fn bench_correlation(c: &mut Criterion) {
     let mut engine = CorrelationEngine::new(300);
     let mut tree = ProcessTreeManager::new();
-    // 预填充事件窗口（100 条混合事件）
+    // 预填充事件窗口(100条混合事件)
     for i in 0..100u32 {
         let evt = make_event(i + 100, 1, "bash", 1);
         engine.detect_correlations_with_tree(&evt, Some(&tree));

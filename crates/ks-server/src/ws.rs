@@ -1,7 +1,6 @@
-//! D4: WebSocket 实时告警推送
+//! WebSocket实时告警推送。
 //!
-//! 客户端连接 /ws/alerts 后，订阅 ServerState 的 broadcast channel，
-//! 每当 push_alert 被调用，客户端收到 JSON 序列化的 Alert。
+//! 客户端连接/ws/alerts后,订阅ServerState的broadcast channel,每当push_alert被调用,客户端收到JSON序列化的Alert。
 
 use crate::state::SharedState;
 use axum::{

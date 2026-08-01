@@ -18,6 +18,11 @@
   description: "检测加载可疑内核模块 (rootkit/backdoor/nf_hook) (event_type=81, 探针: kprobe/do_init_module)"
   severity: critical
   conditions:
+    # 必须是真正的 do_init_module 安全探针事件 (event_type=81)，避免普通
+    # insmod/modprobe 进程的 open/exec 事件因 comm 匹配而误报。
+    - field: event_type
+      operator: equals
+      value: "81"
     - field: comm
       operator: regex
       value: "(insmod|modprobe)"
@@ -32,6 +37,9 @@
   description: "检测加载普通内核模块 (非 rootkit/backdoor/nf_hook) (event_type=81)"
   severity: low
   conditions:
+    - field: event_type
+      operator: equals
+      value: "81"
     - field: comm
       operator: regex
       value: "(insmod|modprobe)"
