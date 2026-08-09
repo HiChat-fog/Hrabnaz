@@ -1,7 +1,7 @@
-//! G5.1: ML 自适应检测性能压测 — AdaptiveDetector::detect 单次。
+//! ML自适应检测性能压测:AdaptiveDetector::detect单次。
 //!
-//! 目标：<50μs/次
-//! 运行：cargo bench --workspace -p ks-engine --bench ml_bench
+//! 目标低于50μs/次
+//! 运行:cargo bench --workspace -p ks-engine --bench ml_bench
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ks_core::event::EventHeader;
@@ -52,7 +52,7 @@ fn make_event(pid: u32, comm: &str, event_type: u32) -> DecodedEvent {
 
 fn bench_ml(c: &mut Criterion) {
     let mut detector = AdaptiveDetector::new();
-    // 预热：填充 100 条事件建立 EWMA 状态
+    // 预热:填充100条事件建立EWMA状态
     for _ in 0..100u32 {
         let evt = make_event(1234, "bash", 1);
         detector.update_from_event(&evt);
@@ -72,7 +72,7 @@ fn bench_ml(c: &mut Criterion) {
         });
     });
 
-    // 组合：update + detect（真实事件循环单次开销）
+    // 组合:update + detect(真实事件循环单次开销)
     c.bench_function("update_then_detect", |b| {
         b.iter(|| {
             black_box(&mut detector).update_from_event(black_box(&probe));

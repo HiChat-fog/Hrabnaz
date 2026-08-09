@@ -1,6 +1,6 @@
-//! z-score 统计基线偏离检测。
-//! 给每个进程建立正常行为基线，算出偏差 z-score，超过 2σ 告警。
-//! 比 detector.rs 里硬编码的打分法更自适应。
+//! z-score统计基线偏离检测。
+//! 给每个进程建立正常行为基线,算出偏差z-score,超过2σ告警。
+//! 比detector.rs里硬编码的打分法更自适应。
 
 use crate::aggregator::DecodedEvent;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,8 @@ pub struct BehaviorBaseline {
     pub established_at_ns: u64,
     pub sample_count: u32,
     pub is_inherently_high_freq: bool,
+    /// 最后一次更新该PID的时间戳,用于LRU淘汰不活跃PID,防止per-PID结构无界增长。
+    pub last_seen_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -94,6 +96,9 @@ pub struct BaselineManager {
     min_samples: u32,
     fixed_thresholds: FixedThresholds,
     established_pids: HashSet<u32>,
+    /// per-PID结构容量上限。超过时按last_seen_ns淘汰最不活跃的PID,
+    /// 防止长期运行下baselines/freq_history随累计PID数无界增长(RSS涨)。
+    max_pids: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +136,7 @@ impl BaselineManager {
             max_history_windows: 20,
             z_score_threshold: 2.0,
             min_samples: 5,
+            max_pids: 10000,
             fixed_thresholds: FixedThresholds {
                 syscall_60s: 5000,
                 file_ops_60s: 500,
@@ -143,8 +149,8 @@ impl BaselineManager {
         }
     }
 
-    /// 每个事件都要调用，更新当前窗口计数。
-    /// 窗口满 60 秒自动创建新窗口。
+    /// 每个事件都要调用,更新当前窗口计数。
+    /// 窗口满60秒自动创建新窗口。
     pub fn update_from_event(&mut self, event: &DecodedEvent) {
         let pid = event.header.pid;
         let comm = event.comm.clone();
@@ -210,6 +216,31 @@ impl BaselineManager {
                 self.recalculate_baseline(pid, &comm, is_high_freq);
                 self.established_pids.insert(pid);
             }
+        } else if let Some(b) = self.baselines.get_mut(&pid) {
+            // 已建立基线的PID,刷新last_seen,供LRU淘汰判断活跃度。
+            b.last_seen_ns = event.header.timestamp_ns;
+        }
+
+        // 容量上限淘汰:per-PID结构随累计PID数无界增长(84核机器3小时见6.5万PID),
+        // 超过max_pids时删最不活跃的PID的全部per-PID数据。
+        if self.baselines.len() > self.max_pids {
+            self.evict_inactive_pids();
+        }
+    }
+
+    /// 淘汰最不活跃的PID:按last_seen_ns升序删到baselines降到max_pids以下,
+    /// 同步清理freq_history/established_pids中对应entry,防止per-PID结构无界增长。
+    fn evict_inactive_pids(&mut self) {
+        let target = self.max_pids.saturating_sub(self.max_pids / 10);
+        while self.baselines.len() > target {
+            // 找last_seen最小的PID(最不活跃)
+            let evict_pid = match self.baselines.iter().min_by_key(|(_, b)| b.last_seen_ns) {
+                Some((p, _)) => *p,
+                None => break,
+            };
+            self.baselines.remove(&evict_pid);
+            self.freq_history.remove(&evict_pid);
+            self.established_pids.remove(&evict_pid);
         }
     }
 
@@ -233,13 +264,13 @@ impl BaselineManager {
                 established_at_ns: snapshots.first().unwrap().timestamp_ns,
                 sample_count: snapshots.len() as u32,
                 is_inherently_high_freq: is_high_freq,
+                last_seen_ns: snapshots.last().unwrap().timestamp_ns,
             },
         );
     }
 
-    /// 申报书基线偏离检测：手动解除某 PID 的一次性训练锁定并立即重算基线。
-    /// （申报书："需要手动调用 refresh_baseline() 才能重新训练"）
-    /// 用于运维在确认某进程行为合法变更后手动重训练，避免基线被异常数据稀释后锁死。
+    /// 基线偏离检测:手动解除某PID的一次性训练锁定并立即重算基线。
+    /// 用于运维在确认某进程行为合法变更后手动重训练,避免基线被异常数据稀释后锁死。
     pub fn refresh_baseline(&mut self, pid: u32) {
         self.established_pids.remove(&pid);
         let (comm, is_high_freq, has_baseline) = match self.baselines.get(&pid) {

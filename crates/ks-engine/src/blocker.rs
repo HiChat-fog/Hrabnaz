@@ -1,17 +1,10 @@
-//! G2.2: 用户态反向阻断通道 — BlockManager。
+//! 用户态反向阻断通道BlockManager。
 //!
-//! 申报书依据："阻断机制基于 bpf_send_signal 实现" + "风险分阈值设为大于等于 70 触发阻断"
+//! 申报书依据:阻断机制基于bpf_send_signal实现,风险分阈值设为大于等于70触发阻断。
 //!
-//! BlockManager 维护一个内存中的阻断决策表（block_decisions），支持：
-//! - `block_pid(pid, ttl, reason)` — 添加阻断（带 TTL 过期）
-//! - `unblock_pid(pid)` — 解除阻断
-//! - `list_blocked()` — 列出所有被阻断的 PID
-//! - `is_blocked(pid)` — 检查 PID 是否被阻断
-//! - `cleanup_expired()` — 清理过期条目
+//! BlockManager维护一个内存中的阻断决策表(block_decisions),支持block_pid(pid, ttl, reason)添加阻断(带TTL过期)、unblock_pid(pid)解除阻断、list_blocked()列出所有被阻断的PID、is_blocked(pid)检查PID是否被阻断、cleanup_expired()清理过期条目。
 //!
-//! 当 G2.1 内核态阻断完成后，BlockManager 可选地写入 BPF block_decisions map，
-//! 使内核探针在下次事件时读取 map 并调用 bpf_send_signal(SIGKILL)。
-//! 当前版本为用户态内存管理，不依赖 BPF loader。
+//! 当内核态阻断完成后,BlockManager可选地写入BPF block_decisions map,使内核探针在下次事件时读取map并调用bpf_send_signal(SIGKILL)。当前版本为用户态内存管理,不依赖BPF loader。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,15 +13,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 阻断原因编码
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockReason {
-    /// 规则匹配触发（severity >= 阈值）
+    /// 规则匹配触发(severity >= 阈值)
     RuleMatch = 1,
-    /// 基线偏离触发（z-score >= 5σ）
+    /// 基线偏离触发(z-score >= 5σ)
     BaselineDeviation = 2,
-    /// ML 异常检测触发
+    /// ML异常检测触发
     MlAnomaly = 3,
     /// 关联引擎触发
     Correlation = 4,
-    /// 手动阻断（REST API）
+    /// 手动阻断(REST API)
     Manual = 5,
 }
 
@@ -57,26 +50,26 @@ impl std::fmt::Display for BlockReason {
     }
 }
 
-/// 被阻断的 PID 条目
+/// 被阻断的PID条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockedPid {
     pub pid: u32,
-    /// 阻断生效时间（UNIX 纳秒）
+    /// 阻断生效时间(UNIX纳秒)
     pub blocked_at_ns: u64,
-    /// 过期时间（UNIX 纳秒），0 表示永久
+    /// 过期时间(UNIX纳秒),0表示永久
     pub expiry_ns: u64,
     /// 阻断原因
     pub reason: BlockReason,
-    /// 触发告警的规则名/描述
+    /// 触发告警的规则名或描述
     pub trigger: String,
 }
 
 pub struct BlockManager {
-    /// pid → BlockedPid
+    /// pid到BlockedPid的映射
     blocked: HashMap<u32, BlockedPid>,
-    /// 是否启用阻断（false 时 block_pid 静默返回 Ok）
+    /// 是否启用阻断(false时block_pid静默返回Ok)
     enabled: bool,
-    /// 默认 TTL（秒）
+    /// 默认TTL(秒)
     default_ttl: u64,
 }
 
@@ -103,9 +96,7 @@ impl BlockManager {
         }
     }
 
-    /// 阻断指定 PID。
-    /// - ttl_secs=0 表示使用默认 TTL
-    /// - 返回是否实际添加了阻断（若已存在且未过期则更新）
+    /// 阻断指定PID。ttl_secs为0表示用默认TTL,返回是否实际添加了阻断(若已存在且未过期则更新)。
     pub fn block_pid(
         &mut self,
         pid: u32,
@@ -147,7 +138,7 @@ impl BlockManager {
         self.blocked.remove(&pid).is_some()
     }
 
-    /// 检查 PID 是否被阻断（同时清理过期条目）
+    /// 检查PID是否被阻断(同时清理过期条目)
     pub fn is_blocked(&mut self, pid: u32) -> bool {
         if let Some(entry) = self.blocked.get(&pid) {
             if entry.expiry_ns > 0 && now_ns() > entry.expiry_ns {
@@ -159,7 +150,7 @@ impl BlockManager {
         false
     }
 
-    /// 列出所有被阻断的 PID（先清理过期条目）
+    /// 列出所有被阻断的PID(先清理过期条目)
     pub fn list_blocked(&mut self) -> Vec<BlockedPid> {
         self.cleanup_expired();
         self.blocked.values().cloned().collect()
@@ -231,7 +222,7 @@ mod tests {
     #[test]
     fn test_block_ttl_expiry() {
         let mut mgr = BlockManager::with_config(true, 300);
-        // 1 秒 TTL
+        // 1秒TTL
         mgr.block_pid(1234, 1, BlockReason::Manual, "test");
         assert!(mgr.is_blocked(1234));
         // 等 1.1 秒
@@ -295,7 +286,7 @@ mod tests {
     fn test_update_existing_block() {
         let mut mgr = BlockManager::with_config(true, 300);
         mgr.block_pid(1234, 60, BlockReason::RuleMatch, "rule1");
-        // 再次阻断同 PID，更新原因
+        // 再次阻断同PID,更新原因
         mgr.block_pid(1234, 60, BlockReason::MlAnomaly, "ml1");
         let list = mgr.list_blocked();
         assert_eq!(list.len(), 1);

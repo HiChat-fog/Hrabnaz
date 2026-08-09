@@ -6,10 +6,13 @@ use ks_core::alert::{
 };
 use ks_core::rule::{Condition, DetectionRule, Field, MatchResult, Operator};
 use log::{info, warn};
+use std::collections::HashMap;
 
 pub struct DetectionEngine {
     rules: Vec<DetectionRule>,
-    rules_index: std::collections::HashMap<String, usize>,
+    rules_index: HashMap<String, usize>,
+    //预编译正则缓存:加载规则时一次性编译所有regex/not_regex的target,运行时只读查找避免每事件重新Regex::new
+    regex_cache: HashMap<String, regex::Regex>,
 }
 
 impl Default for DetectionEngine {
@@ -22,7 +25,8 @@ impl DetectionEngine {
     pub fn new() -> Self {
         Self {
             rules: Vec::new(),
-            rules_index: std::collections::HashMap::new(),
+            rules_index: HashMap::new(),
+            regex_cache: HashMap::new(),
         }
     }
 
@@ -34,15 +38,36 @@ impl DetectionEngine {
             self.rules_index.insert(rule.name.clone(), idx);
         }
         self.rules.extend(rules);
+        self.compile_regexes();
         info!("加载了 {} 条检测规则", count);
         Ok(count)
+    }
+
+    //遍历所有规则的regex/not_regex条件,一次性预编译target存入cache。运行时match_str只读查找,消除每事件Regex::new的重复编译开销(原先占detector_match 90%耗时)
+    fn compile_regexes(&mut self) {
+        for rule in &self.rules {
+            for cond in &rule.conditions {
+                if matches!(cond.operator, Operator::Regex | Operator::NotRegex)
+                    && !self.regex_cache.contains_key(&cond.value)
+                {
+                    match regex::Regex::new(&cond.value) {
+                        Ok(re) => {
+                            self.regex_cache.insert(cond.value.clone(), re);
+                        }
+                        Err(e) => {
+                            warn!("规则正则编译失败,运行时该条件恒false: '{}' — {}", cond.value, e);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
 
-    /// 单事件匹配所有规则，返回命中的规则列表
+    /// 单事件匹配所有规则,返回命中的规则列表
     pub fn match_event(&self, event: &DecodedEvent) -> Vec<MatchResult> {
         let mut results = Vec::new();
         for rule in &self.rules {
@@ -69,30 +94,32 @@ impl DetectionEngine {
     }
 
     fn condition_matches(&self, cond: &Condition, event: &DecodedEvent) -> bool {
+        let cache = &self.regex_cache;
         match &cond.field {
-            Field::SyscallNr => match_i32(event.header.syscall_nr, &cond.operator, &cond.value),
-            Field::Pid => match_u32(event.header.pid, &cond.operator, &cond.value),
-            Field::Uid => match_u32(event.header.uid, &cond.operator, &cond.value),
-            Field::Ppid => match_u32(event.header.ppid, &cond.operator, &cond.value),
+            Field::EventType => match_u32(event.header.event_type, &cond.operator, &cond.value, cache),
+            Field::SyscallNr => match_i32(event.header.syscall_nr, &cond.operator, &cond.value, cache),
+            Field::Pid => match_u32(event.header.pid, &cond.operator, &cond.value, cache),
+            Field::Uid => match_u32(event.header.uid, &cond.operator, &cond.value, cache),
+            Field::Ppid => match_u32(event.header.ppid, &cond.operator, &cond.value, cache),
             Field::Dport => {
-                match_opt_u32(event.dport.map(|v| v as u32), &cond.operator, &cond.value)
+                match_opt_u32(event.dport.map(|v| v as u32), &cond.operator, &cond.value, cache)
             }
             Field::Sport => {
-                match_opt_u32(event.sport.map(|v| v as u32), &cond.operator, &cond.value)
+                match_opt_u32(event.sport.map(|v| v as u32), &cond.operator, &cond.value, cache)
             }
-            Field::TargetPid => match_opt_u32(event.target_pid, &cond.operator, &cond.value),
-            Field::Signal => match_opt_i32(event.signal, &cond.operator, &cond.value),
+            Field::TargetPid => match_opt_u32(event.target_pid, &cond.operator, &cond.value, cache),
+            Field::Signal => match_opt_i32(event.signal, &cond.operator, &cond.value, cache),
             Field::FileBytes => match_opt_u64(event.file_bytes, &cond.operator, &cond.value),
-            Field::Comm => match_str(&event.comm, &cond.operator, &cond.value),
+            Field::Comm => match_str(&event.comm, &cond.operator, &cond.value, cache),
             Field::Filename => {
-                match_opt_str(event.filename.as_deref(), &cond.operator, &cond.value)
+                match_opt_str(event.filename.as_deref(), &cond.operator, &cond.value, cache)
             }
-            Field::Args => match_opt_str(event.args.as_deref(), &cond.operator, &cond.value),
-            Field::Saddr => match_opt_str(event.saddr.as_deref(), &cond.operator, &cond.value),
-            Field::Daddr => match_opt_str(event.daddr.as_deref(), &cond.operator, &cond.value),
-            Field::Proto => match_opt_str(event.proto.as_deref(), &cond.operator, &cond.value),
-            Field::Saddr6 => match_ipv6_field(event.saddr.as_deref(), &cond.operator, &cond.value),
-            Field::Daddr6 => match_ipv6_field(event.daddr.as_deref(), &cond.operator, &cond.value),
+            Field::Args => match_opt_str(event.args.as_deref(), &cond.operator, &cond.value, cache),
+            Field::Saddr => match_opt_str(event.saddr.as_deref(), &cond.operator, &cond.value, cache),
+            Field::Daddr => match_opt_str(event.daddr.as_deref(), &cond.operator, &cond.value, cache),
+            Field::Proto => match_opt_str(event.proto.as_deref(), &cond.operator, &cond.value, cache),
+            Field::Saddr6 => match_ipv6_field(event.saddr.as_deref(), &cond.operator, &cond.value, cache),
+            Field::Daddr6 => match_ipv6_field(event.daddr.as_deref(), &cond.operator, &cond.value, cache),
             Field::Family => {
                 let inferred_family =
                     event
@@ -101,17 +128,17 @@ impl DetectionEngine {
                         .map(|a| if a.contains(':') { "IPv6" } else { "IPv4" });
                 match_family_field(inferred_family, &cond.operator, &cond.value)
             }
-            // E4.4 新增字段: 容器逃逸 / LKM 加载 / eBPF 篡改
+            // 新增字段:容器逃逸、LKM加载、eBPF篡改
             Field::ModuleName => {
-                match_opt_str(event.module_name.as_deref(), &cond.operator, &cond.value)
+                match_opt_str(event.module_name.as_deref(), &cond.operator, &cond.value, cache)
             }
             Field::ProgName => {
-                match_opt_str(event.prog_name.as_deref(), &cond.operator, &cond.value)
+                match_opt_str(event.prog_name.as_deref(), &cond.operator, &cond.value, cache)
             }
-            Field::SourceNsInum => match_opt_u32(event.source_ns_inum, &cond.operator, &cond.value),
-            Field::TargetNsInum => match_opt_u32(event.target_ns_inum, &cond.operator, &cond.value),
-            Field::CapEff => match_opt_u32(event.cap_eff, &cond.operator, &cond.value),
-            Field::Action => match_opt_str(event.action.as_deref(), &cond.operator, &cond.value),
+            Field::SourceNsInum => match_opt_u32(event.source_ns_inum, &cond.operator, &cond.value, cache),
+            Field::TargetNsInum => match_opt_u32(event.target_ns_inum, &cond.operator, &cond.value, cache),
+            Field::CapEff => match_opt_u32(event.cap_eff, &cond.operator, &cond.value, cache),
+            Field::Action => match_opt_str(event.action.as_deref(), &cond.operator, &cond.value, cache),
         }
     }
 
@@ -203,19 +230,12 @@ impl DetectionEngine {
     }
 
     /// 轻量异常评分: 频率 + 敏感文件 + 可疑命令 + 网络异常
-    pub fn anomaly_score(&self, event: &DecodedEvent, history: &[DecodedEvent]) -> f64 {
+    /// recent_syscalls是调用方增量维护的60秒窗口syscall计数(O(1)查询),
+    /// 替代遍历history的O(n)扫描。
+    pub fn anomaly_score(&self, event: &DecodedEvent, recent_syscalls: usize) -> f64 {
         let mut score: f64 = 0.0;
-        let window_ns: u64 = 60_000_000_000;
-        let now_ns = event.header.timestamp_ns;
 
         // 系统调用频率
-        let recent_syscalls = history
-            .iter()
-            .filter(|e| {
-                e.header.pid == event.header.pid
-                    && now_ns.saturating_sub(e.header.timestamp_ns) < window_ns
-            })
-            .count();
         if recent_syscalls > 500 {
             score += 0.4;
         } else if recent_syscalls > 100 {
@@ -325,7 +345,7 @@ impl DetectionEngine {
 
 // ========== 字段匹配辅助函数 ==========
 
-fn match_i32(value: i32, op: &Operator, target: &str) -> bool {
+fn match_i32(value: i32, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
     match op {
         Operator::Equals
         | Operator::GreaterThan
@@ -350,13 +370,13 @@ fn match_i32(value: i32, op: &Operator, target: &str) -> bool {
                 _ => unreachable!(),
             }
         }
-        Operator::Regex | Operator::Contains | Operator::StartsWith => {
-            match_str(&value.to_string(), op, target)
+        Operator::Regex | Operator::Contains | Operator::StartsWith | Operator::NotRegex => {
+            match_str(&value.to_string(), op, target, cache)
         }
     }
 }
 
-fn match_u32(value: u32, op: &Operator, target: &str) -> bool {
+fn match_u32(value: u32, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
     match op {
         Operator::Equals
         | Operator::GreaterThan
@@ -381,22 +401,23 @@ fn match_u32(value: u32, op: &Operator, target: &str) -> bool {
                 _ => unreachable!(),
             }
         }
-        Operator::Regex | Operator::Contains | Operator::StartsWith => {
-            match_str(&value.to_string(), op, target)
+        //dport/sport等数值字段也支持regex操作符(如高危端口枚举),查同一cache
+        Operator::Regex | Operator::Contains | Operator::StartsWith | Operator::NotRegex => {
+            match_str(&value.to_string(), op, target, cache)
         }
     }
 }
 
-fn match_opt_u32(value: Option<u32>, op: &Operator, target: &str) -> bool {
+fn match_opt_u32(value: Option<u32>, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
     match value {
-        Some(v) => match_u32(v, op, target),
+        Some(v) => match_u32(v, op, target, cache),
         None => false,
     }
 }
 
-fn match_opt_i32(value: Option<i32>, op: &Operator, target: &str) -> bool {
+fn match_opt_i32(value: Option<i32>, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
     match value {
-        Some(v) => match_i32(v, op, target),
+        Some(v) => match_i32(v, op, target, cache),
         None => false,
     }
 }
@@ -423,18 +444,23 @@ fn match_opt_u64(value: Option<u64>, op: &Operator, target: &str) -> bool {
     }
 }
 
-fn match_str(value: &str, op: &Operator, target: &str) -> bool {
+fn match_str(value: &str, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
     match op {
         Operator::Equals => value == target,
         Operator::NotEquals => value != target,
         Operator::Contains => value.contains(target),
         Operator::StartsWith => value.starts_with(target),
-        Operator::Regex => match regex::Regex::new(target) {
-            Ok(re) => re.is_match(value),
-            Err(e) => {
-                warn!("正则无效: '{}' — {}", target, e);
-                false
+        //regex预编译缓存:compile_regexes时一次性编译,运行时只读查找避免每事件Regex::new
+        Operator::Regex | Operator::NotRegex => match cache.get(target) {
+            Some(re) => {
+                let m = re.is_match(value);
+                if matches!(op, Operator::NotRegex) {
+                    !m
+                } else {
+                    m
+                }
             }
+            None => false,
         },
         Operator::GreaterThan
         | Operator::LessThan
@@ -453,9 +479,9 @@ fn match_str(value: &str, op: &Operator, target: &str) -> bool {
     }
 }
 
-fn match_opt_str(value: Option<&str>, op: &Operator, target: &str) -> bool {
+fn match_opt_str(value: Option<&str>, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
     match value {
-        Some(v) => match_str(v, op, target),
+        Some(v) => match_str(v, op, target, cache),
         None => false,
     }
 }
@@ -497,11 +523,12 @@ fn op_to_str(op: &Operator) -> &str {
         Operator::GreaterThanOrEqual => ">=",
         Operator::LessThanOrEqual => "<=",
         Operator::NotEquals => "!=",
+        Operator::NotRegex => "!~",
     }
 }
 
-fn match_ipv6_field(value: Option<&str>, op: &Operator, target: &str) -> bool {
-    match_opt_str(value, op, target)
+fn match_ipv6_field(value: Option<&str>, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
+    match_opt_str(value, op, target, cache)
 }
 
 fn match_family_field(value: Option<&str>, op: &Operator, target: &str) -> bool {
@@ -626,7 +653,7 @@ mod tests {
             cap_eff: None,
             action: None,
         };
-        assert_eq!(engine.anomaly_score(&event, &[]), 0.0);
+        assert_eq!(engine.anomaly_score(&event, 0), 0.0);
     }
 
     #[test]
@@ -653,7 +680,7 @@ mod tests {
             cap_eff: None,
             action: None,
         };
-        assert!(engine.anomaly_score(&event, &[]) >= 0.5);
+        assert!(engine.anomaly_score(&event, 0) >= 0.5);
     }
 
     #[test]

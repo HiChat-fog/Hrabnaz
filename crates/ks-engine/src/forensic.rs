@@ -1,5 +1,5 @@
-//! JSONL 格式取证日志，带 SHA-256 哈希链防篡改。
-//! 支持自动轮转（按大小）+ gzip 归档 + 过期清理。
+//! JSONL格式取证日志,带SHA-256哈希链防篡改。
+//! 支持自动轮转(按大小)、gzip归档、过期清理。
 
 use crate::aggregator::DecodedEvent;
 use anyhow::Result;
@@ -57,7 +57,7 @@ pub struct ForensicLogger {
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 impl ForensicLogger {
-    /// 创建日志记录器，若文件已存在则从末尾恢复哈希链
+    /// 创建日志记录器,若文件已存在则从末尾恢复哈希链
     pub fn new(path: PathBuf) -> Result<Self> {
         Self::with_rotation(path, RotationConfig::default())
     }
@@ -102,7 +102,7 @@ impl ForensicLogger {
     }
 
     /// 从已有日志恢复链尾哈希和事件计数
-    /// 跳过 alert 记录（只有 event 记录才有 seq 字段）
+    /// 跳过alert记录(只有event记录才有seq字段)
     fn recover_chain_state(path: &PathBuf) -> Result<(String, u64)> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
@@ -111,7 +111,7 @@ impl ForensicLogger {
             if line.trim().is_empty() {
                 continue;
             }
-            // 只保留含 "seq" 的行（event 记录），跳过 alert 记录
+            // 只保留含seq的行(event记录),跳过alert记录
             if line.contains("\"seq\"") {
                 last_event_line = line;
             }
@@ -133,7 +133,7 @@ impl ForensicLogger {
         Ok((hash, seq))
     }
 
-    /// 当前文件超过 max_file_size 时做轮转：重命名 → 压缩 → 开新文件
+    /// 当前文件超过max_file_size时做轮转:重命名、压缩、开新文件
     fn maybe_rotate(&mut self) -> Result<()> {
         if self.current_file_size < self.rotation_config.max_file_size {
             return Ok(());
@@ -212,7 +212,7 @@ impl ForensicLogger {
             record["file_bytes"] = serde_json::json!(b);
         }
 
-        // 用 BTreeMap 做序列化保证 key 排序一致，verify_chain 才不会因为 key 顺序不同报假错
+        // 用BTreeMap做序列化保证key排序一致,verify_chain才不会因为key顺序不同报假错
         let btree: BTreeMap<String, serde_json::Value> = record
             .as_object()
             .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())

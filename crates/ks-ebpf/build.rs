@@ -1,9 +1,6 @@
-//! ks-ebpf: eBPF 探针程序 (C 代码编译)
+//! ks-ebpf:eBPF探针程序(C代码编译)
 //!
-//! build.rs 负责:
-//! 1. 检测系统 clang/llvm
-//! 2. 编译 src/bpf/*.bpf.c 为 eBPF 字节码 (.o)
-//! 3. 将编译产物放在 OUT_DIR 供主程序加载
+//! build.rs负责检测系统clang/llvm,编译src/bpf/*.bpf.c为eBPF字节码(.o),将编译产物放在OUT_DIR供主程序加载。
 
 use std::env;
 use std::path::PathBuf;
@@ -15,10 +12,10 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bpf_src_dir = PathBuf::from("src/bpf");
 
-    // 检测 clang
-    let clang = which::which("clang").expect("clang 未找到，请安装: sudo apt install clang llvm");
+    // 检测clang
+    let clang = which::which("clang").expect("clang未找到,请安装: sudo apt install clang llvm");
 
-    // 编译每个 .bpf.c 文件
+    // 编译每个.bpf.c文件
     let bpf_files: Vec<PathBuf> = std::fs::read_dir(&bpf_src_dir)
         .expect("无法读取 bpf 源码目录")
         .filter_map(|entry| {

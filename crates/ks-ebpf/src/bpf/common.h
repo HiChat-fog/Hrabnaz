@@ -30,8 +30,8 @@ typedef __s64 i64;
     #define KS_LRU_HASH  1
 #endif
 
-/* ── C1: Ancient tier shim — bpf_probe_read_kernel 系列回退 ──
- * 3.10 无 bpf_probe_read_kernel / bpf_probe_read_kernel_str helper，
+/* ── C1: Ancient/Legacy-NOBTF tier shim — bpf_probe_read_kernel 系列回退 ──
+ * 3.10 与 4.19 均无 bpf_probe_read_kernel / bpf_probe_read_kernel_str helper（5.5+ 引入），
  * 回退到 bpf_probe_read / bpf_probe_read_str（语义等价）。
  * BPF_CORE_READ 内部调用 bpf_probe_read_kernel，经此 shim 自动重定向。
  *
@@ -39,8 +39,10 @@ typedef __s64 i64;
  *      这两个 helper 同为 5.5+ 引入（vmlinux.h 编号 112/114），
  *      ks_probes_syscall.h 中 trace_sys_exit 探针主动调用。
  *      bpf_probe_read 对 __user 指针也能 fault-in 用户页，语义等价。
+ *
+ * Phase F: 4.19 无 BTF（legacy_nobtf）同样需要此 shim——4.19 原版内核无 5.5+ helper。
  */
-#ifdef KS_TIER_ANCIENT
+#if defined(KS_TIER_ANCIENT) || (defined(KS_TIER_LEGACY) && defined(KS_NOBTF))
     #define bpf_probe_read_kernel       bpf_probe_read
     #define bpf_probe_read_kernel_str   bpf_probe_read_str
     #define bpf_probe_read_user         bpf_probe_read
@@ -61,14 +63,25 @@ typedef __s64 i64;
 #ifdef KS_NOBTF
     #undef BPF_CORE_READ
 
-    /* 实测 offset（3.10.0-1160.119.1.el7.x86_64） */
-    #define KS_OFF_INET_SADDR          776
-    #define KS_OFF_INET_SPORT          784
+    /* 跨版本稳定的 offset（4.19 与 3.10 一致） */
     #define KS_OFF_SOCK_COMMON         0
     #define KS_OFF_PATH_DENTRY         8
     #define KS_OFF_DENTRY_DNAME_NAME   40
     #define KS_OFF_FILE_FPATH          16
     #define KS_OFF_SIN6_PORT           2
+
+    /* inet_saddr/inet_sport 依赖 struct sock 布局，跨内核版本变化，按 tier 区分 */
+    #if defined(KS_TIER_LEGACY)
+        /* 4.19 实测 offset（pahole on 4.19.0-20-dbg vmlinux: inet_sock.inet_saddr=728, inet_sport=736） */
+        #define KS_OFF_INET_SADDR          728
+        #define KS_OFF_INET_SPORT          736
+    #elif defined(KS_TIER_ANCIENT)
+        /* 3.10.0-1160.119.1.el7.x86_64 实测 offset */
+        #define KS_OFF_INET_SADDR          776
+        #define KS_OFF_INET_SPORT          784
+    #else
+        #error "KS_NOBTF 需要 KS_TIER_LEGACY 或 KS_TIER_ANCIENT 之一确定 inet offset"
+    #endif
 
     #define BPF_CORE_READ(ptr, field) KS_NOREAD_##field(ptr)
 
@@ -176,9 +189,12 @@ typedef __s64 i64;
 #if KS_RINGBUF
     #define KS_RESERVE(buf, type) ((type *)bpf_ringbuf_reserve(&(buf), sizeof(type), 0))
     #define KS_SUBMIT(ctx, buf, evt) bpf_ringbuf_submit((evt), 0)
+    /* reserve后丢弃:释放预留空间,不进ringbuf、不唤醒用户态。
+     * 用于verdict==0的事件在reserve之后内核侧过滤。 */
+    #define KS_DISCARD(evt) bpf_ringbuf_discard((evt), 0)
 #else
-    /* PERCPU_ARRAY scratch：value=u8[1024] 覆盖最大事件结构体 exec_event(~816B)
-     * C5: 通过 KS_PERCPU_ARRAY_MAP 宏，Ancient tier 自动回退到 CPU-keyed ARRAY */
+    /* PERCPU_ARRAY scratch:value=u8[1024]覆盖最大事件结构体exec_event(~816B)
+     * C5:通过KS_PERCPU_ARRAY_MAP宏,Ancient tier自动回退到CPU-keyed ARRAY */
     KS_PERCPU_ARRAY_MAP(ks_scratch, u8[1024]);
 
     #define KS_RESERVE(buf, type) ({ \
@@ -187,6 +203,9 @@ typedef __s64 i64;
     })
     #define KS_SUBMIT(ctx, buf, evt) \
         bpf_perf_event_output((ctx), &(buf), BPF_F_CURRENT_CPU, (evt), sizeof(*(evt)))
+    /* perfbuf路径:scratch不是真正reserve,不调KS_SUBMIT即不发,
+     * discard无副作用,留空占位以保持调用点统一。 */
+    #define KS_DISCARD(evt) ((void)(evt))
 #endif
 
 /* ── 事件类型常量 ───────────────────────────── */
@@ -248,6 +267,30 @@ KS_LRU_HASH_MAP(block_decisions, struct block_key, struct block_value, 4096);
  * key=tgid, value=1(受保护)。Array 不足以存任意 pid，用 LRU_HASH。 */
 KS_LRU_HASH_MAP(protected_pids, u32, u8, 256);
 
+/* enforce 作用域白名单:用户态启动时按 exe_path 解析出关键系统进程(sshd/cron/
+ * systemd/journald/dbus/sudo等)的 comm,写入此 map。enforce 下 SIGKILL 前查当前
+ * comm,命中则跳过杀但告警照上送(对齐Tetragon audit模式:对无法安全阻断的关键服务
+ * 降级告警交人工,避免误杀致拒绝服务)。
+ * key=comm[16], value=1(受保护)。comm 可被 exec -a 伪造,故仅作第一层;exe_path
+ * 反向排除(可疑路径/tmp/ /dev/shm/ 下的同名进程照杀)在第二层。 */
+struct comm_key { char comm[16]; };
+KS_LRU_HASH_MAP(protected_comms, struct comm_key, u8, 64);
+
+/* 进程树节点(从 ks_probes_process_tree.h 前移至此,供 enforce 安全门读 exe_path)。
+ * 完整定义在此,ks_probes_process_tree.h 不再重复定义。 */
+#define KS_EXE_PATH_LEN 256
+struct process_node {
+    u32 pid; u32 ppid;
+    u8  comm[16];
+    u8  exe_path[KS_EXE_PATH_LEN];
+    u32 flags;
+    u32 risk_score;
+    u64 create_time;
+    u64 exit_time;
+    u32 _pad_node1, _pad_node2;
+};
+KS_LRU_HASH_MAP(process_tree, u32, struct process_node, 65536);
+
 /* G2.1: 内核态阻断查询 — 命中且未过期则 SIGKILL（仅 Modern tier）。
  * Modern tier（5.8+）一定支持 bpf_send_signal（5.4+ helper）。
  * Legacy/Ancient 不调 bpf_send_signal（兼容性未知），仅返回是否应阻断，
@@ -268,6 +311,22 @@ static __always_inline int ks_current_protected(void) {
     return p && *p == 1;
 }
 
+/* enforce 作用域白名单:当前进程 comm 命中 protected_comms 则受保护。
+ * 解决enforce误杀sshd等关键服务(报告发现1 Critical)。
+ * 注:comm可被exec -a伪造,故第二层ks_exe_path_suspicious反向排除可疑路径。 */
+static __always_inline int ks_comm_protected(void) {
+    struct comm_key ck = {};
+    bpf_get_current_comm(&ck.comm, sizeof(ck.comm));
+    u8 *p = bpf_map_lookup_elem(&protected_comms, &ck);
+    return p && *p == 1;
+}
+
+/* 反向排除:comm匹配白名单但exe_path在可疑临时路径(典型伪装 cp evil /tmp/sshd)
+ * 则照杀。查 process_tree map(execve时记录的完整exe_path)判定前缀。
+ * 返回1=可疑路径(应杀),0=非可疑或查不到(保守不拦)。
+ * struct process_node 完整定义在下方 process_node 定义后,此处仅声明函数。 */
+static __always_inline int ks_exe_path_suspicious(void);
+
 static __always_inline int ks_check_block(u32 pid) {
     struct block_key bk = { .pid = pid, ._pad_blk = 0 };
     struct block_value *bv = bpf_map_lookup_elem(&block_decisions, &bk);
@@ -280,15 +339,45 @@ static __always_inline int ks_check_block(u32 pid) {
     return 0;
 }
 
-/* Modern tier 阻断：
- *   enforce_mode=1(默认0=monitor)：verdict==2 内核态直接 bpf_send_signal。
- *   monitor 模式仅查 block_decisions(用户态显式阻断)，不因 verdict 主动杀。
- * monitor 默认避免冷启动误报误杀正常进程/自身；用户态显式置 enforce 才真阻断。
- * 两条 kill 路径都先过 ks_current_protected() 豁免自身。 */
+/* 反向排除实现:查 process_tree 拿当前进程 exe_path,判定可疑临时路径前缀。
+ * 展开式逐字符比对(验证器友好,申报书"字符串比较展开为固定次数逐字符比对")。 */
+static __always_inline int ks_exe_path_suspicious(void) {
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    struct process_node *node = bpf_map_lookup_elem(&process_tree, &tgid);
+    if (!node) return 0;
+    char c0 = node->exe_path[0], c1 = node->exe_path[1], c2 = node->exe_path[2], c3 = node->exe_path[3];
+    /* /tmp */
+    if (c0=='/' && c1=='t' && c2=='m' && c3=='p') return 1;
+    /* /dev/shm */
+    if (c0=='/' && c1=='d' && c2=='e' && c3=='v') {
+        char c4 = node->exe_path[4], c5 = node->exe_path[5], c6 = node->exe_path[6], c7 = node->exe_path[7];
+        if (c4=='/' && c5=='s' && c6=='h' && c7=='m') return 1;
+    }
+    /* /var/tmp */
+    if (c0=='/' && c1=='v' && c2=='a' && c3=='r') {
+        char c4 = node->exe_path[4], c5 = node->exe_path[5], c6 = node->exe_path[6], c7 = node->exe_path[7];
+        if (c4=='/' && c5=='t' && c6=='m' && c7=='p') return 1;
+    }
+    return 0;
+}
+
+//Modern tier阻断:enforce=1时verdict==2内核态SIGKILL,monitor只查block_decisions
+//三道安全门:(1)干跑期内不杀(risk/基线建立窗口)(2)kill阈值独立于告警阈值
+//(3)comm白名单豁免关键服务(sshd/cron等不杀但告警照上),但exe_path可疑(伪装)则照杀
+//对齐Tetragon audit模式:对无法安全阻断的关键服务降级告警,避免误杀致拒绝服务
 #define KS_MAYBE_BLOCK(pid, verdict) do { \
     if (get_config(CFG_ENFORCE_MODE, 0) == 1 && (verdict) == 2) { \
-        if (!ks_current_protected()) \
-            bpf_send_signal(9); /* SIGKILL — verdict==2 内核态直接阻断(申报书第四阶段) */ \
+        u32 _warmup = get_config(CFG_ENFORCE_WARMUP_UNTIL_SEC, 0); \
+        u32 _kill_thr = get_config(CFG_ENFORCE_KILL_THRESHOLD, 70); \
+        u64 _now = bpf_ktime_get_ns(); \
+        u32 _now_sec = (u32)(_now / 1000000000ULL); \
+        int _warmup_ok = (_warmup == 0 || _now_sec >= _warmup); \
+        u32 _risk = get_risk(pid); \
+        /* comm白名单豁免:但exe_path可疑(伪装)则照杀 */ \
+        int _exempt = ks_current_protected() || \
+            (ks_comm_protected() && !ks_exe_path_suspicious()); \
+        if (_warmup_ok && _risk >= _kill_thr && !_exempt) \
+            bpf_send_signal(9); \
     } \
     ks_check_block((pid)); \
 } while (0)
@@ -326,6 +415,9 @@ KS_LRU_HASH_MAP(net_conn_history, struct net_conn_key, u64, 8192);
 #define FREQ_ANOMALY_DNS_TUNNEL  (1 << 2)
 #define FREQ_ANOMALY_BRUTE_FORCE (1 << 3)
 #define FREQ_ANOMALY_INJECTION   (1 << 4)
+/* 本次窗口已上报过FREQ_ANOM(申报书"仅首次越过阈值时发送告警以避免重复上报")。
+ * 置位后窗口内不再重发,窗口到期重置计数器时一并清零。 */
+#define FREQ_REPORTED            (1 << 5)
 
 struct freq_counter {
     u32 syscall_count_60s, file_op_count_60s, net_op_count_60s;
@@ -344,14 +436,27 @@ enum infer_config_key {
     CFG_TIME_WINDOW_NS      = 2,
     CFG_MAX_NEW_FILES       = 3,
     CFG_NEW_FILE_WINDOW_NS  = 4,
-    /* 5: enforce_mode — 0=monitor(只告警/记block_decisions，不主动SIGKILL)，
-     * 1=enforce(verdict==2 内核态直接 bpf_send_signal)。默认 0，
-     * 冷启动误报高时避免误杀正常进程/自身；用户态显式置 1 才真阻断。
-     * 对齐 Tetragon POLICY_MODE_ENFORCE/MONITOR 设计。 */
+    //5:0=monitor只告警不杀,1=enforce verdict==2内核态SIGKILL
     CFG_ENFORCE_MODE        = 5,
+    //6:enforce干跑期截止(单调秒,0=无干跑期)。启动后N秒内不主动杀,留风险分建立窗口
+    CFG_ENFORCE_WARMUP_UNTIL_SEC = 6,
+    //7:enforce真阻断阈值,默认70对齐申报书。verdict仍按CFG_RISK_THRESHOLD判定,kill门槛可独立抬高
+    CFG_ENFORCE_KILL_THRESHOLD   = 7,
 };
 
+/* infer_config:5个固定阈值(key0-4,申报书MVP值)用常量返回,避免ARRAY map
+ * 默认0导致fallback失效——尤其CFG_RISK_THRESHOLD读0会使风险分>=0恒返回verdict=2
+ * (阻断),enforce模式下会大规模误杀。3个运行时开关(key5-7,enforce模式/干跑期/kill
+ * 阈值)走map,loader启动时写入,0(monitor)是合法值。 */
 static __always_inline u32 get_config(u32 key, u32 default_val) {
+    switch (key) {
+    case CFG_RISK_THRESHOLD:      return 70;
+    case CFG_PORT_SCAN_THRESHOLD: return 20;
+    case CFG_TIME_WINDOW_NS:      return 30;
+    case CFG_MAX_NEW_FILES:       return 100;
+    case CFG_NEW_FILE_WINDOW_NS:  return 30;
+    default: break;
+    }
     u32 *val = bpf_map_lookup_elem(&infer_config, &key);
     return val ? *val : default_val;
 }
@@ -375,19 +480,40 @@ static __always_inline void add_risk(u32 pid, u32 delta) {
     }
 }
 
+/* 敏感文件匹配(申报书"匹配/etc/shadow等路径,加分0-40")。
+ * 精确路径匹配而非宽前缀:原实现只比到/e/t/c//s即+40,
+ * 导致/etc/services /etc/sysconfig /etc/ssh等日常文件全部误加40分,
+ * risk_score普遍累积>=40使should_send_event提前PASS、过滤失效。
+ * 改为逐字符展开精确匹配真实敏感文件(对齐Tracee security_file_open列表)。 */
 static __always_inline int infer_sensitive_file(const char *filename, u32 pid) {
     if (!filename) return 0;
-    if (filename[0] == '/' && filename[1] == 'e' && filename[2] == 't' &&
-        filename[3] == 'c' && filename[4] == '/' && filename[5] == 's') {
+    /* /etc/shadow → +40 (凭证文件,最高危) */
+    if (filename[0]=='/' && filename[1]=='e' && filename[2]=='t' &&
+        filename[3]=='c' && filename[4]=='/' && filename[5]=='s' &&
+        filename[6]=='h' && filename[7]=='a' && filename[8]=='d' &&
+        filename[9]=='o' && filename[10]=='w') {
         add_risk(pid, 40); return 1;
     }
-    if (filename[0] == '/' && filename[1] == 'r' && filename[2] == 'o' &&
-        filename[3] == 'o' && filename[4] == 't') {
-        add_risk(pid, 30); return 1;
+    /* /etc/gshadow → +35 (组凭证) */
+    if (filename[0]=='/' && filename[1]=='e' && filename[2]=='t' &&
+        filename[3]=='c' && filename[4]=='/' && filename[5]=='g' &&
+        filename[6]=='s' && filename[7]=='h' && filename[8]=='a' &&
+        filename[9]=='d' && filename[10]=='o' && filename[11]=='w') {
+        add_risk(pid, 35); return 1;
     }
-    if (filename[0] == '/' && filename[1] == 'p' && filename[2] == 'r' &&
-        filename[3] == 'o' && filename[4] == 'c') {
-        add_risk(pid, 15); return 0;
+    /* /etc/sudoers → +40 (提权持久化,对齐Tracee sudoers_modification) */
+    if (filename[0]=='/' && filename[1]=='e' && filename[2]=='t' &&
+        filename[3]=='c' && filename[4]=='/' && filename[5]=='s' &&
+        filename[6]=='u' && filename[7]=='d' && filename[8]=='o' &&
+        filename[9]=='e' && filename[10]=='r' && filename[11]=='s') {
+        add_risk(pid, 40); return 1;
+    }
+    /* /root/.ssh → +30 (SSH密钥窃取,申报书关联规则T1048) */
+    if (filename[0]=='/' && filename[1]=='r' && filename[2]=='o' &&
+        filename[3]=='o' && filename[4]=='t' && filename[5]=='/' &&
+        filename[6]=='.' && filename[7]=='s' && filename[8]=='s' &&
+        filename[9]=='h') {
+        add_risk(pid, 30); return 1;
     }
     return 0;
 }

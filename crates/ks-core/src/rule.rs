@@ -80,7 +80,7 @@ pub enum Field {
     TargetPid,
     #[serde(rename = "signal")]
     Signal,
-    // E4.4 新增字段 (容器逃逸 / LKM 加载 / eBPF 篡改探针)
+    // 新增字段(容器逃逸、LKM加载、eBPF篡改探针)
     #[serde(rename = "module_name")]
     ModuleName,
     #[serde(rename = "prog_name")]
@@ -93,6 +93,8 @@ pub enum Field {
     CapEff,
     #[serde(rename = "action")]
     Action,
+    #[serde(rename = "event_type")]
+    EventType,
 }
 
 impl Field {
@@ -101,7 +103,7 @@ impl Field {
             self,
             Field::Pid | Field::Ppid | Field::Uid | Field::SyscallNr |
             Field::Sport | Field::Dport | Field::TargetPid | Field::Signal |
-            Field::FileBytes |
+            Field::FileBytes | Field::EventType |
             // E4.4: 容器逃逸数值字段
             Field::SourceNsInum | Field::TargetNsInum | Field::CapEff
         )
@@ -113,7 +115,7 @@ impl Field {
             Field::Comm | Field::Filename | Field::Args |
             Field::Saddr | Field::Daddr | Field::Proto |
             Field::Saddr6 | Field::Daddr6 | Field::Family |
-            // E4.4: LKM/eBPF 字符串字段
+            // LKM和eBPF字符串字段
             Field::ModuleName | Field::ProgName | Field::Action
         )
     }
@@ -145,6 +147,7 @@ impl Field {
             Field::TargetNsInum => "target_ns_inum",
             Field::CapEff => "cap_eff",
             Field::Action => "action",
+            Field::EventType => "event_type",
         }
     }
 
@@ -205,6 +208,9 @@ pub enum Operator {
     LessThanOrEqual,
     #[serde(rename = "not_equals")]
     NotEquals,
+    /// 值不匹配给定正则(用于"非私有IP"等反向匹配,规避Rust regex不支持look-around)
+    #[serde(rename = "not_regex")]
+    NotRegex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

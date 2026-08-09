@@ -27,8 +27,8 @@ pub mod syscall_nr {
     pub const RECVFROM: i32 = 45;
 }
 
-/// ARM64 架构的系统调用号跟 x86_64 不一样。
-/// 注意 ARM64 没有 fork()，只有 clone；unlink 也不存在，用 unlinkat 代替。
+/// ARM64架构的系统调用号跟x86_64不一样。
+/// 注意ARM64没有fork(),只有clone,unlink也不存在,用unlinkat代替。
 pub mod syscall_nr_aarch64 {
     pub const EXECVE: i32 = 221;
     pub const OPENAT: i32 = 56;
@@ -82,8 +82,8 @@ pub enum EventType {
     ProcSignal = 31,
 }
 
-/// TryFrom<u32> —— 从原始 u32 值反序列化 EventType。
-/// 不知道的值返回 Err，不静默吞掉。
+/// TryFrom<u32>,从原始u32值反序列化EventType。
+/// 不知道的值返回Err,不静默吞掉。
 impl TryFrom<u32> for EventType {
     type Error = ();
 

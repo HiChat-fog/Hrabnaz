@@ -20,13 +20,11 @@ struct freq_update_event {
     u64 duration_ns;
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, u32);
-    __type(value, u32);
-    __uint(max_entries, 16);
-} freq_thresholds SEC(".maps");
-
+/* 频率阈值(申报书第27段固定MVP值:file_ops>500勒索/net>100端口扫描/
+ * dns>50隧道/syscall>10000暴破/ptrace>3注入/signal>10)。
+ * 原为freq_thresholds ARRAY map但用户态从不写入,ARRAY默认0导致
+ * get_threshold的fallback永远不生效、阈值实际为0、所有进程首次操作即误标异常。
+ * 改为#define常量,单源零歧义。未来需运行时可配时再加map写入端。 */
 enum freq_threshold_key {
     TH_FILE_OPS_60S = 0, TH_NET_OPS_60S = 1, TH_DNS_OPS_60S = 2,
     TH_SYSCALL_60S = 3,  TH_PTRACE_60S = 4,  TH_SIGNAL_60S = 5,
@@ -36,8 +34,17 @@ enum freq_threshold_key {
 KS_EVENT_MAP(freq_events, 1024 * 1024);
 
 static __always_inline u32 get_threshold(u32 key, u32 default_val) {
-    u32 *val = bpf_map_lookup_elem(&freq_thresholds, &key);
-    return val ? *val : default_val;
+    switch (key) {
+    case TH_FILE_OPS_60S:  return 500;
+    case TH_NET_OPS_60S:   return 100;
+    case TH_DNS_OPS_60S:   return 50;
+    case TH_SYSCALL_60S:   return 10000;
+    case TH_PTRACE_60S:    return 3;
+    case TH_SIGNAL_60S:    return 10;
+    case TH_REPORT_EVERY:  return 100;
+    case TH_WINDOW_NS:     return 60;
+    default: return default_val;
+    }
 }
 
 static __always_inline void update_freq_counter_ex(void *ctx, u32 pid, u32 counter_type) {
@@ -99,16 +106,21 @@ static __always_inline void update_freq_counter_ex(void *ctx, u32 pid, u32 count
     if (fc->ptrace_count_60s   > get_threshold(TH_PTRACE_60S, 3))
         fc->anomaly_flags |= FREQ_ANOMALY_INJECTION;
 
-    if (fc->anomaly_flags > 0) {
+    /* 仅首次越过阈值时发送告警(申报书"仅首次越过阈值时发送告警以避免重复上报")。
+     * 之前未报过(REPORTED未置)且本次有异常位 → 发一次,置REPORTED。
+     * 窗口到期重置时anomaly_flags归零,REPORTED随之清,下个窗口可再报。 */
+    u32 anomaly_only = fc->anomaly_flags & ~FREQ_REPORTED;
+    if (anomaly_only > 0 && !(fc->anomaly_flags & FREQ_REPORTED)) {
         struct freq_anomaly_event *evt = KS_RESERVE(freq_events, struct freq_anomaly_event);
         if (!evt) goto report;
         fill_header(&evt->header, EVENT_FREQ_ANOMALY);
         evt->pid=pid; evt->syscall_count_60s=fc->syscall_count_60s;
         evt->file_op_count_60s=fc->file_op_count_60s; evt->net_op_count_60s=fc->net_op_count_60s;
         evt->dns_op_count_60s=fc->dns_op_count_60s; evt->ptrace_count_60s=fc->ptrace_count_60s;
-        evt->signal_count_60s=fc->signal_count_60s; evt->anomaly_flags=fc->anomaly_flags;
+        evt->signal_count_60s=fc->signal_count_60s; evt->anomaly_flags=anomaly_only;
         evt->duration_ns=now - fc->window_start_ns;
         KS_SUBMIT(ctx, freq_events, evt);
+        fc->anomaly_flags |= FREQ_REPORTED;
     }
 
 report:

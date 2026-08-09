@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -130,6 +131,7 @@ static const struct known_map known_maps[] = {
     {"risk_scores",       BPF_MAP_TYPE_HASH, 4, 4, 4096},
     {"block_decisions",   BPF_MAP_TYPE_HASH, 8, 16, 4096},  /* G2.1: block_key(8)/block_value(16) */
     {"protected_pids",   BPF_MAP_TYPE_HASH, 4, 1, 256},   /* 自身/系统pid豁免(防冷启动误杀) */
+    {"protected_comms",  BPF_MAP_TYPE_HASH, 16, 1, 64},   /* comm白名单豁免(enforce误杀sshd治理) */
     {"ip_whitelist",      BPF_MAP_TYPE_HASH, 4, 1, 256},
     {"net_conn_history",  BPF_MAP_TYPE_HASH, 12, 8, 8192},
     {"freq_counters",     BPF_MAP_TYPE_HASH, 4, 48, 4096},
@@ -363,15 +365,46 @@ static int load_prog(Elf *e, int sec_idx, const char *sec_name) {
         }
     }
 
-    /* 设置kern_version — 3.10需要 */
-    struct utsname uts;
+    /* 设置kern_version — 3.10/4.19要求kern_version==LINUX_VERSION_CODE。
+     * Debian/Ubuntu的uname -r常被改成"4.19.0-6"这种假版本号,但内核编译时的
+     * LINUX_VERSION_CODE用的是真实sublevel(如4.19.67)。kern_version不匹配会EINVAL。
+     * 解析顺序:先/proc/version(含真实version如"4.19.67-2"),回退uname。 */
     unsigned int kern_version = 0;
-    if (uname(&uts) == 0) {
-        unsigned int a = 0, b = 0, c = 0;
-        int matched = sscanf(uts.release, "%u.%u.%u", &a, &b, &c);
-        if (matched >= 2) {
-            if (matched == 2) c = 0;
-            kern_version = KERNEL_VERSION(a, b, c);
+    FILE *fv = fopen("/proc/version", "r");
+    if (fv) {
+        char vbuf[256];
+        if (fgets(vbuf, sizeof(vbuf), fv)) {
+            /* /proc/version格式: ... #1 SMP Debian 4.19.67-2+deb10u2 ...
+             * 找 # 后的 "x.y.z" 模式(真实sublevel) */
+            char *hash = strchr(vbuf, '#');
+            if (hash) {
+                /* #后格式如 "#1 SMP Debian 4.19.67-2+deb10u2"。找
+                 * "数字.数字.数字"模式(跳过build号1)。扫描#之后每个位置试sscanf。 */
+                char *p = hash + 1;
+                for (; *p; p++) {
+                    unsigned int a = 0, b = 0, c = 0;
+                    int matched = sscanf(p, "%u.%u.%u", &a, &b, &c);
+                    /* 要x.y.z且x合理(2~6),排除误匹配build号 */
+                    if (matched >= 2 && a >= 2 && a <= 9 && b < 100) {
+                        if (matched == 2) c = 0;
+                        kern_version = KERNEL_VERSION(a, b, c);
+                        break;
+                    }
+                }
+            }
+        }
+        fclose(fv);
+    }
+    /* 回退:用uname(可能给假sublevel,但比0强) */
+    if (kern_version == 0) {
+        struct utsname uts;
+        if (uname(&uts) == 0) {
+            unsigned int a = 0, b = 0, c = 0;
+            int matched = sscanf(uts.release, "%u.%u.%u", &a, &b, &c);
+            if (matched >= 2) {
+                if (matched == 2) c = 0;
+                kern_version = KERNEL_VERSION(a, b, c);
+            }
         }
     }
 
@@ -393,7 +426,12 @@ static int load_prog(Elf *e, int sec_idx, const char *sec_name) {
     /* 每次load前清空log_buf */
     log_buf[0] = '\0';
 
-    int fd = bpf_syscall(BPF_PROG_LOAD, &attr, sizeof(attr));
+    /* 传恰好到kern_version的attr size(44字节),而非sizeof(union bpf_attr)=144。
+     * 老内核(3.10/4.19)校验attr size,若大于其认识的结构会EINVAL(errno=22,
+     * verifier log空)。只传旧版字段(prog_type..kern_version),不含prog_name等
+     * 新字段。5.15+向前兼容接受小size。 */
+    size_t attr_size = offsetof(union bpf_attr, kern_version) + sizeof(unsigned int);
+    int fd = bpf_syscall(BPF_PROG_LOAD, &attr, attr_size);
     if (fd < 0) {
         fprintf(stderr, "[FAIL] program=%s errno=%d msg=%s\n", sec_name, errno, strerror(errno));
         dump_verifier_log_tail();

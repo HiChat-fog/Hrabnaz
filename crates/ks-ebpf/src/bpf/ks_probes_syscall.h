@@ -6,6 +6,14 @@ struct syscall_ctx {
     u64 start_ns;
     u32 pid;
     u32 syscall_nr;
+    /* execve 的 argv 必须在 sys_enter 读取（exec 前，argv 仍在原地址空间）。
+     * sys_exit 时 exec 已替换地址空间，原 argv 指针失效 → args 读空。
+     * 这里在 enter 时把 argv[0..4] 拼成字符串缓存，exit 时直接拷贝到事件。
+     * NOBTF(3.10) 不含此字段：verifier 对 map value 内大数组偏移访问失败，
+     * 该 tier 放弃 exec args 捕获（args 类规则在 3.10 不生效）。 */
+#ifndef KS_NOBTF
+    char exec_args[320];
+#endif
 };
 
 struct {
@@ -60,6 +68,29 @@ int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
     sctx.args[4] = ctx->args[4];
     sctx.args[5] = ctx->args[5];
 
+    /* execve: 在 sys_enter 读取 argv 字符串缓存（exec 前地址空间未替换）。
+     * 手动展开 5 次读取，编译期常量偏移，规避 verifier 变量偏移限制。
+     * 3.10 NOBTF verifier 对 map value 内数组偏移访问有 bug（value_size=64 off=64 越界），
+     * 该 tier 跳过 enter 缓存，exit 时 argv 已失效（args 空），args 类规则在 3.10 不生效。 */
+    if (syscall_nr == 59) {
+#ifndef KS_NOBTF
+        const char __user *const *argv_ptr = (const char __user *const *)sctx.args[1];
+        if (argv_ptr) {
+            const char __user *arg_ptr;
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[0]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args,        64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[1]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 64,   64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[2]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 128,  64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[3]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 192,  64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[4]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 256,  64, arg_ptr);
+        }
+#endif
+    }
+
     bpf_map_update_elem(&syscall_ctxs, &pid_tgid, &sctx, BPF_ANY);
     return 0;
 }
@@ -94,26 +125,20 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         const char __user *filename_ptr = (const char __user *)sctx->args[0];
         bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), filename_ptr);
 
-        // 3.10 verifier 无法追踪 map value 指针上的变量偏移 bounds，
-        // 手动展开 5 次调用，使用编译期常量偏移（0/64/128/192/256）。
-        const char __user *const *argv_ptr = (const char __user *const *)sctx->args[1];
-        if (argv_ptr) {
-            const char __user *arg_ptr;
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[0]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args,       64, arg_ptr);
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[1]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args + 64,  64, arg_ptr);
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[2]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args + 128, 64, arg_ptr);
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[3]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args + 192, 64, arg_ptr);
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[4]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(evt->args + 256, 64, arg_ptr);
-        }
+        /* argv 已在 sys_enter 缓存到 sctx->exec_args（exec 前读取）。
+         * 直接拷贝到事件，避免 sys_exit 时地址空间已替换导致 argv 失效读空。
+         * NOBTF(3.10) 跳过：verifier 对 map value 内 exec_args 数组偏移访问失败。 */
+#ifndef KS_NOBTF
+        __builtin_memcpy(evt->args, sctx->exec_args, sizeof(sctx->exec_args));
+#endif
 
         int verdict = infer_event(evt->header.pid, EVENT_PROCESS_EXEC,
                     (const char *)evt->filename, 0, 0, 0, 0);
         KS_MAYBE_BLOCK(evt->header.pid, verdict);
+        if (ks_should_drop(evt->header.pid, EVENT_PROCESS_EXEC,
+                           (const char *)evt->filename, verdict)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
         KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
@@ -139,6 +164,10 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         int verdict2 = infer_event(evt->header.pid, EVENT_FILE_OPEN,
                     (const char *)evt->filename, 0, 0, 0, 0);
         KS_MAYBE_BLOCK(evt->header.pid, verdict2);
+        if (ks_should_drop(evt->header.pid, EVENT_FILE_OPEN,
+                           (const char *)evt->filename, verdict2)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
         KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
@@ -184,6 +213,9 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         int verdict3 = infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
                     evt->daddr, evt->dport, evt->proto, 0);
         KS_MAYBE_BLOCK(evt->header.pid, verdict3);
+        if (ks_should_drop(evt->header.pid, EVENT_NET_CONNECT, NULL, verdict3)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
         KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
@@ -200,6 +232,9 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
         int verdict4 = infer_event(evt->header.pid, EVENT_PROC_PTRACE, NULL, 0,0,0, evt->target_pid);
         KS_MAYBE_BLOCK(evt->header.pid, verdict4);
+        if (ks_should_drop(evt->header.pid, EVENT_PROC_PTRACE, NULL, verdict4)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
         KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
@@ -216,6 +251,9 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
 
         int verdict5 = infer_event(evt->header.pid, EVENT_PROC_SIGNAL, NULL, 0,0,0, evt->target_pid);
         KS_MAYBE_BLOCK(evt->header.pid, verdict5);
+        if (ks_should_drop(evt->header.pid, EVENT_PROC_SIGNAL, NULL, verdict5)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
         KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }

@@ -6,18 +6,8 @@
 #define EVENT_TREE_EXIT    42
 #define EVENT_TREE_ANOMALY 43
 
-#define KS_EXE_PATH_LEN 256  /* A5: 64 → 256，覆盖典型系统路径 */
-
-struct process_node {
-    u32 pid; u32 ppid;
-    u8  comm[16];
-    u8  exe_path[KS_EXE_PATH_LEN];
-    u32 flags;
-    u32 risk_score;
-    u64 create_time;
-    u64 exit_time;
-    u32 _pad_node1, _pad_node2;
-};
+/* struct process_node / KS_EXE_PATH_LEN / process_tree map 已前移至 common.h,
+ * 供 enforce 安全门(ks_exe_path_suspicious)读 exe_path 判定伪装。此处不再定义。 */
 
 #define PROC_FLAG_ROOT      (1 << 0)
 #define PROC_FLAG_CONTAINER (1 << 1)
@@ -34,8 +24,6 @@ struct process_tree_event {
     u16 parent_risk, anomaly_type;
     u32 _pad_tree1, _pad_tree2;
 };
-
-KS_LRU_HASH_MAP(process_tree, u32, struct process_node, 65536);
 
 KS_EVENT_MAP(tree_events, 1024 * 1024);
 

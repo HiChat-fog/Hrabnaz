@@ -1,51 +1,63 @@
-//! LinuxBpfMapReader — 通过 aya::Ebpf 真实读取 BPF map 统计信息。
+//! LinuxBpfMapReader,通过aya::Ebpf真实读取BPF map统计信息与条目。
 //!
-//! Phase E1.2：用真实 LinuxBpfMapReader 替换 MockBpfMapReader，让 /api/v1/stats
-//! 端点能暴露 BPF map 真实统计（map_type + entry_count）。
+//! 持有Arc<Mutex<aya::Ebpf>>引用,与EbpfLoader共享同一个Ebpf实例。
+//! 5个共享map:risk_scores、ip_whitelist、net_conn_history、freq_counters、infer_config。
+//! 事件map(events/tree_events等)已被take_map移走,不在此读取。
 //!
-//! ## 设计
-//!
-//! - 持有 `Arc<Mutex<aya::Ebpf>>` 引用，与 `EbpfLoader` 共享同一个 Ebpf 实例。
-//!   `EbpfLoader` 在 `start_all` 末尾把 bpf 包成 `Arc<Mutex>`，并通过 `map_reader()`
-//!   暴露一个克隆给调用方。
-//! - 5 个事件 map（events/tree_events/freq_events/flow_events/filter_events）已被
-//!   `take_map` 移走，不在此读取；只读 5 个共享 map：
-//!     risk_scores / ip_whitelist / net_conn_history / freq_counters / infer_config
-//!
-//! ## 实现现状
-//!
-//! - `list_map_stats()`：通过 `MapData::info()` 读取真实 `map_type` 和 `max_entries`。
-//!   - ARRAY / PERCPU_ARRAY：`max_entries` == 实际 entry 数（所有槽位始终存在）。
-//!   - HASH / LRU_HASH：`max_entries` 是容量上限，实际 entry 数需 `iter().count()`
-//!     （TODO：需要按 map 名匹配 K/V 类型构造 `aya::maps::HashMap<K,V>`）。
-//! - `read_map()`：返回真实 `map_type`，但 `entries` 为空（同上 TODO）。
-//!
-//! ## aya API 扩展点
-//!
-//! 真实读取 entries 见 `aya::maps::HashMap::<&MapData, K, V>::try_from(md).iter()`，
-//! 需要按 map 名硬编码 K/V 类型（如 risk_scores: (u32, u64)）。当前仅返回统计信息，
-//! 不阻塞 E1.3 集成测试和 E1.4 端到端脚本。
+//! aya 0.14借用语义:bpf.map(name)返回Option<&Map>,HashMap::<&MapData,K,V>::try_from(&Map)
+//! 在锁内拿&Map后构造typed reader并iter()。HASH/LRU_HASH的entry_count用iter().count()真实计数,
+//! ARRAY/PERCPU_ARRAY用max_entries(所有槽位始终存在)。
 
 #![cfg(target_os = "linux")]
 
 use std::sync::{Arc, Mutex};
 
+use aya::maps::{Array, HashMap};
+use aya::Pod;
+use serde_json::{Value, json};
+
 use crate::loader::{BpfMapReader, MapSnapshot, MapStat};
 
-/// 5 个共享 map（事件 map 已被 `take_map` 移走，不在此读取）。
-/// 顺序与 `MockBpfMapReader::list_map_stats()` 保持一致，便于前端兼容。
+/// 5个共享map(事件map已被take_map移走,不在此读取)。
 const SHARED_MAPS: &[&str] = &[
     "risk_scores",
     "ip_whitelist",
     "net_conn_history",
     "freq_counters",
     "infer_config",
+    "protected_comms",
 ];
 
-/// 真实 BPF map 读取器 — 持有 `Arc<Mutex<aya::Ebpf>>` 共享 Ebpf 实例。
-///
-/// 线程安全：`Arc<Mutex<Ebpf>>` 是 Send+Sync（因 `aya::Ebpf` 是 Send），
-/// 满足 `BpfMapReader: Send + Sync` supertrait 要求。
+/// net_conn_history的key,跟common.h的struct net_conn_key字节级一致
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NetConnKey {
+    pid: u32,
+    daddr: u32,
+    dport: u16,
+    proto: u8,
+    _pad: u8,
+}
+unsafe impl Pod for NetConnKey {}
+
+/// freq_counters的value,跟common.h的struct freq_counter字节级一致
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct FreqCounter {
+    syscall_count_60s: u32,
+    file_op_count_60s: u32,
+    net_op_count_60s: u32,
+    dns_op_count_60s: u32,
+    ptrace_count_60s: u32,
+    signal_count_60s: u32,
+    last_update_ns: u64,
+    window_start_ns: u64,
+    anomaly_flags: u32,
+    _pad_freq1: u32,
+}
+unsafe impl Pod for FreqCounter {}
+
+/// 真实BPF map读取器,持有Arc<Mutex<aya::Ebpf>>共享Ebpf实例。
 pub struct LinuxBpfMapReader {
     bpf: Arc<Mutex<aya::Ebpf>>,
 }
@@ -55,10 +67,7 @@ impl LinuxBpfMapReader {
         Self { bpf }
     }
 
-    /// 从 `aya::maps::Map` enum 提取内部 `&MapData` 引用。
-    ///
-    /// `Map` 的每个 variant 都恰好包裹一个 `MapData`，用 `|` 模式合并所有分支。
-    /// 若 aya 未来新增 variant，编译器会在 `match` 穷尽性检查时报错，迫使我们更新。
+    /// 从aya::maps::Map提取内部&MapData引用(所有variant都只包一个MapData)。
     fn map_data_ref(map: &aya::maps::Map) -> &aya::maps::MapData {
         match map {
             aya::maps::Map::Array(md)
@@ -91,11 +100,9 @@ impl LinuxBpfMapReader {
             | aya::maps::Map::StackTraceMap(md)
             | aya::maps::Map::Unsupported(md)
             | aya::maps::Map::XskMap(md) => md,
-            // 穷尽匹配：aya 新增 variant 时编译器报错，避免静默漏处理。
         }
     }
 
-    /// 将 `aya::maps::MapType` 转为前端可读的字符串标签。
     fn map_type_str(t: aya::maps::MapType) -> &'static str {
         match t {
             aya::maps::MapType::Hash => "HASH",
@@ -132,17 +139,125 @@ impl LinuxBpfMapReader {
             aya::maps::MapType::StructOps => "STRUCT_OPS",
             aya::maps::MapType::Arena => "ARENA",
             aya::maps::MapType::Unspecified => "UNSPEC",
-            // MapType 是 #[non_exhaustive]，aya 新增 variant 时走此分支。
             _ => "OTHER",
         }
+    }
+
+    /// 按map名分发typed reader,锁内读条目并转JSON。
+    /// PERCPU map(freq_counters在common.h是普通LRU_HASH,非PERCPU)用普通HashMap读。
+    fn read_entries(&self, map_name: &str) -> (usize, Vec<Value>) {
+        let bpf = self.bpf.lock().expect("Ebpf Mutex中毒");
+        let map = match bpf.map(map_name) {
+            Some(m) => m,
+            None => return (0, Vec::new()),
+        };
+
+        match map_name {
+            "risk_scores" => {
+                if let Ok(hm) = HashMap::<_, u32, u32>::try_from(map) {
+                    let mut entries = Vec::new();
+                    for kv in hm.iter() {
+                        if let Ok((pid, score)) = kv {
+                            entries.push(json!({"pid": pid, "risk_score": score}));
+                        }
+                    }
+                    let n = entries.len();
+                    return (n, entries);
+                }
+            }
+            "ip_whitelist" => {
+                if let Ok(hm) = HashMap::<_, u32, u8>::try_from(map) {
+                    let mut entries = Vec::new();
+                    for kv in hm.iter() {
+                        if let Ok((ip, flag)) = kv {
+                            entries.push(json!({"ip": ip, "whitelisted": flag}));
+                        }
+                    }
+                    let n = entries.len();
+                    return (n, entries);
+                }
+            }
+            "net_conn_history" => {
+                if let Ok(hm) = HashMap::<_, NetConnKey, u64>::try_from(map) {
+                    let mut entries = Vec::new();
+                    for kv in hm.iter() {
+                        if let Ok((k, ts)) = kv {
+                            let daddr = k.daddr;
+                            let [b0, b1, b2, b3] = daddr.to_le_bytes();
+                            entries.push(json!({
+                                "pid": k.pid,
+                                "daddr": format!("{}.{}.{}.{}", b0, b1, b2, b3),
+                                "dport": k.dport,
+                                "proto": k.proto,
+                                "last_ns": ts,
+                            }));
+                        }
+                    }
+                    let n = entries.len();
+                    return (n, entries);
+                }
+            }
+            "freq_counters" => {
+                if let Ok(hm) = HashMap::<_, u32, FreqCounter>::try_from(map) {
+                    let mut entries = Vec::new();
+                    for kv in hm.iter() {
+                        if let Ok((pid, fc)) = kv {
+                            entries.push(json!({
+                                "pid": pid,
+                                "syscall_60s": fc.syscall_count_60s,
+                                "file_60s": fc.file_op_count_60s,
+                                "net_60s": fc.net_op_count_60s,
+                                "dns_60s": fc.dns_op_count_60s,
+                                "ptrace_60s": fc.ptrace_count_60s,
+                                "signal_60s": fc.signal_count_60s,
+                                "anomaly_flags": fc.anomaly_flags,
+                            }));
+                        }
+                    }
+                    let n = entries.len();
+                    return (n, entries);
+                }
+            }
+            "infer_config" => {
+                //ARRAY:所有槽位始终存在,max_entries即真实条目数,逐个读出非零配置
+                let md = Self::map_data_ref(map);
+                if let Ok(info) = md.info() {
+                    let max = info.max_entries() as usize;
+                    if let Ok(arr) = Array::<_, u32>::try_from(map) {
+                        let mut entries = Vec::new();
+                        for i in 0..max as u32 {
+                            if let Ok(v) = arr.get(&i, 0) {
+                                entries.push(json!({"idx": i, "value": v}));
+                            }
+                        }
+                        return (max, entries);
+                    }
+                }
+            }
+            "protected_comms" => {
+                if let Ok(hm) = HashMap::<_, [u8; 16], u8>::try_from(map) {
+                    let mut entries = Vec::new();
+                    for kv in hm.iter() {
+                        if let Ok((key, flag)) = kv {
+                            //16字节comm,截到首个\0
+                            let end = key.iter().position(|&b| b == 0).unwrap_or(16);
+                            let comm = String::from_utf8_lossy(&key[..end]).to_string();
+                            entries.push(json!({"comm": comm, "protected": flag}));
+                        }
+                    }
+                    let n = entries.len();
+                    return (n, entries);
+                }
+            }
+            _ => {}
+        }
+        (0, Vec::new())
     }
 }
 
 impl BpfMapReader for LinuxBpfMapReader {
     fn read_map(&self, map_name: &str) -> anyhow::Result<MapSnapshot> {
-        // 通过 aya 真实读取 map_type；entries 暂不实现（需要按 map 名匹配 K/V 类型）。
-        // TODO: 实现 entries 读取 — aya::maps::HashMap::<&MapData, K, V>::try_from(md).iter()
-        let bpf = self.bpf.lock().expect("Ebpf Mutex 中毒");
+        let bpf = self.bpf.lock().expect("Ebpf Mutex中毒");
         let map_type_str = bpf
             .map(map_name)
             .map(Self::map_data_ref)
@@ -150,32 +265,19 @@ impl BpfMapReader for LinuxBpfMapReader {
             .and_then(|info| info.map_type().ok())
             .map(Self::map_type_str)
             .unwrap_or("unknown");
+        drop(bpf);
+
+        let (count, _entries) = self.read_entries(map_name);
         Ok(MapSnapshot {
             name: map_name.to_string(),
             map_type: map_type_str.to_string(),
-            entry_count: 0,
+            entry_count: count,
             entries: vec![],
         })
     }
 
-    /// G2.4: 真实读取 map entries（按 map 名分发 typed reader）。
-    /// 真机阶段补全：risk_scores 等 map 的 typed reading 需用 aya::maps::HashMap
-    /// （aya 0.14 借用语义需 take_map owned MapData，当前 EbpfLoader.bpf 是
-    ///  Arc<Mutex<Ebpf>> 仅能 bpf.map(name) 借用，需重构 EbpfLoader 暴露 owned
-    ///  map clone 或改用 aya Ebpf::map_mut()）。
-    /// MockBpfMapReader 提供完整桩数据用于 CI 测试。
-    fn read_map_structured(&self, map_name: &str) -> Vec<serde_json::Value> {
-        let bpf = self.bpf.lock().expect("Ebpf Mutex 中毒");
-        let md = match bpf.map(map_name).map(Self::map_data_ref) {
-            Some(md) => md,
-            None => return Vec::new(),
-        };
-        log::debug!(
-            "map '{}' (type={:?}) typed reading 待真机阶段补全",
-            map_name,
-            md.info().and_then(|i| i.map_type()).ok()
-        );
-        Vec::new()
+    fn read_map_structured(&self, map_name: &str) -> Vec<Value> {
+        self.read_entries(map_name).1
     }
 
     fn list_maps(&self) -> Vec<String> {
@@ -183,35 +285,22 @@ impl BpfMapReader for LinuxBpfMapReader {
     }
 
     fn list_map_stats(&self) -> Vec<MapStat> {
-        let bpf = self.bpf.lock().expect("Ebpf Mutex 中毒");
+        //复用read_map拿真实entry_count(HASH类iter().count()),避免运维面板显示0条
+        //read_map内部已锁,这里不持锁,逐个map调一次。stats端点低频,可接受。
         SHARED_MAPS
             .iter()
-            .filter_map(|&name| {
-                let map = bpf.map(name)?;
-                let md = Self::map_data_ref(map);
-                match md.info() {
-                    Ok(info) => {
-                        let map_type_str =
-                            info.map_type().map(Self::map_type_str).unwrap_or("UNKNOWN");
-                        // max_entries 是 map 容量上限：
-                        // - ARRAY / PERCPU_ARRAY：max_entries == 实际 entry 数
-                        //   （所有槽位始终存在，无"空槽"概念）
-                        // - HASH / LRU_HASH：max_entries 是容量上限，
-                        //   实际 entry 数需 iter().count()。
-                        //   TODO: 对 HASH map 实现 iter().count() 真实计数
-                        //   （需按 map 名匹配 K/V 类型构造 aya::maps::HashMap<K,V>）
-                        let entry_count = info.max_entries() as usize;
-                        Some(MapStat {
-                            name: name.to_string(),
-                            map_type: map_type_str.to_string(),
-                            entry_count,
-                        })
-                    }
-                    Err(_) => Some(MapStat {
+            .map(|&name| {
+                match self.read_map(name) {
+                    Ok(snap) => MapStat {
+                        name: snap.name,
+                        map_type: snap.map_type,
+                        entry_count: snap.entry_count,
+                    },
+                    Err(_) => MapStat {
                         name: name.to_string(),
                         map_type: "UNKNOWN".to_string(),
                         entry_count: 0,
-                    }),
+                    },
                 }
             })
             .collect()
@@ -224,8 +313,9 @@ mod tests {
 
     #[test]
     fn shared_maps_count() {
-        assert_eq!(SHARED_MAPS.len(), 5);
+        assert_eq!(SHARED_MAPS.len(), 6);
         assert!(SHARED_MAPS.contains(&"risk_scores"));
         assert!(SHARED_MAPS.contains(&"infer_config"));
+        assert!(SHARED_MAPS.contains(&"protected_comms"));
     }
 }
