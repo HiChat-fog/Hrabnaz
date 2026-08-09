@@ -25,6 +25,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures-util = "0.3"
 # G1.3: watch 子命令用 HashSet<uuid::Uuid> 对告警去重
 uuid = { version = "1", features = ["v4", "serde"] }
+colored = "3.1.1"
+comfy-table = "8.0.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
