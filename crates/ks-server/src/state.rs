@@ -1,12 +1,6 @@
-//! D2: 共享状态 — 告警存储 + broadcast channel
+//! 共享状态,告警存储加broadcast channel。
 //!
-//! ServerState 持有：
-//! - RwLock<Vec<Alert>>：内存告警存储（FIFO 淘汰，上限 MAX_ALERTS）
-//! - broadcast::Sender<Alert>：实时推送通道（多订阅者）
-//! - map_reader：Phase E1.2 新增，BPF map 读取器（LinuxBpfMapReader / MockBpfMapReader），
-//!   供 /api/v1/stats 端点读取 5 个共享 map 的统计信息。
-//! - baseline_snapshots：G1.3 新增，z-score 基线快照（最近一次 consumed%50 周期触发时推送）
-//! - correlation_alerts：G1.3 新增，跨事件关联告警存储（FIFO，上限 MAX_CORR_ALERTS）
+//! ServerState持有RwLock<Vec<Alert>>(内存告警存储,FIFO淘汰,上限MAX_ALERTS)、broadcast::Sender<Alert>(实时推送通道,多订阅者)、map_reader(BPF map读取器LinuxBpfMapReader或MockBpfMapReader,供/api/v1/stats端点读5个共享map的统计)、baseline_snapshots(z-score基线快照,最近一次consumed%50周期触发时推送)、correlation_alerts(跨事件关联告警存储,FIFO,上限MAX_CORR_ALERTS)。
 
 use ks_core::alert::{Alert, AlertStatus};
 use ks_engine::baseline::BehaviorBaseline;
@@ -26,17 +20,15 @@ pub struct ServerState {
     pub alerts: RwLock<Vec<Alert>>,
     pub tx: broadcast::Sender<Alert>,
     pub tier_label: &'static str,
-    /// Phase E1.2：BPF map 读取器，供 /api/v1/stats 端点读取 map_stats。
-    /// - Linux + eBPF 已加载：Some(LinuxBpfMapReader)（读取真实 map_type/max_entries）
-    /// - 未加载或非 Linux：None（stats 端点返回空 map_stats 数组）
+    /// BPF map读取器,供/api/v1/stats端点读map_stats。Linux且eBPF已加载时为Some(LinuxBpfMapReader)读真实map_type/max_entries,未加载或非Linux时为None,stats端点返回空map_stats数组。
     pub map_reader: Option<Arc<dyn BpfMapReader + Send + Sync>>,
-    /// G1.3：z-score 基线快照 — start.rs 周期触发时（consumed%50）推送全量基线
+    /// z-score基线快照,start.rs周期触发时(consumed%50)推送全量基线。
     pub baseline_snapshots: RwLock<HashMap<u32, BehaviorBaseline>>,
-    /// G1.3：跨事件关联告警存储 — start.rs 每次产生 CorrelationAlert 时推送
+    /// 跨事件关联告警存储,start.rs每次产生CorrelationAlert时推送。
     pub correlation_alerts: RwLock<Vec<CorrelationAlert>>,
-    /// G4.1：EWMA 自适应检测器 — 与 start.rs 事件循环共享，供 feedback 端点调用
+    /// EWMA自适应检测器,与start.rs事件循环共享,供feedback端点调用。
     pub ml_detector: Arc<Mutex<AdaptiveDetector>>,
-    /// G2.2：用户态阻断管理器 — 供 REST 端点 (POST/DELETE /api/v1/block) 调用
+    /// 用户态阻断管理器,供REST端点(POST/DELETE /api/v1/block)调用。
     pub block_manager: Arc<Mutex<BlockManager>>,
 }
 
@@ -51,7 +43,7 @@ impl ServerState {
             map_reader: None,
             baseline_snapshots: RwLock::new(HashMap::new()),
             correlation_alerts: RwLock::new(Vec::with_capacity(256)),
-            ml_detector: Arc::new(Mutex::new(AdaptiveDetector::new())),
+            ml_detector: Arc::new(Mutex::new(AdaptiveDetector::from_env())),
             block_manager: Arc::new(Mutex::new(BlockManager::new())),
         }
     }
@@ -65,12 +57,12 @@ impl ServerState {
             map_reader: None,
             baseline_snapshots: RwLock::new(HashMap::new()),
             correlation_alerts: RwLock::new(Vec::with_capacity(256)),
-            ml_detector: Arc::new(Mutex::new(AdaptiveDetector::new())),
+            ml_detector: Arc::new(Mutex::new(AdaptiveDetector::from_env())),
             block_manager: Arc::new(Mutex::new(BlockManager::new())),
         }
     }
 
-    /// Phase E1.2：带 map_reader 的构造方法（start.rs 在 eBPF 加载成功后调用）。
+    /// 带map_reader的构造方法,start.rs在eBPF加载成功后调用。
     pub fn with_map_reader(
         tier: &'static str,
         map_reader: Arc<dyn BpfMapReader + Send + Sync>,
@@ -83,14 +75,14 @@ impl ServerState {
             map_reader: Some(map_reader),
             baseline_snapshots: RwLock::new(HashMap::new()),
             correlation_alerts: RwLock::new(Vec::with_capacity(256)),
-            ml_detector: Arc::new(Mutex::new(AdaptiveDetector::new())),
+            ml_detector: Arc::new(Mutex::new(AdaptiveDetector::from_env())),
             block_manager: Arc::new(Mutex::new(BlockManager::new())),
         }
     }
 
     pub async fn push_alert(&self, alert: Alert) {
-        // F3: 记录告警计数（按 severity 累加 ks_alerts_total）。
-        // severity 字符串与 ks-core::rule::Severity 的 Display 实现一致。
+        // 记录告警计数(按severity累加ks_alerts_total)。
+        // severity字符串与ks-core::rule::Severity的Display实现一致。
         crate::metrics::record_alert(alert.severity.to_string().as_str());
 
         {
@@ -122,8 +114,8 @@ impl ServerState {
         false
     }
 
-    /// G4.2: 更新告警反馈标记（误报/确认）。
-    /// 返回 Some(pid) 如果找到告警（供调用方调用 ml_detector.false_feedback）。
+    /// 更新告警反馈标记(误报或确认)。
+    /// 找到告警返回Some(pid),供调用方调用ml_detector.false_feedback。
     pub async fn update_feedback(&self, id: uuid::Uuid, is_false_positive: bool) -> Option<u32> {
         let mut store = self.alerts.write().await;
         if let Some(alert) = store.iter_mut().find(|a| a.id == id) {
@@ -136,8 +128,8 @@ impl ServerState {
         None
     }
 
-    /// G1.3: 推送关联告警到存储（FIFO 淘汰，上限 MAX_CORR_ALERTS）。
-    /// start.rs 在 correlation_engine.detect_correlations_with_tree 返回告警时调用。
+    /// 推送关联告警到存储(FIFO淘汰,上限MAX_CORR_ALERTS)。
+    /// start.rs在correlation_engine.detect_correlations_with_tree返回告警时调用。
     pub async fn push_correlation_alert(&self, alert: CorrelationAlert) {
         let mut store = self.correlation_alerts.write().await;
         if store.len() >= MAX_CORR_ALERTS {
@@ -146,20 +138,20 @@ impl ServerState {
         store.push(alert);
     }
 
-    /// G1.3: 列出最近 N 条关联告警（倒序，最新在前）。
+    /// 列出最近N条关联告警(倒序,最新在前)。
     pub async fn list_correlation_alerts(&self, limit: usize) -> Vec<CorrelationAlert> {
         let store = self.correlation_alerts.read().await;
         store.iter().rev().take(limit).cloned().collect()
     }
 
-    /// G1.3: 更新基线快照（全量替换）。
-    /// start.rs 在周期触发时（consumed%50）调用，把 BaselineManager.all_baselines() 推送过来。
+    /// 更新基线快照(全量替换)。
+    /// start.rs在周期触发时(consumed%50)调用,把BaselineManager.all_baselines()推送过来。
     pub async fn update_baselines(&self, baselines: HashMap<u32, BehaviorBaseline>) {
         let mut store = self.baseline_snapshots.write().await;
         *store = baselines;
     }
 
-    /// G1.3: 列出所有基线快照。
+    /// 列出所有基线快照。
     pub async fn list_baselines(&self) -> Vec<BehaviorBaseline> {
         let store = self.baseline_snapshots.read().await;
         store.values().cloned().collect()

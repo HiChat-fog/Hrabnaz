@@ -1,15 +1,8 @@
-//! F4 安全加固 — 鉴权中间件集成测试
+//! 鉴权中间件集成测试。
 //!
-//! 测试 `auth_middleware` 的 5 个核心场景：
-//! - 未携带 Authorization header → 401
-//! - 错误 token → 401
-//! - 正确 Bearer token → 200
-//! - `--no-auth` (enabled=false) 时所有端点放行 → 200
-//! - 白名单路径 /api/v1/health 免鉴权 → 200
+//! 测试auth_middleware的核心场景:未携带Authorization header返回401,错误token返回401,正确Bearer token返回200,--no-auth(enabled=false)时所有端点放行返回200,白名单路径/api/v1/health免鉴权返回200。
 //!
-//! 测试方式：用 `tower::ServiceExt::oneshot` 直接调用 axum Router，
-//! 无需启动真实 TCP 监听。Router 仅 layer auth_middleware（不含 audit/rate_limit），
-//! 专注验证鉴权逻辑。
+//! 测试方式:用tower::ServiceExt::oneshot直接调用axum Router,无需启动真实TCP监听。Router仅layer auth_middleware(不含audit/rate_limit),专注验证鉴权逻辑。
 
 use std::sync::Arc;
 
@@ -22,13 +15,13 @@ use ks_server::auth::{auth_middleware, AuthToken};
 use ks_server::routes::router;
 use ks_server::ServerState;
 
-/// 构建一个带 auth_middleware 的测试 Router。
+/// 构建一个带auth_middleware的测试Router。
 fn build_app(auth: AuthToken) -> axum::Router {
     let state: Arc<ServerState> = Arc::new(ServerState::with_tier("test"));
     router(state).layer(from_fn_with_state(auth, auth_middleware))
 }
 
-/// 发送一个 GET 请求到指定 URI，可选携带 Authorization header。
+/// 发送一个GET请求到指定URI,可选携带Authorization header。
 async fn send_get(uri: &str, auth_header: Option<&str>) -> StatusCode {
     let app = build_app(AuthToken::new("test-secret-token"));
     let mut builder = Request::builder().method("GET").uri(uri);
@@ -42,7 +35,7 @@ async fn send_get(uri: &str, auth_header: Option<&str>) -> StatusCode {
     response.status()
 }
 
-/// 1) 未携带 Authorization header 请求 /api/v1/alerts → 401
+/// 1)未携带Authorization header请求/api/v1/alerts返回401
 #[tokio::test]
 async fn test_no_token_returns_401() {
     let status = send_get("/api/v1/alerts", None).await;
@@ -54,7 +47,7 @@ async fn test_no_token_returns_401() {
     );
 }
 
-/// 2) 错误 token → 401
+/// 2)错误token返回401
 #[tokio::test]
 async fn test_wrong_token_returns_401() {
     let status = send_get("/api/v1/alerts", Some("Bearer wrong-token-xxx")).await;
@@ -66,7 +59,7 @@ async fn test_wrong_token_returns_401() {
     );
 }
 
-/// 3) 正确 Bearer token → 200
+/// 3)正确Bearer token返回200
 #[tokio::test]
 async fn test_correct_token_returns_200() {
     let status = send_get("/api/v1/alerts", Some("Bearer test-secret-token")).await;
@@ -78,7 +71,7 @@ async fn test_correct_token_returns_200() {
     );
 }
 
-/// 4) `--no-auth` (enabled=false) 时所有端点放行 → 200
+/// 4)--no-auth(enabled=false)时所有端点放行返回200
 #[tokio::test]
 async fn test_no_auth_flag_bypasses() {
     let app = build_app(AuthToken::disabled());
@@ -100,7 +93,7 @@ async fn test_no_auth_flag_bypasses() {
     );
 }
 
-/// 5) /api/v1/health 免鉴权 → 200（即使无 Authorization header）
+/// 5)/api/v1/health免鉴权返回200(即使无Authorization header)
 #[tokio::test]
 async fn test_health_no_auth_needed() {
     let status = send_get("/api/v1/health", None).await;
@@ -112,7 +105,7 @@ async fn test_health_no_auth_needed() {
     );
 }
 
-/// 6) /metrics 路径也免鉴权（F3 已存在该路由）
+/// 6)/metrics路径也免鉴权(已存在该路由)
 #[tokio::test]
 async fn test_metrics_no_auth_needed() {
     let status = send_get("/metrics", None).await;
@@ -124,12 +117,12 @@ async fn test_metrics_no_auth_needed() {
     );
 }
 
-/// 7) /version 路径免鉴权（注意：现有 routes.rs 没有 /version 路由，仅 /api/v1/version；
-///    此测试用 /api/v1/version 验证（非白名单）— 应返回 401。
-///    白名单中的 /version 路径无对应路由，会返回 404，验证白名单放行（非 401）。
+/// 7)/version路径免鉴权(注意:现有routes.rs没有/version路由,仅/api/v1/version;
+///    此测试用/api/v1/version验证(非白名单)应返回401。
+///    白名单中的/version路径无对应路由,会返回404,验证白名单放行(非401)。
 #[tokio::test]
 async fn test_api_v1_version_requires_auth() {
-    // /api/v1/version 不在白名单 — 应 401
+    // /api/v1/version不在白名单,应401
     let status = send_get("/api/v1/version", None).await;
     assert_eq!(
         status,
@@ -139,10 +132,10 @@ async fn test_api_v1_version_requires_auth() {
     );
 }
 
-/// 8) token 比对不应受前缀影响 — `Bearer test-secret-token` 后多空格 / 大小写敏感
+/// 8)token比对不应受前缀影响,Bearer test-secret-token后多空格或大小写敏感
 #[tokio::test]
 async fn test_token_case_sensitive() {
-    // 大小写敏感：`TEST-SECRET-TOKEN` ≠ `test-secret-token`
+    // 大小写敏感:TEST-SECRET-TOKEN不等于test-secret-token
     let status = send_get("/api/v1/alerts", Some("Bearer TEST-SECRET-TOKEN")).await;
     assert_eq!(
         status,
@@ -152,7 +145,7 @@ async fn test_token_case_sensitive() {
     );
 }
 
-/// 9) 缺少 "Bearer " 前缀（仅 token 字符串）→ 401
+/// 9)缺少Bearer前缀(仅token字符串)返回401
 #[tokio::test]
 async fn test_missing_bearer_prefix_returns_401() {
     let status = send_get("/api/v1/alerts", Some("test-secret-token")).await;
