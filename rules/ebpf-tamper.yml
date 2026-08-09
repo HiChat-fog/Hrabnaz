@@ -20,6 +20,11 @@
   description: "检测 BPF 程序被卸载/篡改 (event_type=82, 探针: kprobe/security_bpf_prog_free)"
   severity: critical
   conditions:
+    # 必须是真正的 BPF 卸载事件 (event_type=82)，避免 systemd/kill 的普通
+    # open/exec 事件因 comm 含 systemd 而误报。
+    - field: event_type
+      operator: equals
+      value: "82"
     - field: comm
       operator: regex
       value: "(bpftool|rmmod|systemd|kill|bpftool_rls)"

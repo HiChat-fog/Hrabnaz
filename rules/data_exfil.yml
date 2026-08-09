@@ -28,9 +28,10 @@
   description: "检测向非私有 IP 的高危端口建立连接 (可能的数据外传通道)"
   severity: high
   conditions:
+    # not_regex 规避 Rust regex 不支持 look-around：daddr 不匹配私有/回环地址
     - field: daddr
-      operator: regex
-      value: "^(?!10\\.)(?!192\\.168\\.)(?!172\\.(1[6-9]|2[0-9]|3[01])\\.).*$"
+      operator: not_regex
+      value: "^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|0\\.0\\.0\\.0)"
     - field: dport
       operator: regex
       value: "^(4444|1337|31337|5555|6666|6667|9999)$"
@@ -46,8 +47,8 @@
       operator: gt
       value: "1048576"
     - field: daddr
-      operator: regex
-      value: "^(?!10\\.)(?!192\\.168\\.)(?!172\\.(1[6-9]|2[0-9]|3[01])\\.).*$"
+      operator: not_regex
+      value: "^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|0\\.0\\.0\\.0)"
   alert_message: "检测到大于 1MB 的文件写入同时有外部网络连接，疑似数据外传"
   mitre_tactic: "TA0010"
   mitre_technique: "T1048"
