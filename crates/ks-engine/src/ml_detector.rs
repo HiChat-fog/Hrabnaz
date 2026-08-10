@@ -116,6 +116,10 @@ pub struct AdaptiveDetector {
     fixed_thresholds: FixedThresholds,
     /// 学习期截止(单调ns),0表示无学习期(回退到启动即告警)
     observe_until_ns: u64,
+    /// per-PID结构LRU上限:loadgen高频fork短命进程会致累计PID数爆炸,
+    /// 5个per-PID HashMap无淘汰则RSS无界增长(2核2G机器15分钟涨到1.4GB被OOM)。
+    /// 与aggregator/baseline/process_tree的max_pids对齐=10000。
+    max_pids: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +174,7 @@ impl AdaptiveDetector {
             cold_start_samples: COLD_START_SAMPLES,
             fixed_thresholds: FixedThresholds::default(),
             observe_until_ns: 0,
+            max_pids: 10_000,
         }
     }
 
@@ -276,6 +281,31 @@ impl AdaptiveDetector {
                 }
                 *count = 0;
             }
+        }
+
+        // LRU淘汰:per-PID HashMap随累计PID数无界增长(loadgen短命进程爆炸),
+        // 超max_pids时按window.timestamp_ns(最近活跃)升序删最不活跃PID的全部5表数据。
+        if self.current_windows.len() > self.max_pids {
+            self.evict_inactive_pids();
+        }
+    }
+
+    /// 淘汰最不活跃的PID:按current_windows的timestamp_ns升序删到降到max_pids*0.9,
+    /// 同步清理states(6维)/pid_sample_counts/threshold_multipliers/normal_samples_since_feedback。
+    fn evict_inactive_pids(&mut self) {
+        let target = self.max_pids.saturating_sub(self.max_pids / 10);
+        while self.current_windows.len() > target {
+            // 找最近活跃时间最早(最不活跃)的PID
+            let evict_pid = match self.current_windows.iter().min_by_key(|(_, w)| w.timestamp_ns) {
+                Some((p, _)) => *p,
+                None => break,
+            };
+            self.current_windows.remove(&evict_pid);
+            self.pid_sample_counts.remove(&evict_pid);
+            self.threshold_multipliers.remove(&evict_pid);
+            self.normal_samples_since_feedback.remove(&evict_pid);
+            // states是(pid,dim)复合key,删该PID全部6维
+            self.states.retain(|(p, _), _| *p != evict_pid);
         }
     }
 

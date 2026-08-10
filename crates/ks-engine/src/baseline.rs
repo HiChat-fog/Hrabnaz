@@ -221,25 +221,29 @@ impl BaselineManager {
             b.last_seen_ns = event.header.timestamp_ns;
         }
 
-        // 容量上限淘汰:per-PID结构随累计PID数无界增长(84核机器3小时见6.5万PID),
-        // 超过max_pids时删最不活跃的PID的全部per-PID数据。
-        if self.baselines.len() > self.max_pids {
+        // 容量上限淘汰:per-PID结构随累计PID数无界增长(84核机器3小时见6.5万PID)。
+        // 守卫查freq_history而非baselines:短命进程fork后活不到min_samples=5进不了baselines,
+        // 只在freq_history留1~2个snapshot,若查baselines.len()则淘汰永不触发,freq_history无界涨。
+        if self.freq_history.len() > self.max_pids {
             self.evict_inactive_pids();
         }
     }
 
-    /// 淘汰最不活跃的PID:按last_seen_ns升序删到baselines降到max_pids以下,
-    /// 同步清理freq_history/established_pids中对应entry,防止per-PID结构无界增长。
+    /// 淘汰最不活跃的PID:freq_history比baselines多(短命进程只进freq_history),
+    /// 所以以freq_history为淘汰主表,按其snapshot的timestamp_ns升序删最不活跃PID。
+    /// 同步清理baselines/established_pids中对应entry。
     fn evict_inactive_pids(&mut self) {
         let target = self.max_pids.saturating_sub(self.max_pids / 10);
-        while self.baselines.len() > target {
-            // 找last_seen最小的PID(最不活跃)
-            let evict_pid = match self.baselines.iter().min_by_key(|(_, b)| b.last_seen_ns) {
+        while self.freq_history.len() > target {
+            // 找freq_history里最早snapshot的PID(最不活跃)
+            let evict_pid = match self.freq_history.iter().min_by_key(|(_, snaps)| {
+                snaps.last().map(|s| s.timestamp_ns).unwrap_or(u64::MAX)
+            }) {
                 Some((p, _)) => *p,
                 None => break,
             };
-            self.baselines.remove(&evict_pid);
             self.freq_history.remove(&evict_pid);
+            self.baselines.remove(&evict_pid);
             self.established_pids.remove(&evict_pid);
         }
     }
