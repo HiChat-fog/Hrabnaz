@@ -43,13 +43,10 @@ pub struct AnomalyRelation {
     pub anomaly_type: String,
 }
 
-/// 维护进程拓扑图,支持从事件推导父子关系
 pub struct ProcessTreeManager {
     nodes: HashMap<u32, ProcessNode>,
     anomaly_patterns: Vec<AnomalyPattern>,
-    /// per-PID节点容量上限,超过时删最老节点,防止nodes随累计PID数无界增长。
     max_nodes: usize,
-    /// 单节点事件列表上限,超过时丢最老事件,防止单PID的events Vec无界增长。
     max_events_per_node: usize,
 }
 
@@ -126,7 +123,6 @@ impl ProcessTreeManager {
         ]
     }
 
-    /// 从事件更新进程树。PROCESS_EXEC创建或更新节点,PROCESS_EXIT标记退出。
     pub fn update_from_event(&mut self, event: &DecodedEvent) {
         let pid = event.header.pid;
         let ppid = event.header.ppid;
@@ -159,7 +155,6 @@ impl ProcessTreeManager {
                 node.exit_time_ns = timestamp_ns;
             }
             node.events.push(event.clone());
-            // 限制单节点事件列表长度,防止活跃PID的events Vec无界增长。
             while node.events.len() > self.max_events_per_node {
                 node.events.remove(0);
             }
@@ -199,8 +194,6 @@ impl ProcessTreeManager {
             }
         }
 
-        // 容量上限淘汰:nodes随累计PID数无界增长(84核机器3小时见6.5万PID),
-        // 超过max_nodes时删最老(create_time_ns最小)的节点。
         if self.nodes.len() > self.max_nodes {
             let target = self.max_nodes.saturating_sub(self.max_nodes / 10);
             while self.nodes.len() > target {
@@ -217,7 +210,6 @@ impl ProcessTreeManager {
         self.nodes.get(&pid)
     }
 
-    /// BFS遍历进程树
     pub fn get_family(&self, root_pid: u32) -> Option<ProcessFamily> {
         let root = self.nodes.get(&root_pid)?;
         if root.events.is_empty() && root.children.is_empty() {
@@ -306,7 +298,6 @@ impl ProcessTreeManager {
             .collect()
     }
 
-    /// 基于进程族的事件链还原(升级版chain.rs)
     pub fn reconstruct_tree_attack_chain(&self, family: &ProcessFamily) -> Option<TreeAttackChain> {
         if family.all_events.is_empty() {
             return None;

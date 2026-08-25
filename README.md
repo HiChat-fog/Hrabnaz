@@ -68,9 +68,12 @@ systemd部署用deploy/install.sh,Type=notify,capability限到CAP_BPF、CAP_PERF
 
 ## 现状
 
-- 5 tier eBPF编译通过,在6.17真机和5.15 Ubuntu 22.04 KVM上端到端跑过,事件、告警、哈希链闭环;3.10无BTF的CentOS 7通过C loader跑通
+- 5 tier eBPF 编译通过,在6.17真机和5.15 Ubuntu 22.04 KVM上端到端跑过,事件、告警、哈希链闭环;3.10无BTF的CentOS 7、4.19无BTF的Debian 10通过C loader跑通
+- 2026-08-13 三台云主机端到端回归:3.10 CentOS7(完整 Rust 链路,17650+事件/5092+告警/replay 23579条链完整)、5.15 Ubuntu(1566告警)、6.1 Debian(62告警),e2e-modern 全量断言 EXIT=0,详见 ks-test-evidence/perf-2026-08-13/
 - 5.15上monitor模式45秒soak跑34660事件、778告警、0次SIGKILL,稳定收尾
-- 用户态引擎和12个攻击场景的e2e测试在cargo test里,不开root也能跑
-- 还没做的:5.15和6.1两个内核的对照性能数据;内核态阻断enforce模式(KS_ENFORCE=1)已验证能真杀进程,但冷启动分类器对高频系统进程(sshd、cron)会误判verdict为2,需配合基线建立后再用,默认monitor只告警不杀
+- 用户态引擎和12个攻击场景的e2e测试在cargo test里,不开root也能跑(167个测试)
+- 长稳已验证:8月修复ml_detector/baseline表膨胀OOM(加LRU+淘汰守卫),RSS 1.4GB→3.9MB,误报150万→33
+- enforce模式(KS_ENFORCE=1)已实现多层冷启动防护:protected_pids(自身+父进程链+pid 1)硬豁免、protected_comms关键系统进程白名单(sshd/cron等,含exe_path反伪装)、KS_ENFORCE_WARMUP_SEC干跑期(默认120s,期间不主动杀)、KS_ENFORCE_KILL_THRESHOLD独立kill阈值(默认70,对齐申报书)。真机验证能SIGKILL触发进程;默认仍monitor只告警不杀
+- 三机对照性能数据已采集(3.10/5.15/6.1,见 ks-test-evidence/perf-2026-08-05/):优化后用户态吞吐 1197-1977 events/s,detector_match 单事件 1.12-2.24μs,内核侧捕获 13.6-13.8万 syscall/s;瓶颈定位在用户态单消费者消费,详见 docs/performance-design.md §6
 
 # 

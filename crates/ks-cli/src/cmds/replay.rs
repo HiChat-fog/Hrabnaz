@@ -331,7 +331,6 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
         for (tactic, techniques) in &mitre_tags {
             let phase = mitre_phase_name(tactic);
             println!("  {} ({})", tactic, phase);
-            // 同一 tactic 下多个告警可能命中相同 technique,去重后按命中次数显示
             let mut unique: BTreeMap<String, usize> = BTreeMap::new();
             for tech in techniques {
                 *unique.entry(tech.clone()).or_insert(0) += 1;
@@ -353,7 +352,6 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
         println!("  从离散告警中还原攻击者的行为链:");
         println!();
 
-        // ASCII时间线(申报书第45行):告警按时间戳分桶,sparkline展示密度分布
         let mut timed_ts: Vec<u64> = attack_chains.iter().filter_map(|e| e.ts).collect();
         if !timed_ts.is_empty() {
             timed_ts.sort_unstable();

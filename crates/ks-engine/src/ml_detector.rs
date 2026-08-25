@@ -1,29 +1,15 @@
-//! EWMA在线学习自适应检测器。
-//!
-//! 申报书依据:后续将在真实内核上验证后,逐步引入基线偏离检测的自适应阈值替代硬编码分数。
-//!
-//! 跟baseline.rs的BaselineManager(滑动窗口z-score)互补:BaselineManager用固定60s窗口,周期性重算mean和stddev,适合稳定基线;AdaptiveDetector用EWMA指数衰减,对趋势变化响应更快,适合渐变型攻击。
-//!
-//! 双模型并行取并集,任一触发即告警,severity取较高。冷启动(样本不足5个)用固定阈值fallback,样本充足后切EWMA。
-
 use crate::aggregator::DecodedEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// EWMA衰减系数(0 < alpha < 1),alpha越大越偏向新数据。
-/// 默认0.3,新数据权重30%,约7个样本后旧数据权重低于5%。
 const DEFAULT_ALPHA: f64 = 0.3;
 
-/// 冷启动样本数,少于此数时用固定阈值,不依赖EWMA统计。
 const COLD_START_SAMPLES: usize = 5;
 
-/// EWMA z-score告警阈值,跟BaselineManager一致,2σ。
 const DEFAULT_Z_THRESHOLD: f64 = 2.0;
 
-/// 误报反馈后阈值提升比例,每次误报提升10%。
 const FALSE_POSITIVE_THRESHOLD_BOOST: f64 = 1.1;
 
-/// 误报反馈后阈值衰减,每100个正常样本衰减回1.0。
 const THRESHOLD_DECAY_INTERVAL: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -65,9 +51,7 @@ pub struct AnomalyResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnomalyModel {
-    /// EWMA衰减模型(样本充足时)
     Ewma,
-    /// 冷启动固定阈值(样本不足时fallback)
     ColdStart,
 }
 
@@ -80,7 +64,6 @@ pub struct MlDimensionAnomaly {
     pub threshold: f64,
 }
 
-/// 窗口内频率快照,跟baseline.rs的FreqSnapshot类似但独立。
 #[derive(Debug, Clone, Copy, Default)]
 struct WindowSnapshot {
     syscall_count: u32,
@@ -94,31 +77,19 @@ struct WindowSnapshot {
 
 const WINDOW_DURATION_NS: u64 = 60_000_000_000;
 
-/// 学习期默认180s:启动后这段时间内detect只更新EWMA不告警,让模型吸收真实负载
-/// 申报书"训练期建立基线、检测期保持基线稳定"的落地。180s覆盖3个60s窗口,EWM初稳
 const DEFAULT_OBSERVE_SEC: u64 = 180;
 
 pub struct AdaptiveDetector {
-    /// (pid, dimension)到EWMA状态的映射
     states: HashMap<(u32, MlDimension), EwmaState>,
-    /// pid到当前窗口计数的映射
     current_windows: HashMap<u32, WindowSnapshot>,
-    /// pid到样本总数的映射,用于冷启动判断
     pid_sample_counts: HashMap<u32, usize>,
-    /// pid到阈值调整系数的映射,误报反馈后大于1.0,正常样本累积后衰减回1.0
     threshold_multipliers: HashMap<u32, f64>,
-    /// pid到自上次误报反馈后正常样本计数的映射,用于阈值衰减
     normal_samples_since_feedback: HashMap<u32, usize>,
     alpha: f64,
     z_threshold: f64,
     cold_start_samples: usize,
-    /// 固定阈值,冷启动fallback,跟BaselineManager的FixedThresholds一致
     fixed_thresholds: FixedThresholds,
-    /// 学习期截止(单调ns),0表示无学习期(回退到启动即告警)
     observe_until_ns: u64,
-    /// per-PID结构LRU上限:loadgen高频fork短命进程会致累计PID数爆炸,
-    /// 5个per-PID HashMap无淘汰则RSS无界增长(2核2G机器15分钟涨到1.4GB被OOM)。
-    /// 与aggregator/baseline/process_tree的max_pids对齐=10000。
     max_pids: usize,
 }
 
@@ -133,7 +104,6 @@ pub struct FixedThresholds {
 }
 
 impl Default for FixedThresholds {
-    /// 申报书固定阈值fallback:syscall5000/60s、file_ops500、net_ops100、dns_ops50、ptrace3、signal10。
     fn default() -> Self {
         Self {
             syscall_60s: 5000,
@@ -146,7 +116,6 @@ impl Default for FixedThresholds {
     }
 }
 
-/// 读/proc/uptime得boot起算的单调ns,跟bpf_ktime_get_ns同源。
 fn boot_monotonic_ns() -> u64 {
     std::fs::read_to_string("/proc/uptime")
         .ok()
@@ -184,8 +153,6 @@ impl AdaptiveDetector {
         d
     }
 
-    /// 按配置构造:阈值可调(默认对齐申报书5000/500/100/50/3/10),学习期可开关。
-    /// observe_sec=0表示无学习期;>0时启动后该秒数内detect只更新EWMA不告警。
     pub fn with_config(fixed_thresholds: FixedThresholds, observe_sec: u64) -> Self {
         let mut d = Self::new();
         d.fixed_thresholds = fixed_thresholds;
@@ -195,14 +162,10 @@ impl AdaptiveDetector {
         d
     }
 
-    /// 当前是否处于学习期(只更新EWMA不告警)。
     pub fn in_observe_period(&self) -> bool {
         self.observe_until_ns > 0 && boot_monotonic_ns() < self.observe_until_ns
     }
 
-    /// 从环境变量构造,供start.rs/ServerState统一调用。
-    /// KS_ML_OBSERVE_SEC:学习期秒数(默认180,0=无学习期)
-    /// KS_ML_SYSCALL_60S等:覆盖各维固定阈值(默认对齐申报书)
     pub fn from_env() -> Self {
         let mut thresholds = FixedThresholds::default();
         if let Ok(v) = std::env::var("KS_ML_SYSCALL_60S") {
@@ -227,7 +190,6 @@ impl AdaptiveDetector {
         Self::with_config(thresholds, observe_sec)
     }
 
-    /// 每个事件都要调用,更新当前窗口计数,窗口满60s时提交EWMA。
     pub fn update_from_event(&mut self, event: &DecodedEvent) {
         let pid = event.header.pid;
         let ts = event.header.timestamp_ns;
@@ -238,7 +200,6 @@ impl AdaptiveDetector {
         let is_ptrace = event.header.event_type == 30;
         let is_signal = event.header.event_type == 31;
 
-        // 取出当前窗口(Copy类型,避免借用冲突)
         let mut window = self.current_windows.get(&pid).copied().unwrap_or_default();
         if window.timestamp_ns == 0 {
             window.timestamp_ns = ts;
@@ -272,7 +233,6 @@ impl AdaptiveDetector {
         }
         self.current_windows.insert(pid, window);
 
-        // 正常样本累积,阈值衰减
         if let Some(count) = self.normal_samples_since_feedback.get_mut(&pid) {
             *count += 1;
             if *count >= THRESHOLD_DECAY_INTERVAL {
@@ -283,19 +243,14 @@ impl AdaptiveDetector {
             }
         }
 
-        // LRU淘汰:per-PID HashMap随累计PID数无界增长(loadgen短命进程爆炸),
-        // 超max_pids时按window.timestamp_ns(最近活跃)升序删最不活跃PID的全部5表数据。
         if self.current_windows.len() > self.max_pids {
             self.evict_inactive_pids();
         }
     }
 
-    /// 淘汰最不活跃的PID:按current_windows的timestamp_ns升序删到降到max_pids*0.9,
-    /// 同步清理states(6维)/pid_sample_counts/threshold_multipliers/normal_samples_since_feedback。
     fn evict_inactive_pids(&mut self) {
         let target = self.max_pids.saturating_sub(self.max_pids / 10);
         while self.current_windows.len() > target {
-            // 找最近活跃时间最早(最不活跃)的PID
             let evict_pid = match self.current_windows.iter().min_by_key(|(_, w)| w.timestamp_ns) {
                 Some((p, _)) => *p,
                 None => break,
@@ -304,7 +259,6 @@ impl AdaptiveDetector {
             self.pid_sample_counts.remove(&evict_pid);
             self.threshold_multipliers.remove(&evict_pid);
             self.normal_samples_since_feedback.remove(&evict_pid);
-            // states是(pid,dim)复合key,删该PID全部6维
             self.states.retain(|(p, _), _| *p != evict_pid);
         }
     }
@@ -338,9 +292,6 @@ impl AdaptiveDetector {
         *self.pid_sample_counts.entry(pid).or_insert(0) += 1;
     }
 
-    /// 检测当前窗口的异常。
-    /// 学习期内只更新EWMA不告警(返回None),让模型吸收真实负载。
-    /// 冷启动(窗口数少于cold_start_samples)用固定阈值,样本充足后用EWMA z-score。
     pub fn detect(&self, pid: u32) -> Option<AnomalyResult> {
         if self.in_observe_period() {
             return None;
@@ -446,8 +397,6 @@ impl AdaptiveDetector {
         })
     }
 
-    /// 误报反馈:标记某pid的告警为误报,提升其阈值10%。
-    /// 后续正常样本累积100个后阈值衰减回原值。
     pub fn false_feedback(&mut self, pid: u32, is_false_positive: bool) {
         if is_false_positive {
             let mult = self.threshold_multipliers.entry(pid).or_insert(1.0);
@@ -456,17 +405,14 @@ impl AdaptiveDetector {
         }
     }
 
-    /// 获取某pid的EWMA状态,调试或展示用。
     pub fn get_state(&self, pid: u32, dim: MlDimension) -> Option<&EwmaState> {
         self.states.get(&(pid, dim))
     }
 
-    /// 获取某pid的阈值调整系数,调试或展示用。
     pub fn get_threshold_multiplier(&self, pid: u32) -> f64 {
         self.threshold_multipliers.get(&pid).copied().unwrap_or(1.0)
     }
 
-    /// 窗口数,调试或展示用。
     pub fn window_count(&self, pid: u32) -> usize {
         self.pid_sample_counts.get(&pid).copied().unwrap_or(0)
     }
@@ -501,14 +447,12 @@ mod tests {
         let pid = 1000;
         let base_ts = 1_000_000_000;
 
-        // 模拟10个60s窗口,每窗口100 syscall
         for i in 0..10 {
             for j in 0..100 {
                 let ts = base_ts + i * WINDOW_DURATION_NS + j * 1_000_000;
                 let event = make_event(i * 100 + j, pid, 1, "test", ts);
                 det.update_from_event(&event);
             }
-            // 强制提交窗口(除最后一个)
             if i < 9 {
                 let ts = base_ts + (i + 1) * WINDOW_DURATION_NS;
                 let event = make_event(999, pid, 1, "test", ts);
@@ -518,13 +462,11 @@ mod tests {
 
         let state = det.get_state(pid, MlDimension::SyscallFrequency).unwrap();
         assert!(state.sample_count >= 9);
-        // EWMA均值应接近100(但可能因窗口提交计数偏移略有偏差)
         assert!(
             state.mean > 50.0 && state.mean < 150.0,
             "EWMA mean should be near 100, got {}",
             state.mean
         );
-        // 正常行为不应触发告警
         let result = det.detect(pid);
         assert!(
             result.is_none(),
@@ -539,21 +481,18 @@ mod tests {
         let pid = 2000;
         let base_ts = 1_000_000_000;
 
-        // 仅2个窗口(少于cold_start_samples=5)
         for i in 0..2 {
             for j in 0..200 {
                 let ts = base_ts + i * WINDOW_DURATION_NS + j * 1_000_000;
                 let event = make_event(i * 200 + j, pid, 1, "test", ts);
                 det.update_from_event(&event);
             }
-            // 强制提交每个窗口
             let ts = base_ts + (i + 1) * WINDOW_DURATION_NS;
             let event = make_event(999, pid, 1, "test", ts);
             det.update_from_event(&event);
         }
 
         let result = det.detect(pid);
-        // 200 syscall远低于5000固定阈值,不告警
         assert!(
             result.is_none(),
             "Cold start with low freq should not alert"
@@ -568,7 +507,6 @@ mod tests {
         let pid = 3000;
         let base_ts = 1_000_000_000;
 
-        // 训练阶段:6个窗口,每窗口50 file ops(正常)
         for i in 0..6 {
             for j in 0..50 {
                 let ts = base_ts + i * WINDOW_DURATION_NS + j * 1_000_000;
@@ -582,11 +520,9 @@ mod tests {
             }
         }
 
-        // 正常阶段不应告警
         let normal = det.detect(pid);
         assert!(normal.is_none(), "Normal file ops should not alert");
 
-        // 攻击阶段:一个窗口内600 file ops(超过固定阈值500)
         for j in 0..600 {
             let ts = base_ts + 7 * WINDOW_DURATION_NS + j * 1_000_000;
             let event = make_event(j, pid, 10, "ransomware", ts);
@@ -611,17 +547,14 @@ mod tests {
         let mut det = AdaptiveDetector::new();
         let pid = 4000;
 
-        // 初始阈值系数1.0
         assert!((det.get_threshold_multiplier(pid) - 1.0).abs() < 0.001);
 
-        // 误报反馈,阈值提升10%
         det.false_feedback(pid, true);
         assert!(
             (det.get_threshold_multiplier(pid) - 1.1).abs() < 0.001,
             "Threshold should be 1.1 after one false positive"
         );
 
-        // 再次误报到1.21
         det.false_feedback(pid, true);
         assert!(
             (det.get_threshold_multiplier(pid) - 1.21).abs() < 0.001,
@@ -634,12 +567,10 @@ mod tests {
         let mut det = AdaptiveDetector::new();
         let pid = 5000;
 
-        // 两次误报,阈值1.21
         det.false_feedback(pid, true);
         det.false_feedback(pid, true);
         assert!((det.get_threshold_multiplier(pid) - 1.21).abs() < 0.001);
 
-        // 累积100个正常样本,阈值衰减回1.1
         for _ in 0..100 {
             det.update_from_event(&make_event(1, pid, 1, "test", 1_000_000_000));
         }
@@ -656,7 +587,6 @@ mod tests {
         let pid = 6000;
         let base_ts = 1_000_000_000;
 
-        // 训练:6窗口正常DNS(每窗口5次)
         for i in 0..6 {
             for j in 0..5 {
                 let ts = base_ts + i * WINDOW_DURATION_NS + j * 10_000_000;
@@ -670,10 +600,8 @@ mod tests {
             }
         }
 
-        // 正常不告警
         assert!(det.detect(pid).is_none());
 
-        // DNS隧道攻击:60次DNS(超过固定阈值50)
         for j in 0..60 {
             let ts = base_ts + 7 * WINDOW_DURATION_NS + j * 1_000_000;
             let event = make_event(j, pid, 24, "dns_tunnel", ts);
@@ -693,13 +621,10 @@ mod tests {
 
     #[test]
     fn test_dual_model_complementarity() {
-        // 验证EWMA和BaselineManager互补:
-        // EWMA对渐变型攻击(逐步增加频率)更敏感
         let mut det = AdaptiveDetector::new();
         let pid = 7000;
         let base_ts = 1_000_000_000;
 
-        // 训练:6窗口,每窗口50 syscall
         for i in 0..6 {
             for j in 0..50 {
                 let ts = base_ts + i * WINDOW_DURATION_NS + j * 1_000_000;
@@ -713,24 +638,18 @@ mod tests {
             }
         }
 
-        // 渐变攻击:窗口7=80, 窗口8=120, 窗口9=200
-        // EWMA应在第8或9窗口检测到(均值逐步上升但z-score超标)
         for (w, count) in [(7, 80), (8, 120), (9, 200)] {
             for j in 0..count {
                 let ts = base_ts + w * WINDOW_DURATION_NS + j * 1_000_000;
                 let event = make_event(w * 200 + j, pid, 1, "attack", ts);
                 det.update_from_event(&event);
             }
-            // 提交窗口
             let next_ts = base_ts + (w + 1) * WINDOW_DURATION_NS;
             let event = make_event(9999, pid, 1, "attack", next_ts);
             det.update_from_event(&event);
         }
 
         let _result = det.detect(pid);
-        // 200 syscall远低于5000固定阈值,但EWMA应检测到偏离
-        // 注意:可能因为窗口提交逻辑,z-score可能或可能不超2.0
-        // 关键验证:EWMA状态已更新且样本数大于等于5
         let state = det.get_state(pid, MlDimension::SyscallFrequency).unwrap();
         assert!(state.sample_count >= 8, "Should have 8+ EWMA samples");
         assert!(

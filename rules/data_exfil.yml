@@ -1,17 +1,3 @@
-# 检测规则 — 数据窃取
-#
-# 数据窃取特征:
-#   - 读取大量敏感文件后建立外部网络连接
-#   - 通过 DNS/HTTP/FTP 等协议将数据传输到外部服务器
-#
-# 重要说明:
-#   当前规则引擎仅支持单事件匹配 (AND 条件在同一事件中)。
-#   跨事件关联 (如 "读文件 A 后连接 IP B") 由异常评分引擎处理:
-#   - anomaly_score 对文件访问 + 网络外连的组合加权
-#   - chain.reconstruct() 按 PID 分组还原完整的窃取链
-#
-# MITRE ATT&CK: TA0010 数据窃取
-
 - name: "敏感日志文件访问"
   description: "检测对系统日志目录的异常访问 (可能为数据窃取做准备)"
   severity: medium
@@ -19,7 +5,6 @@
     - field: filename
       operator: regex
       value: "^/var/log/(auth|secure|syslog|audit)"
-    # 注: 仅检测认证/安全相关日志，避免误报正常运维操作
   alert_message: "检测到对安全相关日志文件的访问，可能为数据窃取做准备"
   mitre_tactic: "TA0010"
   mitre_technique: "T1005"
@@ -28,7 +13,6 @@
   description: "检测向非私有 IP 的高危端口建立连接 (可能的数据外传通道)"
   severity: high
   conditions:
-    # not_regex 规避 Rust regex 不支持 look-around：daddr 不匹配私有/回环地址
     - field: daddr
       operator: not_regex
       value: "^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|0\\.0\\.0\\.0)"

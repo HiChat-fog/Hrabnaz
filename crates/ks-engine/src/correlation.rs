@@ -1,6 +1,3 @@
-//! 跨事件关联引擎,补足单事件规则检测不到的"读/etc/shadow后外连"这类多步攻击。
-//! 不替代rule.rs,而是在其之上做第二层检测。
-
 use crate::aggregator::DecodedEvent;
 use crate::process_tree::ProcessTreeManager;
 use serde::{Deserialize, Serialize};
@@ -56,17 +53,12 @@ struct PartialAlert {
     confidence: f64,
 }
 
-/// 维护滑动窗口,检查新事件是否与窗口内的历史事件形成关联模式
 pub struct CorrelationEngine {
     event_window: VecDeque<DecodedEvent>,
     window_size_secs: u64,
     rules: Vec<CorrelationRule>,
     sequence_trackers: HashMap<(usize, u32), SequenceTracker>,
-    /// per-(rule,pid) tracker容量上限。超过时按last_step_timestamp_ns删最老的,
-    /// 防止sequence_trackers随累计PID数无界增长(84核机器见3.8万PID,RSS涨到3.7GB)。
     max_trackers: usize,
-    /// event_window容量上限。check_window_correlation每事件全量扫描window(O(n)),
-    /// 密集事件下window堆到数万条使单事件延迟从38μs涨到90μs。限制规模保检测语义不变。
     max_window_events: usize,
 }
 
@@ -245,13 +237,10 @@ impl CorrelationEngine {
         self.rules.push(rule);
     }
 
-    /// 新事件进来,入窗口,清过期,检查所有规则
     pub fn detect_correlations(&mut self, event: &DecodedEvent) -> Vec<CorrelationAlert> {
         self.detect_correlations_with_tree(event, None)
     }
 
-    /// 带进程树的关联检测,ProcessTree规则需要查询进程树获取父进程信息。
-    /// 原detect_correlations调用此方法并传None,跳过ProcessTree规则,向后兼容。
     pub fn detect_correlations_with_tree(
         &mut self,
         event: &DecodedEvent,
@@ -267,14 +256,9 @@ impl CorrelationEngine {
                 break;
             }
         }
-        // 容量上限淘汰:压测密集事件下window会堆到数万条,check_window_correlation
-        // 每事件全量扫描window是O(n)——是process_tree+corr 90μs的主因。
-        // 限制window规模,扫描从数万降到上限,检测语义不变(同process_tree的max_events_per_node)。
         while self.event_window.len() > self.max_window_events {
             self.event_window.pop_front();
         }
-        // 容量上限淘汰:sequence_trackers随累计(rule,pid)数无界增长(84核机器见3.8万PID),
-        // 超过max_trackers时删last_step_timestamp_ns最老(含0即从未推进)的tracker。
         if self.sequence_trackers.len() > self.max_trackers {
             let target = self.max_trackers.saturating_sub(self.max_trackers / 10);
             while self.sequence_trackers.len() > target {
@@ -351,7 +335,6 @@ impl CorrelationEngine {
             }
         }
 
-        // ProcessTree关联规则,查询进程树检查父子关系
         if let Some(pt) = process_tree {
             for (rule_idx, rule) in self.rules.iter().enumerate() {
                 if let CorrelationType::ProcessTree {
@@ -383,7 +366,6 @@ impl CorrelationEngine {
         alerts
     }
 
-    /// 进程树关联检查,当前事件匹配child_condition,其父进程匹配parent_condition时告警。
     fn check_process_tree_correlation(
         &self,
         event: &DecodedEvent,
@@ -392,7 +374,6 @@ impl CorrelationEngine {
         child_condition: &CorrelationCondition,
         process_tree: &ProcessTreeManager,
     ) -> Option<PartialAlert> {
-        // 当前事件必须匹配child_condition
         if !matches_condition(event, child_condition) {
             return None;
         }
@@ -402,11 +383,9 @@ impl CorrelationEngine {
             return None;
         }
 
-        // 获取父进程信息
         let parent_node = process_tree.get_node(ppid)?;
         let parent_comm = parent_node.comm.clone();
 
-        // 构造父进程的临时事件来匹配parent_condition
         let mut parent_cb = [0u8; 16];
         let len = parent_comm.len().min(16);
         parent_cb[..len].copy_from_slice(&parent_comm.as_bytes()[..len]);
@@ -448,7 +427,6 @@ impl CorrelationEngine {
             action: None,
         };
 
-        // 检查父进程是否匹配parent_condition
         if !matches_condition(&parent_event, parent_condition) {
             return None;
         }
@@ -461,7 +439,6 @@ impl CorrelationEngine {
         })
     }
 
-    /// 检查当前事件B是否在窗口内与历史事件A形成配对
     fn check_window_correlation(
         &mut self,
         event: &DecodedEvent,
@@ -505,7 +482,6 @@ impl CorrelationEngine {
         })
     }
 
-    /// 追踪同PID的事件是否按步骤顺序出现
     fn check_sequence_correlation(
         &mut self,
         event: &DecodedEvent,
@@ -727,7 +703,6 @@ mod tests {
         assert!(alerts.is_empty());
     }
 
-    /// 扩展helper,支持设置ppid,用于构造父子进程关系
     fn make_event_with_parent(seq: u64, pid: u32, ppid: u32, et: u32, comm: &str) -> DecodedEvent {
         let mut cb = [0u8; 16];
         let len = comm.len().min(16);
@@ -769,13 +744,9 @@ mod tests {
 
     #[test]
     fn test_process_tree_correlation_sshd_to_nc() {
-        // 场景: sshd启动nc(反弹Shell),应触发critical告警
-        // 规则名: "进程树异常: sshd→bash→网络工具"
         let mut tree = ProcessTreeManager::new();
-        // 先把sshd父进程加入树
         let sshd_event = make_event_with_parent(1, 1000, 0, 1, "sshd");
         tree.update_from_event(&sshd_event);
-        // 再把nc子进程加入树(建立ppid=1000关系)
         let nc_event = make_event_with_parent(2, 1001, 1000, 1, "nc");
         tree.update_from_event(&nc_event);
 
@@ -795,10 +766,8 @@ mod tests {
         assert_eq!(alert.severity, "critical");
         assert!(alert.confidence >= 0.8);
         assert_eq!(alert.events.len(), 2);
-        // 第一条应是父进程sshd,第二条是子进程nc
         assert_eq!(alert.events[0].header.pid, 1000);
         assert_eq!(alert.events[1].header.pid, 1001);
-        // MITRE映射
         assert!(alert.mitre.is_some());
         let mitre = alert.mitre.as_ref().unwrap();
         assert_eq!(mitre.tactic, "TA0001");
@@ -807,8 +776,6 @@ mod tests {
 
     #[test]
     fn test_process_tree_correlation_cron_to_wget() {
-        // 场景: cron启动wget(payload投递),应触发high告警
-        // 规则名: "进程树异常: cron→下载工具"
         let mut tree = ProcessTreeManager::new();
         let cron_event = make_event_with_parent(1, 2000, 0, 1, "cron");
         tree.update_from_event(&cron_event);
@@ -839,7 +806,6 @@ mod tests {
 
     #[test]
     fn test_process_tree_no_match() {
-        // 场景: 父进程是vim(非sshd/cron),子是nc,不应触发ProcessTree规则
         let mut tree = ProcessTreeManager::new();
         let vim_event = make_event_with_parent(1, 3000, 0, 1, "vim");
         tree.update_from_event(&vim_event);
@@ -857,7 +823,6 @@ mod tests {
 
     #[test]
     fn test_process_tree_no_match_ppid_zero() {
-        // 场景: 子进程ppid=0(无父进程),不应触发告警
         let mut tree = ProcessTreeManager::new();
         let nc_event = make_event_with_parent(1, 4000, 0, 1, "nc");
         tree.update_from_event(&nc_event);
@@ -872,15 +837,11 @@ mod tests {
 
     #[test]
     fn test_detect_correlations_with_tree_backward_compat() {
-        // 场景: 传None(向后兼容),ProcessTree规则应被跳过,
-        // 但Window/Sequence规则仍正常工作
         let mut engine = CorrelationEngine::new(30);
-        // 先添加一个bash -i事件(满足reverse_shell规则的condition_a)
         engine.detect_correlations_with_tree(
             &make_event(1, 1234, 1, "bash", None, Some("bash -i"), None),
             None,
         );
-        // 再添加外连4444事件(满足condition_b),应触发reverse_shell Window规则
         let alerts = engine.detect_correlations_with_tree(
             &make_event(2, 1234, 20, "bash", None, None, Some(4444)),
             None,
@@ -890,7 +851,6 @@ mod tests {
             "传 None 时 Window 规则应正常工作，实际: {:?}",
             alerts.iter().map(|a| &a.rule_name).collect::<Vec<_>>()
         );
-        // 不应触发任何进程树规则
         assert!(
             !alerts.iter().any(|a| a.rule_name.contains("进程树异常")),
             "传 None 时不应触发进程树关联告警"
@@ -899,8 +859,6 @@ mod tests {
 
     #[test]
     fn test_process_tree_correlation_with_old_api() {
-        // 场景: 旧API detect_correlations(&event)等价于detect_correlations_with_tree(event, None)
-        // 验证旧调用方不会破坏(向后兼容)
         let mut tree = ProcessTreeManager::new();
         let sshd_event = make_event_with_parent(1, 5000, 0, 1, "sshd");
         tree.update_from_event(&sshd_event);
@@ -908,11 +866,8 @@ mod tests {
         tree.update_from_event(&nc_event);
 
         let mut engine = CorrelationEngine::new(300);
-        // 旧API(无process_tree参数)
         let alerts_old = engine.detect_correlations(&nc_event);
-        // 新API传None
         let alerts_none = engine.detect_correlations_with_tree(&nc_event, None);
-        // 两者结果应等价(都不触发ProcessTree规则,但Window/Sequence一致)
         assert_eq!(alerts_old.len(), alerts_none.len());
         assert!(
             !alerts_old

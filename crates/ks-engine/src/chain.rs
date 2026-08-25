@@ -54,7 +54,6 @@ impl ChainReconstructor {
         }
     }
 
-    /// 从同进程树的事件序列还原攻击链,按时间窗口+行为特征分类阶段
     pub fn reconstruct(&self, events: &[DecodedEvent]) -> Option<AttackChain> {
         if events.is_empty() {
             return None;

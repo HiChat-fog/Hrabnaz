@@ -1,7 +1,3 @@
-//! WebSocket实时告警推送。
-//!
-//! 客户端连接/ws/alerts后,订阅ServerState的broadcast channel,每当push_alert被调用,客户端收到JSON序列化的Alert。
-
 use crate::state::SharedState;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},

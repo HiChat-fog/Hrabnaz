@@ -10,7 +10,6 @@ use colored::control;
 struct Cli {
     #[arg(short, long, default_value = "warn")]
     log_level: String,
-    /// 颜色开关:auto(默认,TTY自动)/always(强制)/never(关闭,管道友好)
     #[arg(long, default_value = "auto", value_parser = ["auto", "always", "never"], global = true)]
     color: String,
     #[command(subcommand)]
@@ -19,7 +18,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 启动探针开始监控
     Start {
         #[arg(short, long, default_value = "rules/")]
         rules_dir: String,
@@ -27,49 +25,36 @@ enum Commands {
         log_dir: String,
         #[arg(long)]
         serve: Option<u16>,
-        /// 启动后向systemd发送READY=1通知(Type=notify服务使用)
         #[arg(long, default_value_t = false)]
         sd_notify: bool,
-        /// 安全加固参数(仅--serve启用数据服务时生效)
         #[command(flatten)]
         security: cmds::SecurityArgs,
     },
-    /// 卸载探针
     Stop,
-    /// 查看状态(--watch进入动态监控模式,定期刷新探针状态与事件计数)
     Status {
-        /// 动态监控模式:定期清屏重绘
         #[arg(long, default_value_t = false)]
         watch: bool,
-        /// 刷新间隔秒数(仅--watch生效)
         #[arg(long, default_value_t = 2)]
         interval: u64,
     },
-    /// 回放取证日志
     Replay {
         #[arg(short, long)]
         file: String,
-        /// 输出 JSON 摘要而非文本报告(管道/jq 消费用)
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// CLI-first声明(不启动Web服务,serve不等同于启动Web服务)
     Serve {
-        /// 仅用于提示start --serve <port>可选demo端口
         #[arg(short, long, default_value = "8443")]
         port: u16,
     },
-    /// 查看进程行为基线(z-score六维基线)
     Baseline {
         #[command(flatten)]
         args: cmds::baseline::BaselineArgs,
     },
-    /// 查看跨事件关联告警
     Correlation {
         #[command(flatten)]
         args: cmds::correlation::CorrelationArgs,
     },
-    /// 实时监控告警流
     Watch {
         #[command(flatten)]
         args: cmds::watch::WatchArgs,
@@ -82,16 +67,12 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&cli.log_level))
         .init();
 
-    // 颜色控制(学 Tetragon --color):never 保证管道/jq/SIEM 消费干净,
-    // always 强制保留色(重定向到文件想看色时),auto 走 colored 自带 TTY 检测。
     match cli.color.as_str() {
         "always" => control::set_override(true),
         "never" => control::set_override(false),
         _ => control::unset_override(),
     }
 
-    // BPF map创建需memlock,非systemd运行(如SSH手动start)默认memlock 64KB会在CentOS 7 3.10上致bpf() EPERM。
-    // systemd unit已设LimitMEMLOCK=infinity,此处兜底手动运行。
     #[cfg(target_os = "linux")]
     {
         let rl = libc::rlimit {
@@ -151,7 +132,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 打印当前安全配置概要(不泄露token)。
 fn print_security_status(args: &cmds::SecurityArgs) {
     let auth_status = if args.no_auth {
         "DISABLED (--no-auth)"

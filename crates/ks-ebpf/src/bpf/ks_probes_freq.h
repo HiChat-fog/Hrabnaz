@@ -20,11 +20,6 @@ struct freq_update_event {
     u64 duration_ns;
 };
 
-/* 频率阈值(申报书第27段固定MVP值:file_ops>500勒索/net>100端口扫描/
- * dns>50隧道/syscall>10000暴破/ptrace>3注入/signal>10)。
- * 原为freq_thresholds ARRAY map但用户态从不写入,ARRAY默认0导致
- * get_threshold的fallback永远不生效、阈值实际为0、所有进程首次操作即误标异常。
- * 改为#define常量,单源零歧义。未来需运行时可配时再加map写入端。 */
 enum freq_threshold_key {
     TH_FILE_OPS_60S = 0, TH_NET_OPS_60S = 1, TH_DNS_OPS_60S = 2,
     TH_SYSCALL_60S = 3,  TH_PTRACE_60S = 4,  TH_SIGNAL_60S = 5,
@@ -106,9 +101,6 @@ static __always_inline void update_freq_counter_ex(void *ctx, u32 pid, u32 count
     if (fc->ptrace_count_60s   > get_threshold(TH_PTRACE_60S, 3))
         fc->anomaly_flags |= FREQ_ANOMALY_INJECTION;
 
-    /* 仅首次越过阈值时发送告警(申报书"仅首次越过阈值时发送告警以避免重复上报")。
-     * 之前未报过(REPORTED未置)且本次有异常位 → 发一次,置REPORTED。
-     * 窗口到期重置时anomaly_flags归零,REPORTED随之清,下个窗口可再报。 */
     u32 anomaly_only = fc->anomaly_flags & ~FREQ_REPORTED;
     if (anomaly_only > 0 && !(fc->anomaly_flags & FREQ_REPORTED)) {
         struct freq_anomaly_event *evt = KS_RESERVE(freq_events, struct freq_anomaly_event);
@@ -157,4 +149,4 @@ static __always_inline void freq_handle_sys_exit(void *ctx, u32 syscall_nr) {
     }
 }
 
-#endif // KS_PROBES_FREQ_H
+#endif

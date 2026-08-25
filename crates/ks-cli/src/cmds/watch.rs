@@ -1,7 +1,3 @@
-//! `kernelsentinel watch`子命令,实时监控告警流。
-//!
-//! 通过HTTP轮询/api/v1/alerts?limit=20(每秒一次)打印新告警。不使用WebSocket客户端以避免额外依赖,轮询间隔1s对告警展示足够。
-
 use anyhow::Result;
 use ks_core::alert::Alert;
 use std::collections::HashSet;
@@ -12,16 +8,12 @@ use colored::Colorize;
 
 #[derive(clap::Args, Debug)]
 pub struct WatchArgs {
-    /// ks-server地址
     #[arg(short, long, default_value = "http://127.0.0.1:3000")]
     pub server: String,
-    /// 轮询间隔(秒,默认1)
     #[arg(short, long, default_value_t = 1)]
     pub interval: u64,
-    /// 最多显示N条后退出(0表示持续)
     #[arg(long, default_value_t = 0)]
     pub max: usize,
-    /// 输出 JSONL(每行一条告警),管道/jq/SIEM 消费用
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
@@ -69,7 +61,6 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
                             if seen.insert(a.id) {
                                 count += 1;
                                 if json_mode {
-                                    // JSONL:每行一条告警,喂 jq/SIEM/其他系统
                                     if let Ok(s) = serde_json::to_string(a) {
                                         println!("{s}");
                                     }

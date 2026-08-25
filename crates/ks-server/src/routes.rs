@@ -1,18 +1,3 @@
-//! REST API路由(9个端点加WebSocket)。
-//!
-//! | 方法 | 路径 | 功能 |
-//! |------|------|------|
-//! | GET  | /api/v1/alerts | 列出最近告警 |
-//! | GET  | /api/v1/alerts/:id | 按UUID查单个告警 |
-//! | POST | /api/v1/alerts/:id/ack | 确认告警 |
-//! | POST | /api/v1/alerts/:id/resolve | 标记已解决 |
-//! | GET  | /api/v1/stats | 统计概览 |
-//! | GET  | /api/v1/health | 健康检查 |
-//! | GET  | /api/v1/tier | 当前tier信息 |
-//! | POST | /api/v1/reload | 触发规则重载(占位) |
-//! | GET  | /api/v1/version | 版本信息 |
-//! | GET  | /ws/alerts | WebSocket实时告警推送 |
-
 use crate::metrics;
 use crate::state::SharedState;
 use crate::ws;
@@ -33,7 +18,6 @@ pub struct AlertQuery {
     pub limit: Option<usize>,
 }
 
-/// 单个BPF map的统计信息,序列化给前端。
 #[derive(Serialize)]
 pub struct MapStatResponse {
     pub name: String,
@@ -46,8 +30,7 @@ pub struct StatsResponse {
     pub total: usize,
     pub by_severity: serde_json::Value,
     pub by_status: serde_json::Value,
-    /// 5个共享map的统计(risk_scores、ip_whitelist等)。
-    /// map_reader为None时返回空数组。
+
     pub map_stats: Vec<MapStatResponse>,
 }
 
@@ -74,34 +57,30 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/v1/tier", get(tier_info))
         .route("/api/v1/reload", post(reload))
         .route("/api/v1/version", get(version))
-        // z-score基线快照加跨事件关联告警
+
         .route("/api/v1/baselines", get(list_baselines))
         .route("/api/v1/correlations", get(list_correlations))
-        // 误报反馈端点POST /api/v1/alerts/:id/feedback
+
         .route("/api/v1/alerts/:id/feedback", post(feedback_alert))
-        // 阻断管理端点POST/DELETE/GET
+
         .route("/api/v1/block/:pid", post(block_pid_handler))
         .route("/api/v1/block/:pid", delete(unblock_pid_handler))
         .route("/api/v1/blocked", get(list_blocked_handler))
-        // BPF Map全6个共享map读取端点(process_tree、net_flows、
-        // freq_counters、filter_stats、risk_scores、block_decisions)
+
         .route("/api/v1/maps", get(list_maps_handler))
         .route("/api/v1/maps/:name", get(read_map_handler))
         .route("/ws/alerts", get(ws::ws_handler))
-        // Prometheus指标导出端点,免鉴权(其他端点鉴权才处理)。
-        // 返回Content-Type: text/plain; version=0.0.4; charset=utf-8
+
         .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
-/// 列出所有进程的z-score基线快照。
 async fn list_baselines(
     State(st): State<SharedState>,
 ) -> Json<Vec<ks_engine::baseline::BehaviorBaseline>> {
     Json(st.list_baselines().await)
 }
 
-/// 列出最近的跨事件关联告警(默认100条,最新在前)。
 async fn list_correlations(
     State(st): State<SharedState>,
     Query(q): Query<AlertQuery>,
@@ -109,7 +88,6 @@ async fn list_correlations(
     Json(st.list_correlation_alerts(q.limit.unwrap_or(100)).await)
 }
 
-/// 误报反馈端点,标记告警为误报或确认,并联动ML检测器调整阈值。
 #[derive(Deserialize)]
 struct FeedbackRequest {
     is_false_positive: bool,
@@ -124,7 +102,7 @@ async fn feedback_alert(
     Json(req): Json<FeedbackRequest>,
 ) -> impl IntoResponse {
     if let Some(pid) = st.update_feedback(id, req.is_false_positive).await {
-        // 联动ML检测器:误报则提升阈值
+
         st.ml_detector
             .lock()
             .await
@@ -135,8 +113,6 @@ async fn feedback_alert(
     }
 }
 
-/// 阻断指定PID。
-/// POST /api/v1/block/:pid?ttl=300&reason=1
 #[derive(Deserialize)]
 struct BlockQuery {
     #[serde(default)]
@@ -173,8 +149,6 @@ async fn block_pid_handler(
     }
 }
 
-/// 解除阻断。
-/// DELETE /api/v1/block/:pid
 async fn unblock_pid_handler(
     State(st): State<SharedState>,
     Path(pid): Path<u32>,
@@ -187,16 +161,12 @@ async fn unblock_pid_handler(
     }
 }
 
-/// 列出所有被阻断的PID。
-/// GET /api/v1/blocked
 async fn list_blocked_handler(
     State(st): State<SharedState>,
 ) -> Json<Vec<ks_engine::blocker::BlockedPid>> {
     Json(st.block_manager.lock().await.list_blocked())
 }
 
-/// 列出所有可读的BPF map名称。
-/// GET /api/v1/maps
 async fn list_maps_handler(State(st): State<SharedState>) -> impl IntoResponse {
     match &st.map_reader {
         Some(mr) => Json(serde_json::json!({"maps": mr.list_maps()})).into_response(),
@@ -208,9 +178,6 @@ async fn list_maps_handler(State(st): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-/// 读取指定BPF map的结构化条目。
-/// GET /api/v1/maps/:name
-/// 支持的map: process_tree、net_flows、freq_counters、filter_stats、risk_scores、block_decisions
 async fn read_map_handler(
     State(st): State<SharedState>,
     Path(name): Path<String>,
@@ -248,9 +215,6 @@ async fn read_map_handler(
     }
 }
 
-/// Prometheus抓取端点。
-///
-/// 返回所有已注册指标(事件计数、告警计数、map大小、延迟、tier状态、ringbuf丢失)。Content-Type遵循Prometheus exposition format 0.0.4规范。
 async fn metrics_handler() -> impl IntoResponse {
     let body = metrics::render_metrics();
     (
@@ -311,16 +275,14 @@ async fn stats(State(st): State<SharedState>) -> Json<StatsResponse> {
             AlertStatus::Resolved | AlertStatus::FalsePositive => resolved += 1,
         }
     }
-    drop(store); // 释放alerts RwLock,再读map_stats
+    drop(store);
 
-    // 从map_reader读取5个共享map的统计信息。
-    // map_reader为None(未加载eBPF或非Linux)时返回空数组。
     let map_stats: Vec<MapStatResponse> = match &st.map_reader {
         Some(mr) => mr
             .list_map_stats()
             .into_iter()
             .map(|ms| {
-                // 同步更新ks_map_entries指标(Gauge),供Prometheus抓取。
+
                 metrics::set_map_entries(&ms.name, ms.entry_count as i64);
                 MapStatResponse {
                     name: ms.name,

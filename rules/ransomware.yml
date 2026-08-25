@@ -1,6 +1,3 @@
-# 检测规则 — 勒索软件
-# 勒索软件特征: 大量文件写入 (加密) + 文件删除 (删除原文件)
-
 - name: "勒索软件加密行为"
   description: "检测文件写入加密后缀 (.encrypted/.locked/.crypto) 或批量文件删除操作"
   severity: critical

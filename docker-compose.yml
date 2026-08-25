@@ -1,31 +1,10 @@
-# 内核哨兵(KernelSentinel) — 生产部署Compose
-#
-# 启动:
-#   docker compose up -d
-#
-# 仅 ks-server(核心):
-#   docker compose up -d ks-server
-#
-# 含监控栈(可选 prometheus):
-#   docker compose --profile metrics up -d
-#
-# 前提:
-#   - eBPF加载需privileged + 宿主/sys/fs/bpf已挂载(type bpf)
-#   - KS_AUTH_TOKEN建议放入.env文件(compose自动读取)
-#       echo "KS_AUTH_TOKEN=$(openssl rand -hex 32)" > .env
-#
-# 注: ks-frontend/nginx前端服务已移除（申报书不涉及Web前端），历史痕迹见 git log，如需恢复请在独立分支维护。
-
 services:
-  # kernelsentinel: eBPF检测守护进程（CLI-first；REST API为可选demo）
   ks-server:
     build:
       context: .
       dockerfile: Dockerfile
     image: kernelsentinel:latest
     container_name: ks-server
-    # eBPF需要 CAP_BPF/CAP_PERFMON/CAP_SYS_ADMIN + 访问/sys/fs/bpf、/proc
-    # 生产可改用cap_add列表，但部分老内核(3.10)仍需privileged
     privileged: true
     restart: unless-stopped
     ports:
@@ -36,22 +15,16 @@ services:
       - /lib/modules:/lib/modules:ro
       - ./rules:/etc/kernelsentinel/rules:ro
     environment:
-      # REST API鉴权token(从.env读取，未设置则关闭鉴权)
       KS_AUTH_TOKEN: ${KS_AUTH_TOKEN:-}
       RUST_LOG: ${RUST_LOG:-info}
-    # 入口脚本做前置检查后 exec kernelsentinel start（CLI-first检测守护进程）
-    # 如需REST API demo：command: ["--serve", "8080", "--rules-dir", "/etc/kernelsentinel/rules"]
     command: ["--rules-dir", "/etc/kernelsentinel/rules", "--log-dir", "/var/log/kernelsentinel"]
     healthcheck:
-      # CLI-first默认不绑端口，故查运行状态文件（start时写/tmp/ks-status.json，退出时清理）
       test: ["CMD", "bash", "-c", "test -f /tmp/ks-status.json"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
 
-  # prometheus: 指标采集(可选，--profile metrics启用)
-  # 注: nginx前端反代服务已移除（申报书不涉及Web前端），历史痕迹见 git log。
   prometheus:
     image: prom/prometheus:latest
     container_name: ks-prometheus

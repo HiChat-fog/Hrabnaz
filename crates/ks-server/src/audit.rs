@@ -1,11 +1,3 @@
-//! 审计日志中间件。
-//!
-//! 记录每个HTTP请求的访问日志,输出为JSON Lines(每行一个JSON对象),便于SIEM、Loki等日志聚合系统采集。
-//!
-//! 记录字段:timestamp(ISO8601时间戳)、client_ip(客户端IP,来自X-Forwarded-For或连接地址)、token_id(Bearer token的sha256前8位,不可逆,保护原始token)、method、path(含query string)、status、latency_ms(处理延迟毫秒)。
-//!
-//! 实现上用tokio::sync::Mutex<tokio::fs::File>持有文件句柄异步写入,文件以append模式打开,每次写入后flush避免日志丢失。enabled为false时跳过写入,仅作日志记录不影响请求。
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,12 +13,11 @@ use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
 use tokio::sync::Mutex;
 
-/// 审计配置,由CLI flags构建。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AuditConfig {
-    /// 审计日志文件路径,默认/var/log/kernelsentinel/audit.log。
+
     pub log_path: PathBuf,
-    /// 是否启用审计。false时中间件直接放行,不写日志。
+
     pub enabled: bool,
 }
 
@@ -38,7 +29,6 @@ impl AuditConfig {
         }
     }
 
-    /// 关闭审计。
     pub fn disabled() -> Self {
         Self {
             log_path: PathBuf::new(),
@@ -47,18 +37,13 @@ impl AuditConfig {
     }
 }
 
-/// 异步文件写入器,持有tokio::fs::File,多请求串行写入。
-///
-/// 用tokio::sync::Mutex保护文件句柄,避免并发写入导致字节交错。文件以append模式打开,每次write_line后调用flush(审计日志优先持久化)。
 #[derive(Clone)]
 pub struct AuditWriter {
     inner: Arc<Mutex<File>>,
 }
 
 impl AuditWriter {
-    /// 打开(或创建)审计日志文件。
-    ///
-    /// 父目录不存在时自动创建(如/var/log/kernelsentinel/)。
+
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -74,7 +59,6 @@ impl AuditWriter {
         })
     }
 
-    /// 写入一行JSON(自动追加换行),写入后立即flush。
     pub async fn write_line(&self, line: &str) -> std::io::Result<()> {
         let mut f = self.inner.lock().await;
         use tokio::io::AsyncWriteExt;
@@ -85,9 +69,6 @@ impl AuditWriter {
     }
 }
 
-/// 计算给定Bearer token的标识符(sha256前8位hex)。
-///
-/// 用于审计日志中记录请求方身份而不泄露原始token。输入None返回none(未携带token),输入Some(t)返回8位hex字符串。
 pub fn token_id(token: Option<&str>) -> String {
     match token {
         None => "none".to_string(),
@@ -100,7 +81,6 @@ pub fn token_id(token: Option<&str>) -> String {
     }
 }
 
-/// 取4字节digest转hex字符串(共8字符)。
 fn hex_short(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(8);
     for b in bytes.iter().take(4) {
@@ -109,7 +89,6 @@ fn hex_short(bytes: &[u8]) -> String {
     s
 }
 
-/// 提取请求头中的Bearer token(不验证,仅用于审计)。
 fn extract_bearer(req: &Request) -> Option<String> {
     req.headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -117,9 +96,6 @@ fn extract_bearer(req: &Request) -> Option<String> {
         .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()))
 }
 
-/// 提取客户端IP,优先X-Forwarded-For,否则回退到空字符串。
-///
-/// 注:axum的ConnectInfo extension需通过into_make_service_with_connect_info才能获取,此处简化处理,仅读X-Forwarded-For头部。
 fn extract_client_ip(req: &Request) -> String {
     if let Some(xff) = req.headers().get("x-forwarded-for") {
         if let Ok(s) = xff.to_str() {
@@ -128,11 +104,10 @@ fn extract_client_ip(req: &Request) -> String {
             }
         }
     }
-    // 兜底:标记为unknown(ConnectInfo提取需要into_make_service_with_connect_info)
+
     "unknown".to_string()
 }
 
-/// 单条审计日志记录,序列化为JSON。
 #[derive(Serialize)]
 struct AuditEntry<'a> {
     timestamp: String,
@@ -144,15 +119,12 @@ struct AuditEntry<'a> {
     latency_ms: u64,
 }
 
-/// 审计中间件,axum::middleware::from_fn_with_state形态。
-///
-/// 流程:记录起始时间并提取token_id、client_ip、method、path,调用下游handler获取response,计算latency_ms并提取status code,序列化为JSON line异步写入文件,写入失败仅记tracing::warn不阻塞响应。
 pub async fn audit_middleware(
     State(writer): State<Option<AuditWriter>>,
     req: Request,
     next: Next,
 ) -> Response {
-    // 立即开始计时并提取请求元数据(不消耗body)
+
     let start = Instant::now();
     let bearer = extract_bearer(&req);
     let tid = token_id(bearer.as_deref());
@@ -164,10 +136,8 @@ pub async fn audit_middleware(
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
 
-    // 调用下游
     let response = next.run(req).await;
 
-    // 仅当writer存在时写日志(disabled时由ServerConfig传None)
     if let Some(w) = writer {
         let latency_ms = start.elapsed().as_millis() as u64;
         let status = response.status().as_u16();
@@ -205,12 +175,12 @@ mod tests {
 
     #[test]
     fn test_token_id_stable_prefix() {
-        // 同一token应得到同一ID(前8位hex)
+
         let id1 = token_id(Some("secret-token-abc"));
         let id2 = token_id(Some("secret-token-abc"));
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 8);
-        // 不同token应得到不同ID
+
         let id3 = token_id(Some("different-token"));
         assert_ne!(id1, id3);
     }
@@ -226,7 +196,7 @@ mod tests {
         let content = tokio::fs::read_to_string(&tmp).await.expect("read back");
         assert!(content.contains(r#"{"a":1}"#));
         assert!(content.contains(r#"{"a":2}"#));
-        // 每行一个JSON加换行
+
         assert_eq!(content.lines().count(), 2);
         let _ = tokio::fs::remove_file(&tmp).await;
     }

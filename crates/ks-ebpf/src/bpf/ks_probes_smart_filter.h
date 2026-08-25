@@ -39,10 +39,6 @@ enum filter_config_key {
     FC_BLOCK_RATE_TARGET = 2,
 };
 
-/* 过滤阈值(申报书第27段固定MVP值:risk_score<40不发,过滤率目标80%)。
- * 原为filter_config ARRAY map但用户态从不写入,ARRAY默认0导致fallback
- * 永不生效、min_risk实际为0。改为switch返回常量,单源零歧义。 */
-/* C6: KS_PERCPU_ARRAY_MAP 宏声明，Ancient tier 自动回退到 CPU-keyed ARRAY */
 KS_PERCPU_ARRAY_MAP(filter_stats_map, struct filter_stats);
 
 KS_EVENT_MAP(filter_events, 1024 * 1024);
@@ -114,9 +110,6 @@ static __always_inline void update_filter_stats(u8 action) {
 }
 
 static __always_inline void smart_filter_handle_vfs_open(struct path *path) {
-    /* vfs_open不再submit事件(由sys_exit统一发),此函数仅保留过滤统计。
-     * 不调infer_sensitive_file/update_freq_counter——避免与sys_exit的infer_event
-     * 重复累加风险分。推理+频率计数交给sys_exit路径。 */
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     if (pid == 0) return;
@@ -124,8 +117,6 @@ static __always_inline void smart_filter_handle_vfs_open(struct path *path) {
     struct dentry *dentry = BPF_CORE_READ(path, dentry);
     const char *name = KS_READ_DNAME(dentry);
 
-    /* 3.10 verifier无法追踪bpf_probe_read返回的指针(标记为inv),
-     * 直接解引用会报"invalid mem access"。先拷到栈缓冲区。 */
     char name_buf[64] = {};
     if (name) bpf_probe_read(name_buf, sizeof(name_buf), name);
 
@@ -133,19 +124,12 @@ static __always_inline void smart_filter_handle_vfs_open(struct path *path) {
     update_filter_stats(decision.action);
 }
 
-/* 内核侧verdict驱动提交(申报书"智能过滤层"+"推理引擎返回值决定是否提交ring buffer")。
- * verdict!=0(告警1/阻断2)必提交——真威胁不能丢;
- * verdict==0时交should_send_event按默认策略+风险分+频率+白名单决定:
- *   exec/ptrace/signal/net默认PASS(action=0提交),file open/read默认BLOCK(action=1丢弃)。
- * 返回1=应丢弃(KS_DISCARD),0=应提交(KS_SUBMIT)。
- * 顺带记filter_stats,使过滤率可观测。 */
 static __always_inline int ks_should_drop(u32 pid, u32 event_type,
                                           const char *filename, int verdict) {
-    /* verdict!=0(真告警/阻断)必提交,记为passed */
     if (verdict != 0) { update_filter_stats(0); return 0; }
     struct filter_decision d = should_send_event(pid, event_type, filename);
     update_filter_stats(d.action);
     return d.action;
 }
 
-#endif // KS_PROBES_SMART_FILTER_H
+#endif

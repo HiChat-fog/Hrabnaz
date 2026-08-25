@@ -1,6 +1,3 @@
-//! JSONL格式取证日志,带SHA-256哈希链防篡改。
-//! 支持自动轮转(按大小)、gzip归档、过期清理。
-
 use crate::aggregator::DecodedEvent;
 use anyhow::Result;
 use ks_core::alert::Alert;
@@ -57,7 +54,6 @@ pub struct ForensicLogger {
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 impl ForensicLogger {
-    /// 创建日志记录器,若文件已存在则从末尾恢复哈希链
     pub fn new(path: PathBuf) -> Result<Self> {
         Self::with_rotation(path, RotationConfig::default())
     }
@@ -101,8 +97,6 @@ impl ForensicLogger {
         })
     }
 
-    /// 从已有日志恢复链尾哈希和事件计数
-    /// 跳过alert记录(只有event记录才有seq字段)
     fn recover_chain_state(path: &PathBuf) -> Result<(String, u64)> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
@@ -111,7 +105,6 @@ impl ForensicLogger {
             if line.trim().is_empty() {
                 continue;
             }
-            // 只保留含seq的行(event记录),跳过alert记录
             if line.contains("\"seq\"") {
                 last_event_line = line;
             }
@@ -133,7 +126,6 @@ impl ForensicLogger {
         Ok((hash, seq))
     }
 
-    /// 当前文件超过max_file_size时做轮转:重命名、压缩、开新文件
     fn maybe_rotate(&mut self) -> Result<()> {
         if self.current_file_size < self.rotation_config.max_file_size {
             return Ok(());
@@ -170,7 +162,6 @@ impl ForensicLogger {
         Ok(())
     }
 
-    /// 记录事件
     pub fn log_event(&mut self, event: &DecodedEvent) -> Result<()> {
         self.event_count += 1;
 
@@ -212,7 +203,6 @@ impl ForensicLogger {
             record["file_bytes"] = serde_json::json!(b);
         }
 
-        // 用BTreeMap做序列化保证key排序一致,verify_chain才不会因为key顺序不同报假错
         let btree: BTreeMap<String, serde_json::Value> = record
             .as_object()
             .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -237,17 +227,20 @@ impl ForensicLogger {
         Ok(())
     }
 
-    /// 记录告警
     pub fn log_alert(&mut self, alert: &Alert) -> Result<()> {
         self.alert_count += 1;
         let mut record = serde_json::to_value(alert)?;
+        record["type"] = serde_json::Value::String("alert".to_string());
 
-        let json_str = serde_json::to_string(&record)?;
+        let btree: BTreeMap<String, serde_json::Value> = record
+            .as_object()
+            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        let json_str = serde_json::to_string(&btree)?;
         let current_hash = self.hasher.hash(&json_str);
 
         record["prev_hash"] = serde_json::Value::String(self.prev_hash.clone());
         record["hash"] = serde_json::Value::String(current_hash.clone());
-        record["type"] = serde_json::Value::String("alert".to_string());
 
         let line = serde_json::to_string(&record)?;
         writeln!(self.writer, "{}", line)?;
@@ -278,7 +271,6 @@ impl ForensicLogger {
         &self.prev_hash
     }
 
-    /// 从头校验日志链完整性
     pub fn verify_chain(path: &PathBuf) -> Result<ChainVerification> {
         let content = std::fs::read_to_string(path)?;
         let mut prev_hash = GENESIS_HASH.to_string();
@@ -464,6 +456,53 @@ mod tests {
         let result = ForensicLogger::verify_chain(&path).unwrap();
         assert!(result.is_valid);
         assert_eq!(result.total_records, 10);
+    }
+
+    #[test]
+    fn test_chain_verification_valid_mixed_events_and_alerts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut logger = ForensicLogger::new(path.clone()).unwrap();
+            for i in 1..=5 {
+                logger.log_event(&make_event(i, 100)).unwrap();
+            }
+            let alert = ks_core::alert::Alert {
+                id: uuid::Uuid::new_v4(),
+                timestamp_ns: 123456789,
+                severity: ks_core::rule::Severity::High,
+                title: "test alert".to_string(),
+                description: "desc".to_string(),
+                rule_name: "test_rule".to_string(),
+                process: ks_core::alert::ProcessInfo {
+                    pid: 100,
+                    ppid: 1,
+                    comm: "test".to_string(),
+                    uid: 0,
+                    exe_path: Some("/usr/bin/test".to_string()),
+                    cmdline: None,
+                },
+                network: None,
+                file: None,
+                event_ids: vec![1, 2],
+                mitre: Some(ks_core::alert::MitreInfo {
+                    tactic: "TA0002".to_string(),
+                    technique: "T1059".to_string(),
+                    sub_technique: None,
+                }),
+                status: ks_core::alert::AlertStatus::New,
+                feedback: None,
+            };
+            logger.log_alert(&alert).unwrap();
+            logger.log_event(&make_event(6, 200)).unwrap();
+            logger.flush().unwrap();
+        }
+        let result = ForensicLogger::verify_chain(&path).unwrap();
+        assert!(
+            result.is_valid,
+            "混合事件+告警链应有效, 却在第 {:?} 条断裂",
+            result.broken_at
+        );
     }
 
     #[test]

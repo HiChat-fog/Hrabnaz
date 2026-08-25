@@ -118,7 +118,6 @@ pub struct Alert {
     pub event_ids: Vec<u64>,
     pub mitre: Option<MitreInfo>,
     pub status: AlertStatus,
-    /// 误报反馈,None为未反馈,Some(true)为确认告警,Some(false)为误报
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<bool>,
 }

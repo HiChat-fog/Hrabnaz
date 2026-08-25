@@ -2,10 +2,6 @@ use anyhow::Result;
 use colored::Colorize;
 use super::ui::banner;
 
-/// serve子命令为CLI-first声明,不启动Web服务。
-///
-/// CLI-first:检测与运维均通过CLI子命令完成,REST API仅作可选demo
-/// (通过start --serve <port>与eBPF检测同进程启用),不绑定端口。
 pub async fn run(port: u16) -> Result<()> {
     banner("内核哨兵 — CLI-first 模式（不启动 Web 服务）");
     println!();

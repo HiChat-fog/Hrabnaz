@@ -1,29 +1,15 @@
-//! 事件源抽象,统一eBPF ring buffer、mock、文件回放的数据获取接口。
-//!
-//! trait用async(next_bytes返回Future,避免perfbuf/inotify阻塞tokio reactor);不要求Sync(RingBuf是Send非Sync,强加会逼出Mutex<RingBuf>损失性能);用SourceKind enum做运行时多态与日志区分。
-
 use anyhow::Result;
 use async_trait::async_trait;
 use ks_core::event::{af, EventHeader, ExecEvent, FileEvent, NetEvent, SignalEvent};
 
-/// 事件源种类。
-///
-/// 跟多tier eBPF架构对应:Modern(5.8+ ringbuf)、Legacy(4.x perfbuf)、Ancient(3.10+ BTF backport)。Mock和FileReplay用于测试与离线分析。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
-    /// 现代eBPF tier,5.8以上,用BPF_MAP_TYPE_RINGBUF
     EbpfModern,
-    /// Legacy eBPF tier,4.x,用BPF_MAP_TYPE_PERF_EVENT_ARRAY
     EbpfLegacy,
-    /// Ancient eBPF tier,3.10.0-1160以上BTF backport,HASH加手动LRU
     EbpfAncient,
-    /// Ancient NOBTF tier,3.10 stock内核无BTF,aya无法加载,由C loader sidecar(ks_loader --stream子进程)加载.o文件,Rust父进程从stdout读帧
     EbpfAncientNoBtf,
-    /// Legacy NOBTF tier,4.19原版和麒麟V10 SP1-SP2无BTF,aya加载带BTF的legacy .o时BTF_BTF_LOAD返回EINVAL;改走C loader加载剥离BTF.ext的legacy_nobtf .o,硬编码4.19 offset
     EbpfLegacyNoBtf,
-    /// Mock回放,测试演示CI用
     Mock,
-    /// 文件回放,离线pcap/jsonl日志重放,未来扩展
     FileReplay,
 }
 
@@ -41,33 +27,22 @@ impl SourceKind {
     }
 }
 
-/// 统一事件源trait。
-///
-/// 设计上Send不Sync:RingBuf<MapData>是Send非Sync,强加Sync会逼出Mutex<RingBuf>包装每次lock损失性能,本架构每事件源由单task独占持有,删Sync安全。next_bytes是async,perfbuf和FileReplay可能要await epoll/AsyncFd,trait一开始就async避免后续破坏性改动。
 #[async_trait]
 pub trait EventSource: Send {
-    /// 取下一条事件字节。Ok(None)表示暂无数据,不是错误,调用方应sleep。
     async fn next_bytes(&mut self) -> Result<Option<Vec<u8>>>;
 
-    /// 来源种类,用于运行时多态与日志展示。
     fn kind(&self) -> SourceKind;
 
-    /// 人类可读描述,含tier、ringbuf名等细节。
     fn description(&self) -> &str;
 
-    /// 是否为mock,用于跳过告警上报等。
     fn is_mock(&self) -> bool {
         matches!(self.kind(), SourceKind::Mock)
     }
 
-    /// 自身及父进程链pid豁免集合,只有eBPF tier才有,mock和perf返回空。
-    /// 用户态检测(baseline/ML/anomaly)跳过这些pid,避免哨兵消费变忙时自指误报。
     fn protected_pids(&self) -> &[u32] {
         &[]
     }
 }
-
-// Mock事件源
 
 pub struct MockEventSource {
     events: Vec<Vec<u8>>,
@@ -364,9 +339,6 @@ impl EventSource for MockEventSource {
     }
 }
 
-// Linux真实事件源(aya ring buffer)
-// 注意:LinuxEventSource已简化为stub。真实ring buffer消费在start.rs中通过loader.try_next_event()直接调用,后续由EbpfModernSource替换此stub。
-
 #[cfg(target_os = "linux")]
 pub struct LinuxEventSource;
 
@@ -387,7 +359,6 @@ impl LinuxEventSource {
 #[async_trait]
 impl EventSource for LinuxEventSource {
     async fn next_bytes(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        // stub,真实消费由start.rs绕过此trait直接调loader,后续由EbpfModernSource接管。
         Ok(None)
     }
     fn kind(&self) -> SourceKind {
@@ -400,8 +371,6 @@ impl EventSource for LinuxEventSource {
         false
     }
 }
-
-// 辅助函数
 
 fn make_header(event_type: u32, pid: u32, ts: u64, comm: &[u8], nr: i32) -> EventHeader {
     let mut buf = [0u8; 16];
@@ -437,7 +406,6 @@ fn make_cstr_512(s: &str) -> [u8; 512] {
 }
 
 fn ipv4_to_u32(addr: &str) -> u32 {
-    // 跟内核bpf_probe_read_kernel一致:网络字节序字节直接拷入u32字段,Rust读出是native-endian,用from_ne_bytes匹配内核行为。
     let parts: Vec<u8> = addr
         .split('.')
         .filter_map(|p| p.parse::<u8>().ok())
@@ -452,7 +420,6 @@ fn ipv4_to_u32(addr: &str) -> u32 {
 fn encode_struct<T: Copy>(s: &T) -> Vec<u8> {
     let size = core::mem::size_of::<T>();
     let mut data = vec![0u8; size];
-    // 直接从引用拷贝到Vec,避免*s在栈上产生大结构体副本(ExecEvent约800B)。
     unsafe {
         core::ptr::copy_nonoverlapping(s as *const T as *const u8, data.as_mut_ptr(), size);
     }
@@ -470,8 +437,6 @@ pub enum MockScenario {
     All,
 }
 
-// 平台导出
-
 #[cfg(target_os = "linux")]
 pub use linux_impl::*;
 #[cfg(not(target_os = "linux"))]
@@ -486,9 +451,6 @@ mod linux_impl {
     use crate::tier_detect::detect_ebpf_tier;
     use std::sync::Arc;
 
-    /// 默认事件源,根据内核版本自动选择eBPF tier。
-    ///
-    /// 返回元组(Box<dyn EventSource>, Option<Arc<dyn BpfMapReader>>),第二元素是BPF map读取器,加载成功为LinuxBpfMapReader,fallback mock为MockBpfMapReader,供/api/v1/stats端点读map_stats。5.8以上走EbpfModernSource(ringbuf,ks_main_modern.o);4.x走EbpfPerfSource(perfbuf,ks_main_legacy.o);3.10以上走EbpfPerfSource(perfbuf,ks_main_ancient.o);太老或读不到版本时走mock加warning。
     pub async fn default_event_source() -> (Box<dyn EventSource>, Option<Arc<dyn BpfMapReader>>) {
         match detect_ebpf_tier() {
             Some(SourceKind::EbpfModern) => {
@@ -500,7 +462,6 @@ mod linux_impl {
                             "[tier-detect] eBPF Modern tier加载成功,{}个程序已attach",
                             loader.loaded_probes().len()
                         );
-                        // 在move loader到source之前先取map_reader
                         let map_reader = loader.map_reader();
                         return (Box::new(EbpfModernSource::new(loader)), map_reader);
                     }
@@ -538,8 +499,6 @@ mod linux_impl {
                 )
             }
             Some(SourceKind::EbpfLegacyNoBtf) => {
-                // 4.19原版和麒麟V10 SP1-SP2无BTF,aya加载带BTF的legacy .o会BTF_BTF_LOAD返回EINVAL。
-                // 改走CLoaderSource加载剥离BTF.ext的ks_main_legacy_nobtf.o(硬编码4.19 offset)。
                 log::info!(
                     "[tier-detect] Legacy tier无BTF,尝试CLoaderSource (ks_loader --stream ks_main_legacy_nobtf.o)"
                 );
@@ -561,7 +520,6 @@ mod linux_impl {
                 )
             }
             Some(SourceKind::EbpfAncient) => {
-                // Ancient加NOBTF路径优先走CLoaderSource(ks_loader --stream子进程)。3.10 stock内核无BTF时aya(依赖libbpf 1.0以上)通常无法加载,改由C loader加载.o并把perfbuf事件按帧写stdout。
                 if !crate::tier_detect::btf_available() {
                     log::info!("[tier-detect] Ancient tier无BTF,尝试CLoaderSource (ks_loader --stream)");
                     match try_cloader_source().await {
@@ -577,7 +535,6 @@ mod linux_impl {
                         }
                     }
                 }
-                // aya加载路径(有BTF,或CLoaderSource失败时fallback)
                 log::info!("[tier-detect] 当前内核走Ancient tier (3.10+ BTF backport)");
                 let mut loader = EbpfLoader::new();
                 match loader.start_all(SourceKind::EbpfAncient).await {
@@ -611,17 +568,13 @@ mod linux_impl {
         }
     }
 
-    /// 尝试启动CLoaderSource(NOBTF路径),在Ancient tier且内核无BTF时调用:先查找ks_loader二进制(KS_LOADER_PATH覆盖或内嵌static预编释放),再查找ks_main_ancient_nobtf.o(KS_EBPF_DIR覆盖或内嵌字节码释放),然后CLoaderSource::spawn启动子进程返回事件源。
-    /// CLoaderSource不持有EbpfLoader,无法提供BpfMapReader(map数据在C loader子进程内,Rust父进程访问不到),返回None,stats端点显示空map_stats(NOBTF是研究性路径,可接受)。
     async fn try_cloader_source() -> anyhow::Result<(
         crate::cloader_source::CLoaderSource,
         Option<Arc<dyn BpfMapReader>>,
     )> {
-        // Ancient路径:3.10.0-1160硬编码offset
         try_cloader_source_for("ancient_nobtf").await
     }
 
-    /// Legacy NOBTF路径(4.19无BTF)的CLoaderSource启动。
     async fn try_cloader_source_legacy() -> anyhow::Result<(
         crate::cloader_source::CLoaderSource,
         Option<Arc<dyn BpfMapReader>>,
@@ -629,7 +582,6 @@ mod linux_impl {
         try_cloader_source_for("legacy_nobtf").await
     }
 
-    /// 参数化CLoaderSource启动,按tier suffix选择.o和release兼容检查。
     async fn try_cloader_source_for(
         tier_suffix: &str,
     ) -> anyhow::Result<(
@@ -638,7 +590,6 @@ mod linux_impl {
     )> {
         use crate::cloader_source::CLoaderSource;
 
-        // release兼容检查,fail loud,避免wrong offset silent读错字段
         let compat = match tier_suffix {
             "ancient_nobtf" => crate::tier_detect::nobtf_release_compatible(),
             "legacy_nobtf" => crate::tier_detect::legacy_nobtf_release_compatible(),
@@ -649,10 +600,8 @@ mod linux_impl {
             anyhow::bail!("{}", reason);
         }
 
-        // 查找ks_loader二进制
         let loader_path = find_ks_loader_binary()?;
 
-        // 查找tier-specific .o
         let object_path = match tier_suffix {
             "ancient_nobtf" => find_ancient_nobtf_object()?,
             "legacy_nobtf" => find_legacy_nobtf_object()?,
@@ -666,17 +615,14 @@ mod linux_impl {
             object_path.display(),
         );
 
-        // spawn CLoaderSource
         let source = CLoaderSource::spawn(
             loader_path.to_str().expect("loader_path非UTF-8"),
             object_path.to_str().expect("object_path非UTF-8"),
         )?;
 
-        // CLoaderSource不持有EbpfLoader,返回None,stats端点显示空map_stats(NOBTF路径可接受)
         Ok((source, None))
     }
 
-    /// 把内嵌字节码释放到临时文件并设权限(单二进制部署:运行时从二进制内释放ks_loader和.o)。
     fn release_to_temp(name: &str, bytes: &[u8], mode: u32) -> anyhow::Result<std::path::PathBuf> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -704,11 +650,7 @@ mod linux_impl {
         Ok(path)
     }
 
-    /// 查找ks_loader二进制路径(nobtf C loader),优先级:先看环境变量KS_LOADER_PATH(调试覆盖),再从二进制内嵌的static ks_loader释放到临时文件(单二进制,去gcc/PATH依赖)。
-    ///
-    /// 内嵌ks_loader由build.rs用gcc -static预编(libelf+libz+libzstd静态链接),可在CentOS 7(glibc 2.17)运行。编译期未预编则返回Err,提示设KS_LOADER_PATH。
     fn find_ks_loader_binary() -> anyhow::Result<std::path::PathBuf> {
-        // 环境变量KS_LOADER_PATH(调试覆盖)
         if let Ok(p) = std::env::var("KS_LOADER_PATH") {
             let path = std::path::PathBuf::from(&p);
             if path.is_file() {
@@ -718,7 +660,6 @@ mod linux_impl {
             log::warn!("[cloader] KS_LOADER_PATH={}但文件不存在,改用内嵌", p);
         }
 
-        // 从二进制内嵌static ks_loader释放到临时文件(0500可执行)
         let bytes = crate::loader::ebpf_objects::ks_loader_static().ok_or_else(|| {
             anyhow::anyhow!(
                 "二进制内无内嵌ks_loader(编译期static预编失败);\
@@ -728,11 +669,9 @@ mod linux_impl {
         release_to_temp("ks_loader", bytes, 0o500)
     }
 
-    /// 查找ks_main_ancient_nobtf.o(NOBTF tier eBPF字节码),优先级:先看环境变量KS_EBPF_DIR加ks_main_ancient_nobtf.o(调试覆盖),再从二进制内嵌字节码释放到临时文件(单二进制,去磁盘.o依赖)。
     fn find_ancient_nobtf_object() -> anyhow::Result<std::path::PathBuf> {
         const OBJ_NAME: &str = "ks_main_ancient_nobtf.o";
 
-        // 环境变量KS_EBPF_DIR(调试覆盖)
         if let Ok(dir) = std::env::var("KS_EBPF_DIR") {
             let p = std::path::PathBuf::from(&dir).join(OBJ_NAME);
             if p.is_file() {
@@ -746,7 +685,6 @@ mod linux_impl {
             );
         }
 
-        // 从二进制内嵌字节码释放到临时文件(0400只读,ks_loader读取即可)
         let bytes =
             crate::loader::ebpf_objects::ebpf_object_for("ancient_nobtf").ok_or_else(|| {
                 anyhow::anyhow!(
@@ -758,7 +696,6 @@ mod linux_impl {
         release_to_temp(OBJ_NAME, bytes, 0o400)
     }
 
-    /// 查找ks_main_legacy_nobtf.o(4.19无BTF路径,C loader加载)。
     fn find_legacy_nobtf_object() -> anyhow::Result<std::path::PathBuf> {
         const OBJ_NAME: &str = "ks_main_legacy_nobtf.o";
 
@@ -793,7 +730,6 @@ mod mock_only {
     use crate::loader::{BpfMapReader, MockBpfMapReader};
     use std::sync::Arc;
 
-    /// 非Linux平台返回mock事件源加MockBpfMapReader。
     pub async fn default_event_source() -> (Box<dyn EventSource>, Option<Arc<dyn BpfMapReader>>) {
         (
             Box::new(MockEventSource::new_with_all_scenarios().with_loop(true)),

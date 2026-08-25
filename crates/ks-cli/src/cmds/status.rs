@@ -12,19 +12,26 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
 
     println!("{}", "── 1. eBPF 探针配置 ──".cyan().bold());
     println!();
-    println!("  内置探针（核心 9 组 另有 E4 容器逃逸/LKM加载/eBPF防护 3 组）");
+    println!("  内置探针（16 个: 5 tracepoint + 11 kprobe，与 loader.rs 实际加载列表一致）");
     println!();
 
     let probes = [
         ("trace_sys_enter", "tracepoint", "raw_syscalls/sys_enter", "是"),
         ("trace_sys_exit", "tracepoint", "raw_syscalls/sys_exit", "是"),
-        ("trace_sched_exec", "tracepoint", "sched/sched_process_exec", "是"),
-        ("trace_sched_exit", "tracepoint", "sched/sched_process_exit", "是"),
+        ("trace_sched_fork", "tracepoint", "sched/sched_process_fork", "是"),
+        ("trace_sched_exec_tree", "tracepoint", "sched/sched_process_exec", "是"),
+        ("trace_sched_exit_tree", "tracepoint", "sched/sched_process_exit", "是"),
         ("kprobe_vfs_open", "kprobe", "vfs_open", "是"),
         ("kprobe_vfs_write", "kprobe", "vfs_write", "是"),
         ("kprobe_vfs_unlink", "kprobe", "vfs_unlink", "是"),
         ("kprobe_tcp_connect", "kprobe", "tcp_v4_connect", "是"),
+        ("kprobe_tcp_v6_connect", "kprobe", "tcp_v6_connect", "是"),
         ("kprobe_udp_sendmsg", "kprobe", "udp_sendmsg", "是"),
+        ("kprobe_tcp_set_state_flow", "kprobe", "tcp_set_state", "是"),
+        ("kprobe_tcp_sendmsg_flow", "kprobe", "tcp_sendmsg", "是"),
+        ("kprobe_commit_creds", "kprobe", "commit_creds", "是"),
+        ("kprobe_do_init_module", "kprobe", "do_init_module", "是"),
+        ("kprobe_security_bpf_prog_free", "kprobe", "security_bpf_prog_free", "是"),
     ];
 
     let mut t = new_table();
@@ -40,7 +47,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     }
     println!("{t}");
     println!();
-    println!("  覆盖范围: 系统调用×2 + 进程调度×2 + VFS×3 + 网络栈×2 (核心 9 组)");
+    println!("  覆盖范围: 系统调用×2 + 进程调度×3 + VFS×3 + 网络栈×5 + 安全探针×3 (共 16 组)");
     println!("  采集深度: VFS 层 比 syscall 更底层 能捕获内核态操作");
 
     println!();
@@ -48,8 +55,6 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!();
 
     let loader = ks_engine::loader::EbpfLoader::new();
-    // status不加载eBPF(不调start),map_reader()返回None时用MockBpfMapReader
-    // 兜底显示map配置,is_mock标记让输出如实标注是mock统计而非真实计数
     let (map_reader, is_mock): (Arc<dyn BpfMapReader>, bool) = match loader.map_reader() {
         Some(mr) => (mr, false),
         None => (Arc::new(MockBpfMapReader), true),
@@ -106,7 +111,6 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("{}", "── 5. 检测规则集 ──".cyan().bold());
     println!();
     println!("  规则格式: YAML + Field 枚举 字段名拼写错误会在加载时报错");
-    // 动态读rules/目录,数量始终与实际一致
     let mut rule_files: Vec<String> = std::fs::read_dir("rules/")
         .map(|rd| {
             rd.filter_map(|e| e.ok())
@@ -167,7 +171,6 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("  kernelsentinel start       → 启动实时监控");
     println!("  kernelsentinel replay <file> → 取证回放 含哈希链校验 + 攻击链可视化");
 
-    // status动态监控模式,定期清屏重绘map配置与运行实例
     if watch {
         println!();
         println!("{}", format!("── 动态刷新 每 {}s Ctrl+C 退出 ──", interval).cyan().bold());
@@ -182,7 +185,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
                 _ = tokio::time::sleep(dur) => {}
             }
             tick += 1;
-            print!("\x1B[2J\x1B[H"); // 清屏加光标归位
+            print!("\x1B[2J\x1B[H");
             println!("{} 动态刷新 第 {} 次 {}", "╔".cyan().bold(), tick, "╗".cyan().bold());
             for map_name in &maps {
                 if let Ok(s) = map_reader.read_map(map_name) {
@@ -193,7 +196,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
                 Ok(content) => println!("  运行实例: {}", content.trim().replace('\n', " ")),
                 Err(_) => println!("  运行实例: (未检测到 start 进程)"),
             }
-            let _ = std::io::stdout().flush(); // 非TTY管道下强制每tick刷新,避免块缓冲丢失
+            let _ = std::io::stdout().flush();
         }
     }
 

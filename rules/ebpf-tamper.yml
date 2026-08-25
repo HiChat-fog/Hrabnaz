@@ -1,27 +1,7 @@
-# 检测规则 — eBPF 程序篡改 (eBPF Tamper)
-#
-# E4.4.3: 匹配 event_type=82 (EVENT_EBPF_TAMPER) 的安全探针事件。
-# 探针位置: ks_probes_self_protect.h → kprobe/security_bpf_prog_free
-# 探针在 BPF 程序被卸载/释放时触发，捕获 pid/uid/prog_name[64]/comm[16]/action[16]。
-#
-# 检测策略: 任何 BPF 程序卸载/篡改 → 直接 critical
-# 攻击者卸载安全监控 BPF 程序是典型的防御规避行为，
-# 用于绕过 EDR/监控后再执行后续攻击。
-#
-# E4.4 重构: Field 枚举新增 prog_name/action 字段，用户态可直接解码探针提交的
-# 程序名和动作。当前规则仍以 comm 字段匹配 BPF 管理工具 (bpftool) 及可能卸载 BPF
-# 的进程 (rmmod/systemd/kill)，这些进程触发 security_bpf_prog_free 时高度疑似防御规避。
-# prog_name/action 可用于后续精细化过滤 (如仅匹配本项目探针名前缀 kprobe_*)。
-#
-# MITRE ATT&CK: TA0005 Defense Evasion / T1562 Impair Defenses
-#               (T1562.001 Disable or Modify Tools 的子类型)
-
 - name: "eBPF 程序篡改检测"
   description: "检测 BPF 程序被卸载/篡改 (event_type=82, 探针: kprobe/security_bpf_prog_free)"
   severity: critical
   conditions:
-    # 必须是真正的 BPF 卸载事件 (event_type=82)，避免 systemd/kill 的普通
-    # open/exec 事件因 comm 含 systemd 而误报。
     - field: event_type
       operator: equals
       value: "82"

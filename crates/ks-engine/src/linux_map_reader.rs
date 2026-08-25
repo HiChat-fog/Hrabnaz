@@ -1,13 +1,3 @@
-//! LinuxBpfMapReader,通过aya::Ebpf真实读取BPF map统计信息与条目。
-//!
-//! 持有Arc<Mutex<aya::Ebpf>>引用,与EbpfLoader共享同一个Ebpf实例。
-//! 5个共享map:risk_scores、ip_whitelist、net_conn_history、freq_counters、infer_config。
-//! 事件map(events/tree_events等)已被take_map移走,不在此读取。
-//!
-//! aya 0.14借用语义:bpf.map(name)返回Option<&Map>,HashMap::<&MapData,K,V>::try_from(&Map)
-//! 在锁内拿&Map后构造typed reader并iter()。HASH/LRU_HASH的entry_count用iter().count()真实计数,
-//! ARRAY/PERCPU_ARRAY用max_entries(所有槽位始终存在)。
-
 #![cfg(target_os = "linux")]
 
 use std::sync::{Arc, Mutex};
@@ -18,7 +8,6 @@ use serde_json::{Value, json};
 
 use crate::loader::{BpfMapReader, MapSnapshot, MapStat};
 
-/// 5个共享map(事件map已被take_map移走,不在此读取)。
 const SHARED_MAPS: &[&str] = &[
     "risk_scores",
     "ip_whitelist",
@@ -28,7 +17,6 @@ const SHARED_MAPS: &[&str] = &[
     "protected_comms",
 ];
 
-/// net_conn_history的key,跟common.h的struct net_conn_key字节级一致
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NetConnKey {
@@ -40,7 +28,6 @@ struct NetConnKey {
 }
 unsafe impl Pod for NetConnKey {}
 
-/// freq_counters的value,跟common.h的struct freq_counter字节级一致
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 struct FreqCounter {
@@ -57,7 +44,6 @@ struct FreqCounter {
 }
 unsafe impl Pod for FreqCounter {}
 
-/// 真实BPF map读取器,持有Arc<Mutex<aya::Ebpf>>共享Ebpf实例。
 pub struct LinuxBpfMapReader {
     bpf: Arc<Mutex<aya::Ebpf>>,
 }
@@ -67,7 +53,6 @@ impl LinuxBpfMapReader {
         Self { bpf }
     }
 
-    /// 从aya::maps::Map提取内部&MapData引用(所有variant都只包一个MapData)。
     fn map_data_ref(map: &aya::maps::Map) -> &aya::maps::MapData {
         match map {
             aya::maps::Map::Array(md)
@@ -143,8 +128,6 @@ impl LinuxBpfMapReader {
         }
     }
 
-    /// 按map名分发typed reader,锁内读条目并转JSON。
-    /// PERCPU map(freq_counters在common.h是普通LRU_HASH,非PERCPU)用普通HashMap读。
     fn read_entries(&self, map_name: &str) -> (usize, Vec<Value>) {
         let bpf = self.bpf.lock().expect("Ebpf Mutex中毒");
         let map = match bpf.map(map_name) {
@@ -219,7 +202,6 @@ impl LinuxBpfMapReader {
                 }
             }
             "infer_config" => {
-                //ARRAY:所有槽位始终存在,max_entries即真实条目数,逐个读出非零配置
                 let md = Self::map_data_ref(map);
                 if let Ok(info) = md.info() {
                     let max = info.max_entries() as usize;
@@ -239,7 +221,6 @@ impl LinuxBpfMapReader {
                     let mut entries = Vec::new();
                     for kv in hm.iter() {
                         if let Ok((key, flag)) = kv {
-                            //16字节comm,截到首个\0
                             let end = key.iter().position(|&b| b == 0).unwrap_or(16);
                             let comm = String::from_utf8_lossy(&key[..end]).to_string();
                             entries.push(json!({"comm": comm, "protected": flag}));
@@ -285,8 +266,6 @@ impl BpfMapReader for LinuxBpfMapReader {
     }
 
     fn list_map_stats(&self) -> Vec<MapStat> {
-        //复用read_map拿真实entry_count(HASH类iter().count()),避免运维面板显示0条
-        //read_map内部已锁,这里不持锁,逐个map调一次。stats端点低频,可接受。
         SHARED_MAPS
             .iter()
             .map(|&name| {

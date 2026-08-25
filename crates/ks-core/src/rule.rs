@@ -80,7 +80,6 @@ pub enum Field {
     TargetPid,
     #[serde(rename = "signal")]
     Signal,
-    // 新增字段(容器逃逸、LKM加载、eBPF篡改探针)
     #[serde(rename = "module_name")]
     ModuleName,
     #[serde(rename = "prog_name")]
@@ -104,7 +103,6 @@ impl Field {
             Field::Pid | Field::Ppid | Field::Uid | Field::SyscallNr |
             Field::Sport | Field::Dport | Field::TargetPid | Field::Signal |
             Field::FileBytes | Field::EventType |
-            // E4.4: 容器逃逸数值字段
             Field::SourceNsInum | Field::TargetNsInum | Field::CapEff
         )
     }
@@ -115,7 +113,6 @@ impl Field {
             Field::Comm | Field::Filename | Field::Args |
             Field::Saddr | Field::Daddr | Field::Proto |
             Field::Saddr6 | Field::Daddr6 | Field::Family |
-            // LKM和eBPF字符串字段
             Field::ModuleName | Field::ProgName | Field::Action
         )
     }
@@ -140,7 +137,6 @@ impl Field {
             Field::Family => "family",
             Field::TargetPid => "target_pid",
             Field::Signal => "signal",
-            // E4.4 新增字段
             Field::ModuleName => "module_name",
             Field::ProgName => "prog_name",
             Field::SourceNsInum => "source_ns_inum",
@@ -171,7 +167,6 @@ impl Field {
             "family",
             "target_pid",
             "signal",
-            // E4.4 新增字段
             "module_name",
             "prog_name",
             "source_ns_inum",
@@ -208,7 +203,6 @@ pub enum Operator {
     LessThanOrEqual,
     #[serde(rename = "not_equals")]
     NotEquals,
-    /// 值不匹配给定正则(用于"非私有IP"等反向匹配,规避Rust regex不支持look-around)
     #[serde(rename = "not_regex")]
     NotRegex,
 }
