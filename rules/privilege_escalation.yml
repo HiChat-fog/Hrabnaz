@@ -1,21 +1,7 @@
-# 提权检测规则集
-#
-# MITRE ATT&CK: TA0004 - Privilege Escalation
-#
-# 检测维度:
-#   - SUID 提权: chmod +s 设置特殊权限位
-#   - sudoers 篡改: 修改 sudo 配置文件
-#   - LD_PRELOAD 劫持: 动态链接库注入
-#   - ptrace 进程注入: 调试器附加
-#   - 内核模块加载: insmod/finit_module
-#   - Cron 持久化: 定时任务 (常与提权组合使用)
-
 - name: "SUID 提权检测"
   description: "检测通过 chmod 设置 SUID 位进行提权的行为"
   severity: critical
   conditions:
-    # chmod 是命令名 (comm)，不是文件名 (filename)
-    # 事件来源: syscall_probe 的 execve 事件或 chmod 系统调用
     - field: comm
       operator: equals
       value: "chmod"
@@ -34,7 +20,6 @@
       operator: equals
       value: "101"
   alert_message: "检测到 ptrace 系统调用，疑似进程注入"
-  # ptrace 注入是 T1055.009 (Proc Memory), 不是 T1055.008 (TLS Injection)
   mitre_tactic: "TA0004"
   mitre_technique: "T1055.009"
 
@@ -68,8 +53,6 @@
       operator: regex
       value: "(insmod|modprobe)"
   alert_message: "检测到内核模块加载操作，可能是 Rootkit 安装"
-  # T1547.006 (Kernel Modules) 的主战术是 Persistence (TA0003)
-  # Rootkit 同时兼有 Defense Evasion (TA0005) 属性
   mitre_tactic: "TA0003"
   mitre_technique: "T1547.006"
 

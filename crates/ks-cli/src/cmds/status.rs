@@ -3,62 +3,58 @@ use ks_engine::loader::{BpfMapReader, MockBpfMapReader};
 use std::io::Write;
 use std::sync::Arc;
 
+use colored::Colorize;
+use super::ui::{banner, new_table};
+
 pub async fn run(watch: bool, interval: u64) -> Result<()> {
-    println!("╔══════════════════════════════════════════╗");
-    println!("║  内核哨兵 v0.1.0 — 系统状态报告            ║");
-    println!("╚══════════════════════════════════════════╝");
+    banner("内核哨兵 v0.1.0 — 系统状态报告");
     println!();
 
-    println!("── 1. eBPF 探针配置 ──");
+    println!("{}", "── 1. eBPF 探针配置 ──".cyan().bold());
     println!();
-    println!("  内置探针（核心 9 组 另有 E4 容器逃逸/LKM加载/eBPF防护 3 组）");
+    println!("  内置探针（16 个: 5 tracepoint + 11 kprobe，与 loader.rs 实际加载列表一致）");
     println!();
-    println!(
-        "  {:<4} {:<28} {:<10} {:<24} {:<8}",
-        "#", "探针名称", "类型", "挂载点", "内置"
-    );
-    println!(
-        "  {} {} {} {} {}",
-        "─".repeat(4),
-        "─".repeat(28),
-        "─".repeat(10),
-        "─".repeat(24),
-        "─".repeat(8)
-    );
 
     let probes = [
         ("trace_sys_enter", "tracepoint", "raw_syscalls/sys_enter", "是"),
         ("trace_sys_exit", "tracepoint", "raw_syscalls/sys_exit", "是"),
-        ("trace_sched_exec", "tracepoint", "sched/sched_process_exec", "是"),
-        ("trace_sched_exit", "tracepoint", "sched/sched_process_exit", "是"),
+        ("trace_sched_fork", "tracepoint", "sched/sched_process_fork", "是"),
+        ("trace_sched_exec_tree", "tracepoint", "sched/sched_process_exec", "是"),
+        ("trace_sched_exit_tree", "tracepoint", "sched/sched_process_exit", "是"),
         ("kprobe_vfs_open", "kprobe", "vfs_open", "是"),
         ("kprobe_vfs_write", "kprobe", "vfs_write", "是"),
         ("kprobe_vfs_unlink", "kprobe", "vfs_unlink", "是"),
         ("kprobe_tcp_connect", "kprobe", "tcp_v4_connect", "是"),
+        ("kprobe_tcp_v6_connect", "kprobe", "tcp_v6_connect", "是"),
         ("kprobe_udp_sendmsg", "kprobe", "udp_sendmsg", "是"),
+        ("kprobe_tcp_set_state_flow", "kprobe", "tcp_set_state", "是"),
+        ("kprobe_tcp_sendmsg_flow", "kprobe", "tcp_sendmsg", "是"),
+        ("kprobe_commit_creds", "kprobe", "commit_creds", "是"),
+        ("kprobe_do_init_module", "kprobe", "do_init_module", "是"),
+        ("kprobe_security_bpf_prog_free", "kprobe", "security_bpf_prog_free", "是"),
     ];
 
+    let mut t = new_table();
+    t.set_header(vec!["#", "探针名称", "类型", "挂载点", "内置"]);
     for (i, (name, type_, mount, state)) in probes.iter().enumerate() {
-        println!(
-            "  {:<4} {:<28} {:<10} {:<24} {:<8}",
-            i + 1,
-            name,
-            type_,
-            mount,
-            state
-        );
+        t.add_row(vec![
+            (i + 1).to_string(),
+            name.to_string(),
+            type_.to_string(),
+            mount.to_string(),
+            state.to_string(),
+        ]);
     }
+    println!("{t}");
     println!();
-    println!("  覆盖范围: 系统调用×2 + 进程调度×2 + VFS×3 + 网络栈×2 (核心 9 组)");
+    println!("  覆盖范围: 系统调用×2 + 进程调度×3 + VFS×3 + 网络栈×5 + 安全探针×3 (共 16 组)");
     println!("  采集深度: VFS 层 比 syscall 更底层 能捕获内核态操作");
 
     println!();
-    println!("── 2. eBPF Map 配置 ──");
+    println!("{}", "── 2. eBPF Map 配置 ──".cyan().bold());
     println!();
 
     let loader = ks_engine::loader::EbpfLoader::new();
-    // status不加载eBPF(不调start),map_reader()返回None时用MockBpfMapReader
-    // 兜底显示map配置,is_mock标记让输出如实标注是mock统计而非真实计数
     let (map_reader, is_mock): (Arc<dyn BpfMapReader>, bool) = match loader.map_reader() {
         Some(mr) => (mr, false),
         None => (Arc::new(MockBpfMapReader), true),
@@ -86,7 +82,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     }
 
     println!();
-    println!("── 3. 内核推理引擎 ──");
+    println!("{}", "── 3. 内核推理引擎 ──".cyan().bold());
     println!();
     println!("  推理机制: eBPF 程序内嵌推理函数 零浮点运算");
     println!("  风险累积: LRU Hash Map (PID → 0-100 累计风险分)");
@@ -102,7 +98,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("    ≥70 分 → bpf_send_signal 内核态主动阻断");
 
     println!();
-    println!("── 4. 取证日志保护 ──");
+    println!("{}", "── 4. 取证日志保护 ──".cyan().bold());
     println!();
     println!("  格式:     JSONL + SHA-256 哈希链 防篡改");
     println!("  机制:     每条记录包含 hash=SHA256(内容) + prev_hash=上一条hash");
@@ -112,10 +108,9 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("  链尾哈希: 运行 start 后生成 replay 命令可验证");
 
     println!();
-    println!("── 5. 检测规则集 ──");
+    println!("{}", "── 5. 检测规则集 ──".cyan().bold());
     println!();
     println!("  规则格式: YAML + Field 枚举 字段名拼写错误会在加载时报错");
-    // 动态读rules/目录,数量始终与实际一致
     let mut rule_files: Vec<String> = std::fs::read_dir("rules/")
         .map(|rd| {
             rd.filter_map(|e| e.ok())
@@ -135,7 +130,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("    TA0005 防御规避 / TA0006 凭据访问 / TA0010 数据窃取 / TA0011 命令控制");
 
     println!();
-    println!("── 6. 系统配置 ──");
+    println!("{}", "── 6. 系统配置 ──".cyan().bold());
     println!();
 
     let config = ks_engine::config::Config::default();
@@ -176,10 +171,9 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("  kernelsentinel start       → 启动实时监控");
     println!("  kernelsentinel replay <file> → 取证回放 含哈希链校验 + 攻击链可视化");
 
-    // status动态监控模式,定期清屏重绘map配置与运行实例
     if watch {
         println!();
-        println!("── 动态刷新 每 {}s Ctrl+C 退出 ──", interval);
+        println!("{}", format!("── 动态刷新 每 {}s Ctrl+C 退出 ──", interval).cyan().bold());
         let dur = std::time::Duration::from_secs(interval.max(1));
         let mut tick: u64 = 0;
         loop {
@@ -191,8 +185,8 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
                 _ = tokio::time::sleep(dur) => {}
             }
             tick += 1;
-            print!("\x1B[2J\x1B[H"); // 清屏加光标归位
-            println!("╔ 动态刷新 第 {} 次 ╗", tick);
+            print!("\x1B[2J\x1B[H");
+            println!("{} 动态刷新 第 {} 次 {}", "╔".cyan().bold(), tick, "╗".cyan().bold());
             for map_name in &maps {
                 if let Ok(s) = map_reader.read_map(map_name) {
                     println!("  {:<20} {:<14} {} 条", s.name, s.map_type, s.entry_count);
@@ -202,7 +196,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
                 Ok(content) => println!("  运行实例: {}", content.trim().replace('\n', " ")),
                 Err(_) => println!("  运行实例: (未检测到 start 进程)"),
             }
-            let _ = std::io::stdout().flush(); // 非TTY管道下强制每tick刷新,避免块缓冲丢失
+            let _ = std::io::stdout().flush();
         }
     }
 

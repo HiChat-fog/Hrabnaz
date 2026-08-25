@@ -20,17 +20,6 @@ static __always_inline int read_file_path(struct file *f, u8 *dst, int dst_len) 
 SEC("kprobe/vfs_open")
 int BPF_KPROBE(kprobe_vfs_open, struct path *path, struct file *file) {
     smart_filter_handle_vfs_open(path);
-
-    struct file_event *evt = KS_RESERVE(events, struct file_event);
-    if (!evt) return 0;
-
-    fill_header(&evt->header, EVENT_FILE_OPEN);
-    evt->header.syscall_nr = 2;
-    read_full_path(path, evt->filename, sizeof(evt->filename));
-    evt->fd = -1;  evt->bytes = 0;  evt->flags = 0;
-
-    infer_sensitive_file((const char *)evt->filename, evt->header.pid);
-    KS_SUBMIT(ctx, events, evt);
     return 0;
 }
 
@@ -68,4 +57,4 @@ int BPF_KPROBE(kprobe_vfs_unlink, struct inode *dir, struct dentry *dentry, stru
     return 0;
 }
 
-#endif // KS_PROBES_VFS_H
+#endif

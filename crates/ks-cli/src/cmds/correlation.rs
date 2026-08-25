@@ -1,19 +1,14 @@
-//! `kernelsentinel correlation`子命令,查看最近的跨事件关联告警。
-//!
-//! 通过HTTP GET /api/v1/correlations拉取ServerState中的关联告警存储(由start.rs在correlation_engine产生告警时推送)。
-
 use anyhow::Result;
 use ks_engine::correlation::CorrelationAlert;
+use colored::Colorize;
+use super::ui::{banner, severity_colored};
 
 #[derive(clap::Args, Debug)]
 pub struct CorrelationArgs {
-    /// ks-server地址
     #[arg(short, long, default_value = "http://127.0.0.1:3000")]
     pub server: String,
-    /// 拉取条数(默认50)
     #[arg(short, long, default_value_t = 50)]
     pub limit: usize,
-    /// 输出JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
@@ -35,9 +30,7 @@ pub async fn run(args: &CorrelationArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║  跨事件关联告警 — {:<6} 条", alerts.len());
-    println!("╚════════════════════════════════════════════════════════════════╝");
+    banner(&format!("跨事件关联告警 — {} 条", alerts.len()));
     println!();
 
     if alerts.is_empty() {
@@ -54,15 +47,15 @@ pub async fn run(args: &CorrelationArgs) -> Result<()> {
             .unwrap_or_else(|| "-".to_string());
         let evt_count = a.events.len();
         println!(
-            "  [{:>3}] [{}] {} — 置信度 {:.0}% ({} 事件)",
-            i + 1,
-            a.severity,
-            a.rule_name,
+            "  {} {} {} — 置信度 {:.0}% ({} 事件)",
+            format!("#{:<3}", i + 1).dimmed(),
+            severity_colored(&format!("[{}]", a.severity), &a.severity),
+            a.rule_name.bold(),
             a.confidence * 100.0,
             evt_count
         );
-        println!("        描述: {}", a.description);
-        println!("        MITRE: {}", mitre);
+        println!("        {} {}", "描述:".dimmed(), a.description);
+        println!("        {} {}", "MITRE:".dimmed(), mitre);
     }
 
     println!();

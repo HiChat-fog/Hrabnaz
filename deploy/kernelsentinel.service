@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/kernelsentinel start --rules /etc/kernelsentinel/rules --log-dir /var/log/kernelsentinel --sd-notify
+ExecStart=/usr/local/bin/kernelsentinel start --rules-dir /etc/kernelsentinel/rules --log-dir /var/log/kernelsentinel --sd-notify
 Restart=on-failure
 RestartSec=5
 User=root

@@ -1,30 +1,7 @@
-# 检测规则 — 容器逃逸 (Container Escape)
-#
-# E4.4.1: 匹配 event_type=80 (EVENT_CONTAINER_ESCAPE) 的安全探针事件。
-# 探针位置: ks_probes_container.h → kprobe/commit_creds
-# 探针在进程切换 cred (setuid/setgid/setns/sudo 等) 时触发，
-# 捕获 pid/uid/source_ns_inum/target_ns_inum/cap_eff/comm。
-#
-# 命名空间逃逸典型场景:
-#   - 容器内进程调用 setns(CLONE_NEWNS) 切换到宿主 mnt_ns
-#   - 容器内特权进程通过 /proc/1/root/pivot_root 逃逸
-#   - 容器内 CAP_SYS_ADMIN + mount 嫁接
-#   - Docker/runc CVE (如 CVE-2019-5736) 利用 commit_creds 提权
-#
-# E4.4 重构: Field 枚举新增 source_ns_inum/target_ns_inum/cap_eff 字段，
-# 用户态可直接解码探针提交的命名空间/cap 信息。当前规则仍以 comm 字段
-# 匹配容器运行时进程 (runc/docker/containerd) 及命名空间操作工具 (setns/unshare)，
-# 这些进程触发 commit_creds 时高度可疑容器逃逸。
-# source_ns_inum != target_ns_inum 也可作为逃逸判据 (NOBTF 路径下探针暂留 0，留待 BTF 路径补全)。
-#
-# MITRE ATT&CK: TA0004 Privilege Escalation / T1611 Escape to Host
-
 - name: "容器逃逸检测"
   description: "检测容器内进程通过 commit_creds 切换命名空间或提升权限 (event_type=80, 探针: kprobe/commit_creds)"
   severity: critical
   conditions:
-    # 必须是真正的 commit_creds 安全探针事件 (event_type=80)，避免普通
-    # setns/unshare 进程的 open/exec 事件因 comm 匹配而误报。
     - field: event_type
       operator: equals
       value: "80"

@@ -1,9 +1,6 @@
 use crate::EventType as ET;
 use serde::{Deserialize, Serialize};
 
-// 所有事件结构体都用#[repr(C)],跟eBPF C代码内存布局对齐。
-// ring buffer读出来的字节直接cast过来。
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct EventHeader {
@@ -63,8 +60,6 @@ pub struct SignalEvent {
     pub signal: i32,
 }
 
-/// 容器逃逸探针事件(镜像ks_probes_container.h的container_escape_event)。
-/// event_type=80,kprobe/commit_creds触发。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ContainerEscapeEvent {
@@ -78,8 +73,6 @@ pub struct ContainerEscapeEvent {
     pub comm: [u8; 16],
 }
 
-/// 内核模块加载探针事件(镜像ks_probes_lkm.h的lkm_load_event)。
-/// event_type=81,kprobe/do_init_module触发。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct LkmLoadEvent {
@@ -91,8 +84,6 @@ pub struct LkmLoadEvent {
     pub comm: [u8; 16],
 }
 
-/// eBPF程序篡改探针事件(镜像ks_probes_self_protect.h的ebpf_tamper_event)。
-/// event_type=82,kprobe/security_bpf_prog_free触发。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EbpfTamperEvent {
@@ -105,7 +96,6 @@ pub struct EbpfTamperEvent {
     pub action: [u8; 16],
 }
 
-// 编译期静态断言每个事件结构体大小。若C端与Rust端任一字段遗漏或对齐不一致,此处编译期失败报错,而非运行时数据错乱。
 const _: () = assert!(core::mem::size_of::<EventHeader>() == 64);
 const _: () = assert!(core::mem::size_of::<ExecEvent>() == 832);
 const _: () = assert!(core::mem::size_of::<FileEvent>() == 336);
@@ -129,7 +119,6 @@ pub union RawEvent {
     pub ebpf_tamper: EbpfTamperEvent,
 }
 
-/// 每种事件类型对应的结构体大小,做越界检查用。
 pub fn min_event_size(event_type: u32) -> usize {
     match event_type {
         v if v == ET::ProcessExec as u32 => core::mem::size_of::<ExecEvent>(),
@@ -149,16 +138,6 @@ pub fn min_event_size(event_type: u32) -> usize {
 }
 
 impl RawEvent {
-    /// 从ring buffer裸字节解析事件。
-    /// 先读event_type判断类型,再按需做完整长度校验,用read_unaligned避免对齐UB。
-    ///
-    /// 注意:任何事件struct(如SignalEvent=72B、NetEvent=112B、FileEvent=336B)都小于RawEvent union大小(832B=ExecEvent大小)。直接read_unaligned(data.as_ptr() as *const RawEvent)会无条件读满832字节,对struct小于832的事件触发OOB读,并行测试下可能撞未映射页导致SIGSEGV。
-    /// 修复:用栈缓冲零填充,先清零832字节栈缓冲,再copy实际数据,最后read_unaligned。
-    ///
-    /// # Safety
-    ///
-    /// 调用方必须保证data指向有效内存且data.len() >= size_of::<EventHeader>()。
-    /// 函数内部已做两阶段长度校验并用栈缓冲零填充避免OOB读,对任意长度的data均安全。
     pub unsafe fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < core::mem::size_of::<EventHeader>() {
             return None;
@@ -171,8 +150,6 @@ impl RawEvent {
             return None;
         }
 
-        // 栈缓冲零填充:先清零整个RawEvent大小,再copy实际数据,避免OOB读。
-        // 栈缓冲本身在栈上分配,访问整个832字节范围安全,不会撞未映射页。
         let mut buf = [0u8; core::mem::size_of::<RawEvent>()];
         let copy_len = data.len().min(buf.len());
         core::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr(), copy_len);
@@ -196,14 +173,8 @@ mod tests {
         assert_eq!(mem::size_of::<FileEvent>(), 336);
         assert_eq!(mem::size_of::<NetEvent>(), 112);
         assert_eq!(mem::size_of::<SignalEvent>(), 72);
-        // 新增结构体大小校验,与eBPF C端布局对齐
-        // 注意:struct align跟EventHeader的最大字段(u64)一致为8,
-        // 因此struct size必须是8的倍数(尾部padding)。
-        // ContainerEscapeEvent: 64 + 6*4 + 16 = 104(8倍数,无padding)
         assert_eq!(mem::size_of::<ContainerEscapeEvent>(), 104);
-        // LkmLoadEvent: 64 + 3*4 + 64 + 16 = 156,向上对齐到160
         assert_eq!(mem::size_of::<LkmLoadEvent>(), 160);
-        // EbpfTamperEvent: 64 + 3*4 + 64 + 16 + 16 = 172,向上对齐到176
         assert_eq!(mem::size_of::<EbpfTamperEvent>(), 176);
     }
 
@@ -251,26 +222,20 @@ mod tests {
         assert_eq!(af::AF_INET6, 10);
     }
 
-    /// 回归测试:小于RawEvent union size(832B)的事件不应触发OOB读。
-    /// 历史bug:直接read_unaligned(data.as_ptr() as *const RawEvent)会读满832字节,对struct小于832的事件(如SignalEvent=72B)触发OOB读,并行测试下撞未映射页导致SIGSEGV。
-    /// 修复后用栈缓冲零填充,应安全读取任意size >= min_event_size的数据。
     #[test]
     fn test_from_bytes_small_event_no_oob_read() {
-        // SignalEvent仅72字节,远小于RawEvent union大小(832B)
         let mut data = vec![0u8; mem::size_of::<SignalEvent>()];
-        let etype: u32 = 30; // ProcSignal
+        let etype: u32 = 30;
         data[..4].copy_from_slice(&etype.to_ne_bytes());
         let result = unsafe { RawEvent::from_bytes(&data) };
         assert!(result.is_some());
 
-        // LkmLoadEvent 156字节
         let mut data = vec![0u8; mem::size_of::<LkmLoadEvent>()];
         let etype: u32 = 81;
         data[..4].copy_from_slice(&etype.to_ne_bytes());
         let result = unsafe { RawEvent::from_bytes(&data) };
         assert!(result.is_some());
 
-        // EbpfTamperEvent 172字节
         let mut data = vec![0u8; mem::size_of::<EbpfTamperEvent>()];
         let etype: u32 = 82;
         data[..4].copy_from_slice(&etype.to_ne_bytes());

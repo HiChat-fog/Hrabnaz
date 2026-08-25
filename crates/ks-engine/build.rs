@@ -1,17 +1,8 @@
-//! ks-engine build.rs: 编译eBPF C探针为字节码(.o)
-//!
-//! A3重构后:8个原.bpf.c已合并为单一编译单元ks_main.bpf.c。
-//! ks_main.bpf.c #include了7个ks_probes_*.h头文件,产物为单一ks_main.o。
-//! 共享maps(risk_scores/ip_whitelist/net_conn_history/freq_counters/infer_config)
-//! 与共享events ringbuf真正跨探针生效。
-
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    // cargo:rerun-if-changed=<dir>仅在目录内增删文件时触发,文件内容修改不触发。
-    // 显式列出每个.c/.h,确保BPF源码修改后强制重编.o。
     println!("cargo:rerun-if-changed=../ks-ebpf/src/bpf/");
     println!("cargo:rerun-if-changed=../ks-ebpf/src/bpf/ks_main.bpf.c");
     println!("cargo:rerun-if-changed=../ks-ebpf/src/bpf/common.h");
@@ -26,25 +17,21 @@ fn main() {
     println!("cargo:rerun-if-changed=../ks-ebpf/src/bpf/ks_probes_self_protect.h");
     println!("cargo:rerun-if-changed=../ks-ebpf/src/bpf/ks_probes_freq.h");
     println!("cargo:rerun-if-changed=../ks-ebpf/src/bpf/ks_probes_smart_filter.h");
-    // ks_loader.c改动须触发static预编重跑(否则嵌入的ks_loader二进制会过期)
     println!("cargo:rerun-if-changed=../ks-ebpf/scripts/ks_loader.c");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    // eBPF源码路径,相对于ks-engine crate
     let bpf_src_dir = manifest_dir.join("../ks-ebpf/src/bpf");
     if !bpf_src_dir.exists() {
         println!(
             "cargo:warning=eBPF源码目录不存在: {:?},跳过编译",
             bpf_src_dir
         );
-        // 仍写出ebpf_objects.rs(空consts),保证loader.rs的include!不破裂。
         write_ebpf_objects(&out_dir, &[], false);
         return;
     }
 
-    // 检测clang(兼容clang-18、clang-19、clang)
     let clang = ["clang-18", "clang-19", "clang"]
         .iter()
         .find_map(|name| which::which(name).ok())
@@ -52,23 +39,14 @@ fn main() {
 
     println!("cargo:warning=使用clang: {:?}", clang);
 
-    // 只编译合并后的单一入口ks_main.bpf.c
     let bpf_main = bpf_src_dir.join("ks_main.bpf.c");
     if !bpf_main.exists() {
         panic!("ks_main.bpf.c不存在: {:?} - A3合并工作未完成", bpf_main);
     }
 
-    // 头文件路径:源码目录(vmlinux.h、common.h、ks_probes_*.h)加系统bpf头
     let include_src = bpf_src_dir.to_str().unwrap().to_string();
     let include_bpf = "/usr/include/bpf".to_string();
 
-    // 编译各tier-specific .o
-    //   modern        5.8+ ringbuf
-    //   legacy        4.x perfbuf
-    //   ancient       3.10+ BTF backport (CO-RE, 需BTF)
-    //   ancient_nobtf 3.10+ 无BTF (硬编码offset, 无需kernel-plus)
-    //   legacy_nobtf  4.x无BTF (4.19原版/麒麟V10 SP1-SP2, 硬编码4.19 offset, perfbuf)
-    // 某tier编译失败时warn并跳过(不阻断Modern tier构建)
     let tiers: &[(&str, &str, &[&str])] = &[
         ("modern", "KS_TIER_MODERN", &[]),
         ("legacy", "KS_TIER_LEGACY", &[]),
@@ -114,8 +92,6 @@ fn main() {
                     suffix, tier_flag, extra_defines
                 );
 
-                // ancient_nobtf/legacy_nobtf tier需剥离.BTF.ext/.rel.BTF.ext段
-                // 无BTF内核(3.10 stock、4.19原版)verifier无法处理CO-RE重定位段,但保留.BTF段供aya parse_btf_maps解析map定义。
                 if *suffix == "ancient_nobtf" || *suffix == "legacy_nobtf" {
                     let objcopy = ["llvm-objcopy-18", "llvm-objcopy"]
                         .iter()
@@ -174,16 +150,11 @@ fn main() {
         println!("cargo:warning=Modern tier .o未编译成功,运行时将无法在5.8+ 内核上加载");
     }
 
-    // 预编static ks_loader并嵌入(nobtf路径去gcc + 单二进制)。
     let ks_loader_built = build_static_ks_loader(&out_dir, &manifest_dir);
 
-    // 生成ebpf_objects.rs,把编译成功的各tier .o和ks_loader用include_bytes!嵌入二进制。
     write_ebpf_objects(&out_dir, &compiled, ks_loader_built);
 }
 
-/// 生成OUT_DIR/ebpf_objects.rs,把compiled中列出的各tier .o用include_bytes!嵌入二进制。
-///
-/// 单二进制部署,消除运行时从磁盘读.o的依赖(env!("OUT_DIR")烤死构建机路径地雷)。仅emit实际编译成功的tier,未编译的tier不生成const和match arm,ebpf_object_for对其返回None,调用方fail loud(不静默回退磁盘读)。
 fn write_ebpf_objects(out_dir: &std::path::Path, compiled: &[String], ks_loader_built: bool) {
     let mut arms: Vec<String> = Vec::new();
     let mut lines: Vec<String> = vec![
@@ -193,7 +164,6 @@ fn write_ebpf_objects(out_dir: &std::path::Path, compiled: &[String], ks_loader_
         String::new(),
     ];
     for name in compiled {
-        // name形如ks_main_modern.o或ks_main_ancient_nobtf.o
         let suffix = name
             .strip_prefix("ks_main_")
             .and_then(|s| s.strip_suffix(".o"))
@@ -239,9 +209,6 @@ fn write_ebpf_objects(out_dir: &std::path::Path, compiled: &[String], ks_loader_
     std::fs::write(out_dir.join("ebpf_objects.rs"), body).expect("无法写入ebpf_objects.rs");
 }
 
-/// 预编static ks_loader二进制(nobtf C loader)到OUT_DIR。
-///
-/// gcc -static静态链接libelf加libz加libzstd,使ks_loader可在CentOS 7(glibc 2.17)等老内核运行(纯syscall加libelf,无NSS/dlopen,静态二进制跨glibc版本可移植)。编译失败(缺gcc或libelf.a等)则warn并返回false,nobtf路径回退到KS_LOADER_PATH磁盘查找。
 fn build_static_ks_loader(out_dir: &std::path::Path, manifest_dir: &std::path::Path) -> bool {
     let src = manifest_dir.join("../ks-ebpf/scripts/ks_loader.c");
     if !src.exists() {

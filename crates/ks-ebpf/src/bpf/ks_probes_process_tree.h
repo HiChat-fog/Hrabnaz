@@ -6,18 +6,6 @@
 #define EVENT_TREE_EXIT    42
 #define EVENT_TREE_ANOMALY 43
 
-#define KS_EXE_PATH_LEN 256  /* A5: 64 → 256，覆盖典型系统路径 */
-
-struct process_node {
-    u32 pid; u32 ppid;
-    u8  comm[16];
-    u8  exe_path[KS_EXE_PATH_LEN];
-    u32 flags;
-    u32 risk_score;
-    u64 create_time;
-    u64 exit_time;
-    u32 _pad_node1, _pad_node2;
-};
 
 #define PROC_FLAG_ROOT      (1 << 0)
 #define PROC_FLAG_CONTAINER (1 << 1)
@@ -35,8 +23,6 @@ struct process_tree_event {
     u32 _pad_tree1, _pad_tree2;
 };
 
-KS_LRU_HASH_MAP(process_tree, u32, struct process_node, 65536);
-
 KS_EVENT_MAP(tree_events, 1024 * 1024);
 
 struct anomaly_relation_key {
@@ -50,21 +36,12 @@ struct {
     __uint(max_entries, 64);
 } anomaly_relations SEC(".maps");
 
-/* ── A5: PERCPU_ARRAY scratch buffer ──────────────────────────
- * 扩 exe_path 64→256 后，process_node 约 312 字节。
- * fork handler 需同时持有 parent_info + child_node（共 624 字节），
- * 超过 BPF 栈 512 字节硬限制。用 PERCPU_ARRAY scratch 规避：
- * 每 CPU 一份独立 buffer，无锁，验证器视为非栈内存。
- */
 struct pt_scratch {
-    struct process_node parent_info;  /* fork: 父进程快照 */
-    struct process_node child_node;  /* fork: 子进程构造中 */
-    struct process_node updated;      /* exec: 节点更新中 */
+    struct process_node parent_info;
+    struct process_node child_node;
+    struct process_node updated;
 };
 
-/* 取当前 CPU 的 scratch，失败时直接返回（验证器友好）
- * C6/C7: 通过 KS_PERCPU_ARRAY_MAP 宏声明 + KS_PERCPU_KEY() 取 key，
- *        Ancient tier 自动回退到 CPU-keyed ARRAY（无 PERCPU_ARRAY 支持）*/
 KS_PERCPU_ARRAY_MAP(pt_scratch_map, struct pt_scratch);
 
 static __always_inline struct pt_scratch *pt_scratch_get(void) {
@@ -80,7 +57,6 @@ int trace_sched_fork(struct trace_event_raw_sched_process_fork *ctx) {
 
     u64 now = bpf_ktime_get_ns();
 
-    /* A5: 用 percpu scratch 替代栈变量，规避 BPF 栈 512 字节限制 */
     struct pt_scratch *s = pt_scratch_get();
     if (!s) return 0;
     struct process_node *parent_info = &s->parent_info;
@@ -152,7 +128,6 @@ int trace_sched_exec_tree(struct trace_event_raw_sched_process_exec *ctx) {
 
     u64 now = bpf_ktime_get_ns();
 
-    /* A5: 用 percpu scratch 替代栈变量 */
     struct pt_scratch *s = pt_scratch_get();
     if (!s) return 0;
     struct process_node *updated = &s->updated;
@@ -167,7 +142,6 @@ int trace_sched_exec_tree(struct trace_event_raw_sched_process_exec *ctx) {
     }
 
     bpf_get_current_comm(&updated->comm, sizeof(updated->comm));
-    /* kernel 6.17: 文件名通过 __data_loc_filename 偏移访问 */
     u16 filename_off = ctx->__data_loc_filename & 0xFFFF;
     const char *filename = (const void *)ctx + filename_off;
     bpf_probe_read_kernel_str(updated->exe_path, sizeof(updated->exe_path), filename);
@@ -228,4 +202,4 @@ int trace_sched_exit_tree(struct trace_event_raw_sched_process_template *ctx) {
     return 0;
 }
 
-#endif // KS_PROBES_PROCESS_TREE_H
+#endif

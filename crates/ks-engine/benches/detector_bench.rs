@@ -1,7 +1,3 @@
-//! detector性能压测:加载真实规则后match_event单事件。
-//! 验证regex预编译缓存对detector_match的提速。
-//! 运行:cargo bench -p ks-engine --bench detector_bench
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ks_core::event::EventHeader;
 use ks_engine::aggregator::DecodedEvent;
@@ -9,7 +5,7 @@ use ks_engine::detector::DetectionEngine;
 
 fn make_event() -> DecodedEvent {
     let header = EventHeader {
-        event_type: 1, //ProcessExec
+        event_type: 1,
         _pad1: 0,
         timestamp_ns: 1_625_340_000_000_000,
         pid: 1234,
@@ -44,7 +40,6 @@ fn make_event() -> DecodedEvent {
     }
 }
 
-//加载所有真实规则(9条,含10+个regex/not_regex条件)
 fn load_real_rules() -> DetectionEngine {
     let rules_dir = std::env::var("CARGO_MANIFEST_DIR")
         .map(|d| format!("{}/../../rules", d))

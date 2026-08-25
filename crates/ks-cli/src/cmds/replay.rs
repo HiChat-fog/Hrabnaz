@@ -4,6 +4,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use colored::*;
+use super::ui::{banner, severity_colored};
+
 fn mitre_phase_name(tactic: &str) -> &str {
     match tactic {
         "TA0001" => "初始入侵",
@@ -42,44 +45,44 @@ fn event_type_label(etype: u32) -> &'static str {
     }
 }
 
-pub async fn run(file: &str) -> Result<()> {
+pub async fn run(file: &str, json: bool) -> Result<()> {
     let path = Path::new(file);
     if !path.exists() {
         anyhow::bail!("文件不存在: {}", file);
     }
 
-    println!("╔══════════════════════════════════════════╗");
-    println!("║  内核哨兵 — 取证日志回放                   ║");
-    println!("╚══════════════════════════════════════════╝");
-    println!();
-    println!("日志文件: {}", file);
-
-    println!();
-    println!("── 阶段 1: 哈希链完整性校验 ──");
-    println!("  SHA-256 链式校验: 每条记录的 hash = SHA256(内容)");
-    println!("  prev_hash 机制:   每条记录包含上一条的 hash");
-    println!("  链断裂 = 日志被篡改 (插入/删除/修改任何记录)");
-    println!();
-
     let path_buf = path.to_path_buf();
     let verification = ks_engine::forensic::ForensicLogger::verify_chain(&path_buf)?;
 
-    if verification.is_valid {
-        println!(
-            "  [✓] 链完整性: 通过 — {} 条记录, 链完整无断裂",
-            verification.total_records
-        );
-    } else {
-        println!(
-            "  [✗] 链完整性: 断裂 — 第 {} 条记录处检测到篡改",
-            verification.broken_at.unwrap_or(0)
-        );
-        println!("  建议: 检查该记录是否被人为修改或插入");
-    }
+    if !json {
+        banner("内核哨兵 — 取证日志回放");
+        println!();
+        println!("日志文件: {}", file.cyan());
 
-    println!();
-    println!("── 阶段 2: 事件/告警解析 ──");
-    println!();
+        println!();
+        println!("{}", "── 阶段 1: 哈希链完整性校验 ──".cyan().bold());
+        println!("  SHA-256 链式校验: 每条记录的 hash = SHA256(内容)");
+        println!("  prev_hash 机制:   每条记录包含上一条的 hash");
+        println!("  链断裂 = 日志被篡改 (插入/删除/修改任何记录)");
+        println!();
+
+        if verification.is_valid {
+            println!(
+                "  [✓] 链完整性: 通过 — {} 条记录, 链完整无断裂",
+                verification.total_records
+            );
+        } else {
+            println!(
+                "  [✗] 链完整性: 断裂 — 第 {} 条记录处检测到篡改",
+                verification.broken_at.unwrap_or(0)
+            );
+            println!("  建议: 检查该记录是否被人为修改或插入");
+        }
+
+        println!();
+        println!("{}", "── 阶段 2: 事件/告警解析 ──".cyan().bold());
+        println!();
+    }
 
     let file_handle = File::open(path)?;
     let reader = BufReader::new(file_handle);
@@ -185,6 +188,8 @@ pub async fn run(file: &str) -> Result<()> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
+            let ts = record.get("timestamp_ns").and_then(|v| v.as_u64());
+
             attack_chains.push(AttackChainEntry {
                 title: title.to_string(),
                 severity: severity.to_string(),
@@ -196,6 +201,7 @@ pub async fn run(file: &str) -> Result<()> {
                 filepath: filepath.map(|s| s.to_string()),
                 mitre_tactic: mitre_tactic.to_string(),
                 mitre_technique: mitre_technique.to_string(),
+                ts,
             });
         } else {
             event_count += 1;
@@ -229,7 +235,28 @@ pub async fn run(file: &str) -> Result<()> {
         }
     }
 
-    println!("── 阶段 3: 统计摘要 ──");
+    if json {
+        let summary = serde_json::json!({
+            "file": file,
+            "chain": {
+                "valid": verification.is_valid,
+                "total_records": verification.total_records,
+                "broken_at": verification.broken_at,
+            },
+            "events": event_count,
+            "alerts": alert_count,
+            "unique_pids": pids.len(),
+            "severities": severities,
+            "event_types": event_types,
+            "attack_chains": attack_chains.len(),
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    println!("{}", "── 阶段 3: 统计摘要 ──".cyan().bold());
     println!();
     println!("  事件总数: {}", event_count);
     println!("  告警总数: {}", alert_count);
@@ -255,10 +282,12 @@ pub async fn run(file: &str) -> Result<()> {
 
     if !event_types.is_empty() {
         println!();
-        println!("── 阶段 4: 事件类型分布 ──");
+        println!("{}", "── 阶段 4: 事件类型分布 ──".cyan().bold());
         println!();
         let max_count = event_types.values().max().unwrap_or(&0);
         let bar_width = 30;
+        let mut t = super::ui::new_table();
+        t.set_header(vec!["类型", "名称", "分布", "数量"]);
         for (etype, count) in &event_types {
             let name = event_type_label(*etype);
             let bar_len = if *max_count > 0 {
@@ -267,13 +296,19 @@ pub async fn run(file: &str) -> Result<()> {
                 0
             };
             let bar = "█".repeat(bar_len) + &"░".repeat(bar_width - bar_len);
-            println!("  {:<3} {:<10} │{}│ {:>4} 条", etype, name, bar, count);
+            t.add_row(vec![
+                etype.to_string(),
+                name.to_string(),
+                bar,
+                format!("{} 条", count),
+            ]);
         }
+        println!("{t}");
     }
 
     if !severities.is_empty() {
         println!();
-        println!("── 阶段 5: 告警等级分布 ──");
+        println!("{}", "── 阶段 5: 告警等级分布 ──".cyan().bold());
         println!();
         for (sev, count) in &severities {
             let icon = match sev.as_str() {
@@ -283,31 +318,70 @@ pub async fn run(file: &str) -> Result<()> {
                 "low" => "🟢",
                 _ => "⚪",
             };
-            println!("  {} {:<10} {} 条", icon, sev, count);
+            println!("  {} {} {} 条", icon, severity_colored(sev, sev), count);
         }
     }
 
     if !mitre_tags.is_empty() {
         println!();
-        println!("── 阶段 6: MITRE ATT&CK 映射 ──");
+        println!("{}", "── 阶段 6: MITRE ATT&CK 映射 ──".cyan().bold());
         println!();
         println!("  检测到的攻击战术 (按 MITRE ATT&CK 框架分类):");
         println!();
         for (tactic, techniques) in &mitre_tags {
             let phase = mitre_phase_name(tactic);
             println!("  {} ({})", tactic, phase);
+            let mut unique: BTreeMap<String, usize> = BTreeMap::new();
             for tech in techniques {
-                println!("    └─ {}", tech);
+                *unique.entry(tech.clone()).or_insert(0) += 1;
+            }
+            for (tech, n) in &unique {
+                if *n > 1 {
+                    println!("    └─ {} ×{}", tech, n);
+                } else {
+                    println!("    └─ {}", tech);
+                }
             }
         }
     }
 
     if !attack_chains.is_empty() {
         println!();
-        println!("── 阶段 7: 攻击链还原 ──");
+        println!("{}", "── 阶段 7: 攻击链还原 ──".cyan().bold());
         println!();
         println!("  从离散告警中还原攻击者的行为链:");
         println!();
+
+        let mut timed_ts: Vec<u64> = attack_chains.iter().filter_map(|e| e.ts).collect();
+        if !timed_ts.is_empty() {
+            timed_ts.sort_unstable();
+            let first = *timed_ts.first().unwrap();
+            let last = *timed_ts.last().unwrap();
+            let span = last.saturating_sub(first).max(1);
+            const BUCKETS: usize = 48;
+            let mut counts = vec![0u64; BUCKETS];
+            for t in &timed_ts {
+                let idx = (((t - first) as u128 * BUCKETS as u128) / span as u128) as usize;
+                counts[idx.min(BUCKETS - 1)] += 1;
+            }
+            let maxc = (*counts.iter().max().unwrap_or(&1)).max(1) as f64;
+            let sparks = "▁▂▃▄▅▆▇█";
+            let line: String = counts
+                .iter()
+                .map(|c| {
+                    let lvl = ((*c as f64 / maxc) * 7.0).round() as usize;
+                    sparks.chars().nth(lvl.min(7)).unwrap()
+                })
+                .collect();
+            println!("  ⏱ 告警时间线 (按时间戳分布, {} 条):", timed_ts.len());
+            println!("  {}", line.truecolor(100, 200, 255));
+            println!(
+                "  {} ──────────────── {}",
+                format_timestamp(first).dimmed(),
+                format_timestamp(last).dimmed()
+            );
+            println!();
+        }
 
         let mut sorted_chains = attack_chains.clone();
         sorted_chains.sort_by(|a, b| {
@@ -354,8 +428,12 @@ pub async fn run(file: &str) -> Result<()> {
                 };
 
                 println!(
-                    "  {} [{}] {} — PID:{} ({})",
-                    connector, entry.severity, entry.title, entry.pid, entry.comm
+                    "  {} {} {} — PID:{} ({})",
+                    connector,
+                    severity_colored(&format!("[{}]", entry.severity), &entry.severity),
+                    entry.title.bold(),
+                    entry.pid,
+                    entry.comm
                 );
 
                 if let Some(ref daddr) = entry.daddr {
@@ -382,7 +460,7 @@ pub async fn run(file: &str) -> Result<()> {
 
     if !pid_events.is_empty() {
         println!();
-        println!("── 阶段 8: 进程行为画像 (按 PID) ──");
+        println!("{}", "── 阶段 8: 进程行为画像 (按 PID) ──".cyan().bold());
         println!();
         println!("  每个进程的事件序列 (用于识别异常行为模式):");
         println!();
@@ -402,18 +480,13 @@ pub async fn run(file: &str) -> Result<()> {
     }
 
     println!();
-    println!("╔══════════════════════════════════════════╗");
-    println!("║  回放完成 — 上述分析基于 SHA-256 式校验   ║");
-    println!(
-        "║  链完整性={}",
-        if verification.is_valid {
-            "通过 ✓"
-        } else {
-            "断裂 ✗"
-        }
-    );
-    println!("║  所有结论均有哈希链佐证, 可用于司法取证     ║");
-    println!("╚══════════════════════════════════════════╝");
+    let integrity = if verification.is_valid {
+        "通过 ✓"
+    } else {
+        "断裂 ✗"
+    };
+    banner(&format!("回放完成 — 链完整性 {}", integrity));
+    println!("  上述分析基于 SHA-256 哈希链校验,所有结论均有佐证,可用于司法取证");
 
     Ok(())
 }
@@ -437,4 +510,5 @@ struct AttackChainEntry {
     filepath: Option<String>,
     mitre_tactic: String,
     mitre_technique: String,
+    ts: Option<u64>,
 }

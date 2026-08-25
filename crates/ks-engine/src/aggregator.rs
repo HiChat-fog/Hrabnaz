@@ -4,16 +4,10 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
-/// 事件聚合器,VecDeque环形缓冲,O(1)淘汰。
-/// 解码时做数据长度校验,支持按PID和时间范围查询。
 pub struct EventAggregator {
     buffer: VecDeque<DecodedEvent>,
     max_buffer: usize,
     seq: u64,
-    /// per-PID滑动时间窗口,pid到60秒内syscall时间戳队列。
-    /// anomaly_score增量查询用,O(1)读计数替代遍历recent(1000)。
-    /// 惰性淘汰:查询时丢弃该pid超出窗口的旧时间戳。
-    /// 容量上限:超过max_pids时删最不活跃PID,防止随累计PID数无界增长。
     pid_windows: HashMap<u32, VecDeque<u64>>,
     max_pids: usize,
 }
@@ -33,7 +27,6 @@ pub struct DecodedEvent {
     pub target_pid: Option<u32>,
     pub signal: Option<i32>,
     pub file_bytes: Option<u64>,
-    // 新增字段(容器逃逸、LKM加载、eBPF篡改探针)
     pub module_name: Option<String>,
     pub prog_name: Option<String>,
     pub source_ns_inum: Option<u32>,
@@ -53,8 +46,6 @@ impl EventAggregator {
         }
     }
 
-    /// 从ring buffer裸字节解码事件。
-    /// RawEvent::from_bytes内部已做两阶段长度校验。
     pub fn decode(&mut self, data: &[u8]) -> Result<DecodedEvent> {
         let raw = unsafe { RawEvent::from_bytes(data) }
             .ok_or_else(|| anyhow::anyhow!("事件数据不足: {} 字节", data.len()))?;
@@ -205,7 +196,6 @@ impl EventAggregator {
                 cap_eff: None,
                 action: None,
             },
-            // 容器逃逸事件(kprobe/commit_creds)
             80 => {
                 let ce = unsafe { &raw.container_escape };
                 DecodedEvent {
@@ -230,7 +220,6 @@ impl EventAggregator {
                     action: None,
                 }
             }
-            // LKM加载事件(kprobe/do_init_module)
             81 => {
                 let lkm = unsafe { &raw.lkm_load };
                 let mname = cstr_to_string(&lkm.module_name);
@@ -256,7 +245,6 @@ impl EventAggregator {
                     action: None,
                 }
             }
-            // eBPF篡改事件(kprobe/security_bpf_prog_free)
             82 => {
                 let et = unsafe { &raw.ebpf_tamper };
                 let pname = cstr_to_string(&et.prog_name);
@@ -318,8 +306,6 @@ impl EventAggregator {
         }
         self.buffer.push_back(event.clone());
 
-        // 维护per-PID滑动窗口:记录本次syscall时间戳,惰性淘汰60秒外的旧值。
-        // anomaly_score直接读窗口长度,避免遍历recent(1000)。
         {
             const WINDOW_NS: u64 = 60_000_000_000;
             let now_ns = event.header.timestamp_ns;
@@ -332,12 +318,9 @@ impl EventAggregator {
                     break;
                 }
             }
-            // 容量上限淘汰:pid_windows随累计PID数无界增长(84核机器3小时见6.5万PID),
-            // 超过max_pids时删最不活跃PID(队首时间戳最小)的整个entry。
             if self.pid_windows.len() > self.max_pids {
                 let target = self.max_pids.saturating_sub(self.max_pids / 10);
                 while self.pid_windows.len() > target {
-                    // 找最不活跃的PID:其窗口队首时间戳最小(最久没活动)
                     let evict_pid = match self
                         .pid_windows
                         .iter()
@@ -376,9 +359,6 @@ impl EventAggregator {
         self.buffer.iter().skip(skip).collect()
     }
 
-    /// 增量查询:返回该PID在60秒窗口内的syscall计数。
-    /// 替代anomaly_score里遍历recent(1000)的O(n)扫描,O(1)读窗口长度。
-    /// 惰性淘汰当前pid的过期时间戳,窗口在decode时已维护。
     pub fn recent_syscall_count(&mut self, pid: u32, now_ns: u64) -> usize {
         const WINDOW_NS: u64 = 60_000_000_000;
         if let Some(win) = self.pid_windows.get_mut(&pid) {
@@ -413,16 +393,12 @@ impl EventAggregator {
     }
 }
 
-/// C字节数组转Rust String,遇到\0截断
 fn cstr_to_string(data: &[u8]) -> String {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     String::from_utf8_lossy(&data[..end]).into_owned()
 }
 
 fn ip_to_string(addr: u32) -> String {
-    // 内核sockaddr_in.sin_addr.s_addr是__be32(网络字节序,big-endian)
-    // Rust在x86(小端)上读出的u32字节序与原始内存一致(即大端值在内存中为小端布局)
-    // 用from_be转成本地字节序
     let ip = u32::from_be(addr);
     format!(
         "{}.{}.{}.{}",
@@ -551,23 +527,16 @@ mod tests {
 
     #[test]
     fn test_recent_syscall_count_window() {
-        // 60秒窗口 = 60_000_000_000 ns
         let mut agg = EventAggregator::new(100);
-        // pid 100:5次都在60秒窗口内(时间戳0..40s)
         for t in [0u64, 10_000_000_000, 20_000_000_000, 30_000_000_000, 40_000_000_000] {
             agg.decode(&encode_header(&make_header(2, 100, t))).unwrap();
         }
-        // pid 200:1次
         agg.decode(&encode_header(&make_header(2, 200, 5_000_000_000))).unwrap();
 
-        // 查询pid 100在t=40s时:5次都在窗口内
         assert_eq!(agg.recent_syscall_count(100, 40_000_000_000), 5);
-        // 查询pid 200
         assert_eq!(agg.recent_syscall_count(200, 40_000_000_000), 1);
-        // 查询不存在的pid
         assert_eq!(agg.recent_syscall_count(999, 40_000_000_000), 0);
 
-        // 再来一条pid 100在t=80s:窗口淘汰>=60s的t=0/10/20s三条,剩t=30/40/80共3条
         agg.decode(&encode_header(&make_header(2, 100, 80_000_000_000))).unwrap();
         assert_eq!(agg.recent_syscall_count(100, 80_000_000_000), 3);
     }
@@ -590,9 +559,6 @@ mod tests {
 
     #[test]
     fn test_ip_to_string() {
-        // 内核sockaddr_in.s_addr是__be32,在内存中以小端存储
-        // 0x7F000001(127.0.0.1 big-endian)在x86内存中为01 00 00 7F,
-        // Rust读为u32值0x0100007F
         assert_eq!(ip_to_string(0x0100007F), "127.0.0.1");
         assert_eq!(ip_to_string(0x0101A8C0), "192.168.1.1");
     }

@@ -33,27 +33,23 @@ struct {
     __uint(max_entries, 128);
 } safe_patterns SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, u32);
-    __type(value, u32);
-    __uint(max_entries, 8);
-} filter_config SEC(".maps");
-
 enum filter_config_key {
     FC_MIN_RISK_SCORE    = 0,
     FC_MAX_NORMAL_FREQ   = 1,
     FC_BLOCK_RATE_TARGET = 2,
 };
 
-/* C6: KS_PERCPU_ARRAY_MAP 宏声明，Ancient tier 自动回退到 CPU-keyed ARRAY */
 KS_PERCPU_ARRAY_MAP(filter_stats_map, struct filter_stats);
 
 KS_EVENT_MAP(filter_events, 1024 * 1024);
 
 static __always_inline u32 get_filter_config(u32 key, u32 default_val) {
-    u32 *val = bpf_map_lookup_elem(&filter_config, &key);
-    return val ? *val : default_val;
+    switch (key) {
+    case FC_MIN_RISK_SCORE:    return 40;
+    case FC_MAX_NORMAL_FREQ:   return 100;
+    case FC_BLOCK_RATE_TARGET: return 80;
+    default: return default_val;
+    }
 }
 
 static __always_inline struct filter_decision should_send_event(
@@ -121,18 +117,19 @@ static __always_inline void smart_filter_handle_vfs_open(struct path *path) {
     struct dentry *dentry = BPF_CORE_READ(path, dentry);
     const char *name = KS_READ_DNAME(dentry);
 
-    /* 3.10 verifier 无法追踪 bpf_probe_read 返回的指针（标记为 inv），
-     * 直接解引用会报 "invalid mem access"。先拷到栈缓冲区。 */
     char name_buf[64] = {};
     if (name) bpf_probe_read(name_buf, sizeof(name_buf), name);
 
     struct filter_decision decision = should_send_event(pid, EVENT_FILE_OPEN, name_buf);
     update_filter_stats(decision.action);
-
-    if (decision.action == 1) {
-        infer_sensitive_file(name_buf, pid);
-        update_freq_counter(pid, 10);
-    }
 }
 
-#endif // KS_PROBES_SMART_FILTER_H
+static __always_inline int ks_should_drop(u32 pid, u32 event_type,
+                                          const char *filename, int verdict) {
+    if (verdict != 0) { update_filter_stats(0); return 0; }
+    struct filter_decision d = should_send_event(pid, event_type, filename);
+    update_filter_stats(d.action);
+    return d.action;
+}
+
+#endif

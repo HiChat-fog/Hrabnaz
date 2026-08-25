@@ -1,7 +1,3 @@
-//! eBPF Modern tier事件源(5.8+,BPF_MAP_TYPE_RINGBUF)
-//!
-//! 包装EbpfLoader,通过EventSource trait路由eBPF事件。替代了原start.rs中绕过trait直接调loader.try_next_event()的双路径逻辑,使事件源后端可热插拔(modern、legacy、ancient切换时不影响调用方)。
-
 #![cfg(target_os = "linux")]
 
 use anyhow::Result;
@@ -11,16 +7,10 @@ use std::io::Write;
 use crate::event_source::{EventSource, SourceKind};
 use crate::loader::EbpfLoader;
 
-/// 现代eBPF tier事件源,持有EbpfLoader,round-robin轮询5个RingBuf。
-///
-/// 设计上持有EbpfLoader的ownership(loader内部已take_map出RingBuf持久持有);next_bytes调loader.try_next_events()丢弃来源标签;不实现Sync(RingBuf是Send不Sync),与EventSource trait一致;Drop时EbpfLoader自动drop,rings和bpf fd自动关闭。
 pub struct EbpfModernSource {
     loader: EbpfLoader,
-    /// 压测诊断:next_bytes调用计数,每20000次打印一次内核侧syscount。
     poll_count: u64,
-    /// 诊断:next_bytes返回Some的次数(真正取到事件)。
     some_count: u64,
-    /// 诊断:next_bytes返回None的次数(空轮询走yield_now)。
     none_count: u64,
 }
 
@@ -38,7 +28,6 @@ impl EbpfModernSource {
         Self { loader, poll_count: 0, some_count: 0, none_count: 0 }
     }
 
-    /// 借用loader(用于状态查询,不转移ownership)。
     pub fn loader(&self) -> &EbpfLoader {
         &self.loader
     }

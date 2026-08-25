@@ -11,7 +11,6 @@ use std::collections::HashMap;
 pub struct DetectionEngine {
     rules: Vec<DetectionRule>,
     rules_index: HashMap<String, usize>,
-    //预编译正则缓存:加载规则时一次性编译所有regex/not_regex的target,运行时只读查找避免每事件重新Regex::new
     regex_cache: HashMap<String, regex::Regex>,
 }
 
@@ -43,7 +42,6 @@ impl DetectionEngine {
         Ok(count)
     }
 
-    //遍历所有规则的regex/not_regex条件,一次性预编译target存入cache。运行时match_str只读查找,消除每事件Regex::new的重复编译开销(原先占detector_match 90%耗时)
     fn compile_regexes(&mut self) {
         for rule in &self.rules {
             for cond in &rule.conditions {
@@ -67,7 +65,6 @@ impl DetectionEngine {
         self.rules.len()
     }
 
-    /// 单事件匹配所有规则,返回命中的规则列表
     pub fn match_event(&self, event: &DecodedEvent) -> Vec<MatchResult> {
         let mut results = Vec::new();
         for rule in &self.rules {
@@ -128,7 +125,6 @@ impl DetectionEngine {
                         .map(|a| if a.contains(':') { "IPv6" } else { "IPv4" });
                 match_family_field(inferred_family, &cond.operator, &cond.value)
             }
-            // 新增字段:容器逃逸、LKM加载、eBPF篡改
             Field::ModuleName => {
                 match_opt_str(event.module_name.as_deref(), &cond.operator, &cond.value, cache)
             }
@@ -142,7 +138,6 @@ impl DetectionEngine {
         }
     }
 
-    /// 从匹配结果组装告警
     pub fn generate_alert(&self, result: &MatchResult, event: &DecodedEvent) -> Alert {
         let mitre = self
             .rules_index
@@ -229,20 +224,15 @@ impl DetectionEngine {
         }
     }
 
-    /// 轻量异常评分: 频率 + 敏感文件 + 可疑命令 + 网络异常
-    /// recent_syscalls是调用方增量维护的60秒窗口syscall计数(O(1)查询),
-    /// 替代遍历history的O(n)扫描。
     pub fn anomaly_score(&self, event: &DecodedEvent, recent_syscalls: usize) -> f64 {
         let mut score: f64 = 0.0;
 
-        // 系统调用频率
         if recent_syscalls > 500 {
             score += 0.4;
         } else if recent_syscalls > 100 {
             score += 0.2;
         }
 
-        // 敏感文件访问
         if let Some(ref fname) = event.filename {
             for sensitive in &[
                 "/etc/shadow",
@@ -278,7 +268,6 @@ impl DetectionEngine {
             }
         }
 
-        // 可疑命令特征
         let args = event.args.as_deref().unwrap_or("");
         let suspicious_patterns: &[(&str, f64)] = &[
             ("bash -i", 0.5),
@@ -303,7 +292,6 @@ impl DetectionEngine {
             }
         }
 
-        // 勒索软件扩展名
         if let Some(ref fname) = event.filename {
             let ransomware_extensions: &[&str] = &[
                 ".encrypted",
@@ -324,7 +312,6 @@ impl DetectionEngine {
             }
         }
 
-        // 异常网络连接
         if let Some(dport) = event.dport {
             let malicious_ports: &[u16] = &[4444, 1337, 31337, 5555, 6666, 6667, 9999, 12345];
             if malicious_ports.contains(&dport) {
@@ -342,8 +329,6 @@ impl DetectionEngine {
         score.min(1.0)
     }
 }
-
-// ========== 字段匹配辅助函数 ==========
 
 fn match_i32(value: i32, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
     match op {
@@ -401,7 +386,6 @@ fn match_u32(value: u32, op: &Operator, target: &str, cache: &HashMap<String, re
                 _ => unreachable!(),
             }
         }
-        //dport/sport等数值字段也支持regex操作符(如高危端口枚举),查同一cache
         Operator::Regex | Operator::Contains | Operator::StartsWith | Operator::NotRegex => {
             match_str(&value.to_string(), op, target, cache)
         }
@@ -450,7 +434,6 @@ fn match_str(value: &str, op: &Operator, target: &str, cache: &HashMap<String, r
         Operator::NotEquals => value != target,
         Operator::Contains => value.contains(target),
         Operator::StartsWith => value.starts_with(target),
-        //regex预编译缓存:compile_regexes时一次性编译,运行时只读查找避免每事件Regex::new
         Operator::Regex | Operator::NotRegex => match cache.get(target) {
             Some(re) => {
                 let m = re.is_match(value);

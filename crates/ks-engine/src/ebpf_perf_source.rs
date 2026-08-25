@@ -1,7 +1,3 @@
-//! eBPF Perf tier事件源(Legacy 4.x和Ancient 3.10均用perfbuf)
-//!
-//! 包装EbpfLoader(内部EventBackend::PerfEvent处理per-CPU perfbuf轮询),实现EventSource trait。与EbpfModernSource结构对称,仅kind和description不同。
-
 #![cfg(target_os = "linux")]
 
 use anyhow::Result;
@@ -10,9 +6,6 @@ use async_trait::async_trait;
 use crate::event_source::{EventSource, SourceKind};
 use crate::loader::EbpfLoader;
 
-/// Perf tier事件源,持有EbpfLoader(PerfEvent backend),round-robin轮询per-CPU buffers。
-///
-/// Legacy(4.x)和Ancient(3.10+)共用此源,两者都走perfbuf,仅kind()返回值不同(供日志和配置区分)。
 pub struct EbpfPerfSource {
     loader: EbpfLoader,
     tier: SourceKind,

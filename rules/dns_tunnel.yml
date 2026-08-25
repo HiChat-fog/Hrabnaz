@@ -1,38 +1,5 @@
-# DNS 隧道检测规则
-#
-# 检测通过 DNS 协议进行数据外传或命令控制的隧道行为。
-# DNS 隧道特征:
-#   - 异常长的 DNS 查询域名 (TXT 记录编码数据)
-#   - 高频 DNS 查询 (远超正常基线)
-#   - 可疑域名模式 (随机子域 + 特定顶级域)
-#
-# MITRE ATT&CK: TA0010 数据窃取 (T1041) + TA0011 命令控制 (T1071.004)
-#
-# 重要说明:
-#   DNS 隧道检测需要两个维度配合:
-#   1. 规则引擎: 单事件维度 (协议/端口/域名特征)
-#   2. 异常评分引擎: 时序维度 (频率/基线偏离)
-#   高频检测 (dns_tunnel_high_frequency) 是辅助规则，
-#   需配合异常评分引擎的 60s 窗口频率统计才能精确判定。
-
-- name: "dns_tunnel_long_query"
-  description: "DNS 查询域名异常长 (>50字符), 可能编码了隧道数据"
-  severity: high
-  conditions:
-    - field: proto
-      operator: equals
-      value: "UDP"
-    - field: dport
-      operator: equals
-      value: "53"
-    # 注意: 当前规则引擎不支持字符串长度检测，此处用 contains 模拟长域名特征
-    # 真实检测需要在异常评分引擎中实现: dns_query_length > 50
-  alert_message: "DNS 查询域名异常长，可能存在 DNS 隧道数据编码"
-  mitre_tactic: "TA0010"
-  mitre_technique: "T1041"
-
-- name: "dns_tunnel_high_frequency"
-  description: "短时间内大量 DNS 查询 (>100次/60s), 超出正常基线"
+- name: "dns_tunnel_suspicious_domain"
+  description: "DNS 查询指向公网 DNS 服务器,若配合高频/长域名查询则为 DNS 隧道特征"
   severity: medium
   conditions:
     - field: proto
@@ -41,27 +8,9 @@
     - field: dport
       operator: equals
       value: "53"
-    # 注: 这是辅助规则 — 单条 UDP:dport=53 事件不足以判定 DNS 隧道。
-    # 高频维度由异常评分引擎的 syscall frequency 检测覆盖:
-    #   anomaly_score 在 60s 窗口内对同一 PID 的 DNS 事件计数加权。
-    # 此规则主要用于: 当高频 + 可疑域名同时出现时提供规则层面的告警。
-  alert_message: "高频 DNS 查询，需排查是否存在 DNS 隧道 (配合异常评分引擎频率检测)"
-  mitre_tactic: "TA0011"
-  mitre_technique: "T1071.004"
-
-- name: "dns_tunnel_suspicious_domain"
-  description: "DNS 查询可疑域名模式 (已知 DNS 隧道工具的域名特征)"
-  severity: critical
-  conditions:
-    - field: proto
-      operator: equals
-      value: "UDP"
-    - field: dport
-      operator: equals
-      value: "53"
     - field: daddr
-      operator: regex
-      value: "^(?!10\\.)(?!192\\.168\\.)(?!172\\.(1[6-9]|2[0-9]|3[01])\\.).*$"
-  alert_message: "DNS 查询外部可疑 IP，可能使用 DNS 隧道工具 (iodine/dnscat2)"
+      operator: not_regex
+      value: "^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|0\\.0\\.0\\.0|::1|fe80:)"
+  alert_message: "DNS 查询指向公网 DNS 服务器,若同一进程伴随高频(60s>50次)或超长域名查询则疑似 DNS 隧道,需结合内核频率计数与关联引擎告警排查"
   mitre_tactic: "TA0011"
   mitre_technique: "T1071.004"

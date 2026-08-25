@@ -162157,7 +162157,6 @@ struct creds;
 struct pctldev;
 
 
-/* BPF kfuncs */
 #ifndef BPF_NO_KFUNC_PROTOTYPES
 #endif
 
@@ -162165,4 +162164,4 @@ struct pctldev;
 #pragma clang attribute pop
 #endif
 
-#endif /* __VMLINUX_H__ */
+#endif

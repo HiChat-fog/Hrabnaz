@@ -1,8 +1,3 @@
-//! correlation性能压测:CorrelationEngine::detect_correlations_with_tree单次。
-//!
-//! 目标低于100μs/次
-//! 运行:cargo bench --workspace -p ks-engine --bench correlation_bench
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ks_core::event::EventHeader;
 use ks_engine::aggregator::DecodedEvent;
@@ -54,7 +49,6 @@ fn make_event(pid: u32, ppid: u32, comm: &str, event_type: u32) -> DecodedEvent 
 fn bench_correlation(c: &mut Criterion) {
     let mut engine = CorrelationEngine::new(300);
     let mut tree = ProcessTreeManager::new();
-    // 预填充事件窗口(100条混合事件)
     for i in 0..100u32 {
         let evt = make_event(i + 100, 1, "bash", 1);
         engine.detect_correlations_with_tree(&evt, Some(&tree));
@@ -69,7 +63,6 @@ fn bench_correlation(c: &mut Criterion) {
         });
     });
 
-    // 不带进程树的向后兼容路径
     c.bench_function("detect_correlations_no_tree", |b| {
         b.iter(|| {
             black_box(&mut engine).detect_correlations_with_tree(black_box(&probe), None);

@@ -1,8 +1,3 @@
-//! baseline性能压测:BaselineManager::update_from_event + detect_deviation。
-//!
-//! 目标低于10μs/次(update + detect合计)
-//! 运行:cargo bench --workspace -p ks-engine --bench baseline_bench
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ks_core::event::EventHeader;
 use ks_engine::aggregator::DecodedEvent;
@@ -52,7 +47,6 @@ fn make_event(pid: u32, comm: &str, event_type: u32) -> DecodedEvent {
 
 fn bench_baseline(c: &mut Criterion) {
     let mut mgr = BaselineManager::new();
-    // 预热:填充50条事件建立基线
     for _ in 0..50u32 {
         let evt = make_event(1234, "bash", 1);
         mgr.update_from_event(&evt);
@@ -72,7 +66,6 @@ fn bench_baseline(c: &mut Criterion) {
         });
     });
 
-    // 组合:update + detect(真实事件循环单次开销)
     c.bench_function("update_then_detect", |b| {
         b.iter(|| {
             black_box(&mut mgr).update_from_event(black_box(&probe));

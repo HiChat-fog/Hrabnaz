@@ -3,3 +3,17 @@ node_modules/
 logs/
 *.jsonl
 *.gz
+
+# 测试证据与运行产物(不提交)
+guoancup/
+study-site/
+ks-test-evidence/
+logs-collected/
+
+# IDE/AI 工具配置
+.claude/
+.trae/
+.vscode/
+
+# 打包产物(pack.sh输出)
+dist/

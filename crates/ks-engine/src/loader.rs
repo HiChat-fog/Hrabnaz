@@ -1,12 +1,5 @@
-//! eBPF加载器,支持multi-tier(Modern ringbuf / Legacy perfbuf / Ancient perfbuf)。
-//!
-//! 按tier选择ks_main_modern/legacy/ancient.o加载,attach 16个程序(跨tier一致)。Modern tier take 5 RingBuf持久持有,round-robin轮询;Legacy和Ancient take 5 PerfEventArray,per-CPU open buffer,round-robin轮询。try_next_events()按backend类型分路径返回来源和字节。
-
 use crate::event_source::SourceKind;
 
-/// 内嵌eBPF字节码,build.rs编译各tier .o后生成ebpf_objects.rs。
-///
-/// 单二进制部署:.o编译期用include_bytes!进二进制,运行时不读磁盘,KS_EBPF_DIR仅作调试覆盖,指向含.o的目录。
 #[cfg(target_os = "linux")]
 pub mod ebpf_objects {
     include!(concat!(env!("OUT_DIR"), "/ebpf_objects.rs"));
@@ -60,9 +53,6 @@ pub struct MapSnapshot {
     pub entries: Vec<MapEntry>,
 }
 
-/// map统计信息,用于/api/v1/stats端点的map_stats字段。
-///
-/// entry_count的语义因map_type而异:ARRAY和PERCPU_ARRAY是实际entry数,所有槽位始终存在;HASH和LRU_HASH是容量上限(max_entries),实际entry数需要iter().count()。
 #[derive(Debug, Clone)]
 pub struct MapStat {
     pub name: String,
@@ -73,11 +63,7 @@ pub struct MapStat {
 pub trait BpfMapReader: Send + Sync {
     fn read_map(&self, map_name: &str) -> anyhow::Result<MapSnapshot>;
     fn list_maps(&self) -> Vec<String>;
-    /// 返回所有共享map的统计信息(name/map_type/entry_count)。
     fn list_map_stats(&self) -> Vec<MapStat>;
-    /// 返回map的结构化条目,每个entry序列化为JSON对象。
-    ///
-    /// 支持的map有process_tree / net_flows / freq_counters / filter_stats / risk_scores / block_decisions。MockBpfMapReader返回完整桩数据用于CI和测试;LinuxBpfMapReader对risk_scores真实读取(K/V类型简单),其他返回空数组,真机可补全typed reading。
     fn read_map_structured(&self, _map_name: &str) -> Vec<serde_json::Value> {
         Vec::new()
     }
@@ -101,41 +87,20 @@ impl BpfMapReader for MockBpfMapReader {
             "net_conn_history".into(),
             "freq_counters".into(),
             "infer_config".into(),
+            "protected_comms".into(),
         ]
     }
-    /// 返回5个固定mock条目(entry_count=0),与LinuxBpfMapReader顺序一致。
     fn list_map_stats(&self) -> Vec<MapStat> {
         vec![
-            MapStat {
-                name: "risk_scores".into(),
-                map_type: "HASH".into(),
-                entry_count: 0,
-            },
-            MapStat {
-                name: "ip_whitelist".into(),
-                map_type: "HASH".into(),
-                entry_count: 0,
-            },
-            MapStat {
-                name: "net_conn_history".into(),
-                map_type: "LRU_HASH".into(),
-                entry_count: 0,
-            },
-            MapStat {
-                name: "freq_counters".into(),
-                map_type: "PERCPU_ARRAY".into(),
-                entry_count: 0,
-            },
-            MapStat {
-                name: "infer_config".into(),
-                map_type: "ARRAY".into(),
-                entry_count: 0,
-            },
+            MapStat { name: "risk_scores".into(), map_type: "HASH".into(), entry_count: 0 },
+            MapStat { name: "ip_whitelist".into(), map_type: "HASH".into(), entry_count: 0 },
+            MapStat { name: "net_conn_history".into(), map_type: "LRU_HASH".into(), entry_count: 0 },
+            MapStat { name: "freq_counters".into(), map_type: "PERCPU_ARRAY".into(), entry_count: 0 },
+            MapStat { name: "infer_config".into(), map_type: "ARRAY".into(), entry_count: 0 },
+            MapStat { name: "protected_comms".into(), map_type: "LRU_HASH".into(), entry_count: 0 },
         ]
     }
 
-    /// 返回map的结构化桩数据(CI/测试用)。
-    /// 6个map各返回3条样本,结构与真机读取保持一致。
     fn read_map_structured(&self, map_name: &str) -> Vec<serde_json::Value> {
         match map_name {
             "process_tree" => vec![
@@ -172,10 +137,6 @@ impl BpfMapReader for MockBpfMapReader {
     }
 }
 
-// EbpfLoader
-
-/// 事件来源map名称,5个,对应ks_main.bpf.c里的5个KS_EVENT_MAP。
-/// 顺序代表轮询优先级:events(syscall/vfs/net主流)优先于tree,然后freq,flow,filter。
 pub const RING_NAMES: &[&str] = &[
     "events",
     "tree_events",
@@ -190,7 +151,6 @@ struct RingBufSource {
     ring: aya::maps::RingBuf<aya::maps::MapData>,
 }
 
-/// PerfEventArray per-CPU buffer
 #[cfg(target_os = "linux")]
 struct PerfEventBuffer {
     map_name: &'static str,
@@ -198,7 +158,6 @@ struct PerfEventBuffer {
     buf: aya::maps::perf::PerfEventArrayBuffer<aya::maps::MapData>,
 }
 
-/// 事件后端,RingBuf(Modern)或PerfEvent(Legacy/Ancient)
 #[cfg(target_os = "linux")]
 enum EventBackend {
     Empty,
@@ -213,21 +172,14 @@ enum EventBackend {
 }
 
 pub struct EbpfLoader {
-    /// 已attach的程序名,仅用于状态展示。
     probes: Vec<String>,
     #[cfg(target_os = "linux")]
     backend: EventBackend,
-    /// take_map之后Bpf只剩程序对象加共享map(risk_scores等)。
-    ///
-    /// 用Arc<Mutex<aya::Ebpf>>让LinuxBpfMapReader共享同一Ebpf读map统计。事件map已take到backend,不在这个字段,所以try_next_events不需要锁。
     #[cfg(target_os = "linux")]
     bpf: Option<Arc<Mutex<aya::Ebpf>>>,
-    /// 自身及父进程链pid的豁免集合。
-    /// 用户态检测(baseline/ML/anomaly)跳过这些pid,避免哨兵消费变忙时自指误报。
     protected_pids: Vec<u32>,
 }
 
-/// 读online CPU列表,格式如0-3或0,2,4-6
 #[cfg(target_os = "linux")]
 fn online_cpus() -> Vec<u32> {
     let content = std::fs::read_to_string("/sys/devices/system/cpu/online")
@@ -260,7 +212,6 @@ impl Default for EbpfLoader {
 #[cfg(target_os = "linux")]
 impl Drop for EbpfLoader {
     fn drop(&mut self) {
-        // 压测诊断:进程退出时打印内核侧syscall计数,跟用户态"已处理"对比定位吞吐瓶颈。
         if let Some((enter, exit, drop)) = self.read_syscount() {
             eprintln!(
                 "[syscount] kernel enter={} exit={} ringbuf_drop={}",
@@ -270,14 +221,9 @@ impl Drop for EbpfLoader {
     }
 }
 
-/// 把自身tgid及其父进程链(sshd/systemd等)写入protected_pids豁免map,防止eBPF阻断逻辑冷启动误杀自身及连接会话的系统进程。
-/// 返回收集到的pid列表,供用户态检测(baseline/ML/anomaly)豁免自身,避免自指误报。在程序全部attach完成后、事件开始流动前调用。
 #[cfg(target_os = "linux")]
 fn inject_protected_pid(bpf: &mut aya::Ebpf, self_pid: u32) -> Vec<u32> {
     use aya::maps::HashMap;
-    // 收集需要豁免的pid:自身加父进程链到init,再加pid 1(systemd)。
-    // enforce模式下分类器冷启动会对高频系统进程(sshd/cron)误判verdict为2,
-    // 不豁免的话ssh会话进程会被SIGKILL,连接就断了。自身链含父sshd,一并豁免。
     let mut pids: Vec<u32> = vec![self_pid, 1];
     let mut cur = self_pid;
     for _ in 0..8 {
@@ -319,10 +265,62 @@ fn inject_protected_pid(bpf: &mut aya::Ebpf, self_pid: u32) -> Vec<u32> {
 #[cfg(not(target_os = "linux"))]
 fn inject_protected_pid(_bpf: &mut (), _self_pid: u32) {}
 
-/// infer_config map的CFG_ENFORCE_MODE索引,跟common.h的enum infer_config_key对齐。
-const CFG_ENFORCE_MODE_IDX: u32 = 5;
+const DEFAULT_PROTECTED_COMMS: &[&str] = &[
+    "sshd", "systemd", "cron", "crond", "journald", "dbus-daemon",
+    "sudo", "login", "agetty", "rsyslogd", "systemd-journal",
+];
 
-/// 写infer_config Array<u32>,用于设置enforce_mode等运行时配置。
+#[cfg(target_os = "linux")]
+fn inject_protected_comms(bpf: &mut aya::Ebpf) -> Vec<String> {
+    use aya::maps::HashMap;
+    let mut comms: Vec<String> = DEFAULT_PROTECTED_COMMS.iter().map(|s| s.to_string()).collect();
+    if let Ok(extra) = std::env::var("KS_PROTECTED_COMMS") {
+        for c in extra.split(',') {
+            let c = c.trim();
+            if !c.is_empty() && !comms.iter().any(|x| x == c) {
+                comms.push(c.to_string());
+            }
+        }
+    }
+    let val: u8 = 1;
+    match bpf.map_mut("protected_comms") {
+        Some(m) => match HashMap::<_, [u8; 16], u8>::try_from(m) {
+            Ok(mut hm) => {
+                let mut injected = Vec::new();
+                for c in &comms {
+                    let mut key = [0u8; 16];
+                    let b = c.as_bytes();
+                    let n = b.len().min(15);
+                    key[..n].copy_from_slice(&b[..n]);
+                    if let Err(e) = hm.insert(&key, &val, 0) {
+                        log::warn!("写入 protected_comms 失败({}): {:?}", c, e);
+                    } else {
+                        injected.push(c.clone());
+                    }
+                }
+                log::info!("已注入 protected_comms 白名单({}项): {:?}", injected.len(), injected);
+            }
+            Err(e) => log::warn!("打开 protected_comms map 失败: {:?}(enforce误杀风险)", e),
+        },
+        None => log::warn!("protected_comms map 不存在(enforce误杀风险)"),
+    }
+    comms
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inject_protected_comms(_bpf: &mut ()) {}
+
+const CFG_ENFORCE_MODE_IDX: u32 = 5;
+const CFG_ENFORCE_WARMUP_UNTIL_SEC_IDX: u32 = 6;
+const CFG_ENFORCE_KILL_THRESHOLD_IDX: u32 = 7;
+
+#[cfg(target_os = "linux")]
+fn boot_monotonic_sec() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok().and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+        .map(|f| f as u64).unwrap_or(0)
+}
+
 #[cfg(target_os = "linux")]
 fn set_infer_config(bpf: &mut aya::Ebpf, idx: u32, val: u32) {
     use aya::maps::Array;
@@ -357,7 +355,6 @@ impl EbpfLoader {
             "kprobe_udp_sendmsg",
             "kprobe_tcp_set_state_flow",
             "kprobe_tcp_sendmsg_flow",
-            // 安全探针:容器逃逸、LKM加载、eBPF自身防护
             "kprobe_commit_creds",
             "kprobe_do_init_module",
             "kprobe_security_bpf_prog_free",
@@ -376,8 +373,6 @@ impl EbpfLoader {
         }
     }
 
-    /// 加载tier-specific .o,attach 16个程序,take事件maps持久持有。
-    /// Modern走RingBuf backend,Legacy和Ancient走PerfEvent backend。
     pub async fn start_all(&mut self, tier: SourceKind) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -388,14 +383,10 @@ impl EbpfLoader {
                     if crate::tier_detect::btf_available() {
                         ("ks_main_ancient.o", "ancient")
                     } else {
-                        // NOBTF:aya加载ks_main_ancient_nobtf.o在3.10 stock上可能失败
-                        // (aya依赖libbpf 1.0以上,CentOS 7.9自带libbpf太旧),上层default_event_source应优先走CLoaderSource
                         ("ks_main_ancient_nobtf.o", "ancient_nobtf")
                     }
                 }
                 SourceKind::EbpfLegacyNoBtf | SourceKind::EbpfAncientNoBtf => {
-                    // NOBTF路径由上层default_event_source走CLoaderSource(ks_loader --stream),
-                    // 不经aya start_all;走到这说明上层没走C loader,fail loud。
                     anyhow::bail!(
                         "{:?} 应由CLoaderSource加载,不应走aya start_all(检查default_event_source分支)",
                         tier
@@ -404,8 +395,6 @@ impl EbpfLoader {
                 _ => anyhow::bail!("不支持的eBPF tier: {:?}", tier),
             };
 
-            // 从二进制内嵌字节码加载(单二进制部署)。
-            // 消除env!("OUT_DIR")烤死构建机路径的地雷,KS_EBPF_DIR仅作调试覆盖。
             let obj: Vec<u8> = if let Ok(dir) = std::env::var("KS_EBPF_DIR") {
                 let obj_path = std::path::Path::new(&dir).join(obj_name);
                 std::fs::read(&obj_path).map_err(|e| {
@@ -437,8 +426,6 @@ impl EbpfLoader {
             let mut bpf = match bpf_load_result {
                 Ok(b) => b,
                 Err(e) => {
-                    // Ancient加NOBTF路径加载失败,给上层default_event_source明确提示
-                    // 走CLoaderSource(ks_loader --stream)替代aya加载。
                     if matches!(tier, SourceKind::EbpfAncient)
                         && !crate::tier_detect::btf_available()
                     {
@@ -451,7 +438,6 @@ impl EbpfLoader {
                 }
             };
 
-            // attach tracepoints
             macro_rules! attach_tp {
                 ($name:expr, $cat:expr, $evt:expr) => {
                     let prog: &mut aya::programs::TracePoint = bpf
@@ -468,7 +454,6 @@ impl EbpfLoader {
             attach_tp!("trace_sched_exec_tree", "sched", "sched_process_exec");
             attach_tp!("trace_sched_exit_tree", "sched", "sched_process_exit");
 
-            // attach kprobes
             macro_rules! attach_kp {
                 ($name:expr, $func:expr) => {
                     let prog: &mut aya::programs::KProbe = bpf
@@ -487,10 +472,8 @@ impl EbpfLoader {
             attach_kp!("kprobe_udp_sendmsg", "udp_sendmsg");
             attach_kp!("kprobe_tcp_set_state_flow", "tcp_set_state");
             attach_kp!("kprobe_tcp_sendmsg_flow", "tcp_sendmsg");
-            // 安全探针
             attach_kp!("kprobe_commit_creds", "commit_creds");
             attach_kp!("kprobe_do_init_module", "do_init_module");
-            // security_bpf_prog_free在部分内核版本可能不存在,attach失败不阻断其他探针
             match (|| -> anyhow::Result<()> {
                 attach_kp!("kprobe_security_bpf_prog_free", "security_bpf_prog_free");
                 Ok(())
@@ -499,7 +482,6 @@ impl EbpfLoader {
                 Err(e) => log::warn!("[loader] security_bpf_prog_free attach失败(忽略): {}", e),
             }
 
-            // take事件maps,按tier选择后端
             let use_ringbuf = matches!(tier, SourceKind::EbpfModern);
 
             if use_ringbuf {
@@ -558,17 +540,22 @@ impl EbpfLoader {
                 );
             }
 
-            // 注入自身pid到protected_pids:分类器冷启动误报高,verdict为2时会
-            // bpf_send_signal杀当前进程。先把自身tgid写入豁免map,避免eBPF自杀
-            // (Tetragon没这个硬保险,本项目多加一层)。enforce_mode默认0即monitor,
-            // 双保险:即便误报也只在monitor模式告警不杀。
             let prot_pids = inject_protected_pid(&mut bpf, std::process::id());
             self.protected_pids = prot_pids;
-            // enforce模式开关:KS_ENFORCE=1时verdict为2内核态直接SIGKILL(申报书
-            // 第四阶段零延迟阻断);默认monitor只告警不杀,冷启动误报不误伤。
+            inject_protected_comms(&mut bpf);
             if std::env::var("KS_ENFORCE").map(|v| v == "1").unwrap_or(false) {
                 set_infer_config(&mut bpf, CFG_ENFORCE_MODE_IDX, 1);
-                log::info!("阻断模式: enforce(verdict==2 内核态SIGKILL)");
+                let warmup_sec: u64 = std::env::var("KS_ENFORCE_WARMUP_SEC")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+                let kill_thr: u32 = std::env::var("KS_ENFORCE_KILL_THRESHOLD")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(70);
+                let warmup_until = boot_monotonic_sec().saturating_add(warmup_sec);
+                set_infer_config(&mut bpf, CFG_ENFORCE_WARMUP_UNTIL_SEC_IDX, warmup_until as u32);
+                set_infer_config(&mut bpf, CFG_ENFORCE_KILL_THRESHOLD_IDX, kill_thr);
+                log::info!(
+                    "阻断模式: enforce(verdict==2内核态SIGKILL) 干跑期={}s kill阈值={}",
+                    warmup_sec, kill_thr
+                );
             } else {
                 log::info!("阻断模式: monitor(默认,KS_ENFORCE=1切换为enforce)");
             }
@@ -588,14 +575,10 @@ impl EbpfLoader {
         &self.probes
     }
 
-    /// 自身及父进程链pid的豁免集合。
-    /// 用户态检测(baseline/ML/anomaly)跳过这些pid,避免哨兵消费变忙时自指误报。
     pub fn protected_pids(&self) -> &[u32] {
         &self.protected_pids
     }
 
-    /// round-robin轮询全部事件源,返回(来源名,字节)。
-    /// Modern: 5 RingBuf；Legacy/Ancient: N×CPU PerfEventArray buffers。
     #[cfg(target_os = "linux")]
     pub fn try_next_events(&mut self) -> Option<(&'static str, Vec<u8>)> {
         use aya::maps::perf::PerfEvent;
@@ -668,7 +651,6 @@ impl EbpfLoader {
         None
     }
 
-    /// 兼容旧调用方(start.rs),仅返回字节,丢弃来源标签。
     pub fn try_next_event(&mut self) -> Option<Vec<u8>> {
         self.try_next_events().map(|(_, bytes)| bytes)
     }
@@ -683,9 +665,6 @@ impl EbpfLoader {
         Ok(())
     }
 
-    /// 返回BPF map读取器。
-    ///
-    /// Linux且bpf已加载时返回LinuxBpfMapReader(克隆Arc<Mutex<Ebpf>>共享同一Ebpf,读5个共享map的真实map_type/max_entries);否则返回None,调用方用MockBpfMapReader兜底。返回Option<Arc<dyn BpfMapReader>>避免trait object生命周期问题。
     pub fn map_reader(&self) -> Option<Arc<dyn BpfMapReader>> {
         #[cfg(target_os = "linux")]
         {
@@ -700,8 +679,6 @@ impl EbpfLoader {
         }
     }
 
-    /// 读取内核侧sys_enter/sys_exit触发计数及ringbuf drop数(percpu求和)。
-    /// 压测诊断用,返回(enter, exit, drop)。
     #[cfg(target_os = "linux")]
     pub fn read_syscount(&self) -> Option<(u64, u64, u64)> {
         use aya::maps::PerCpuArray;
@@ -731,7 +708,6 @@ mod tests {
     fn test_probe_list_contains_all_16_programs() {
         let loader = EbpfLoader::new();
         assert_eq!(loader.probes.len(), 16);
-        // 确保关键探针都在
         assert!(loader.probes.contains(&"trace_sys_enter".to_string()));
         assert!(loader.probes.contains(&"trace_sys_exit".to_string()));
         assert!(loader.probes.contains(&"kprobe_tcp_connect".to_string()));
@@ -760,7 +736,7 @@ mod tests {
     fn test_mock_map_reader_list_map_stats() {
         let mr = MockBpfMapReader;
         let stats = mr.list_map_stats();
-        assert_eq!(stats.len(), 5, "MockBpfMapReader 应返回 5 个共享 map 统计");
+        assert_eq!(stats.len(), 6, "MockBpfMapReader 应返回 6 个共享 map 统计");
         assert_eq!(stats[0].name, "risk_scores");
         assert_eq!(stats[4].name, "infer_config");
         assert!(stats.iter().all(|s| s.entry_count == 0));
@@ -777,14 +753,12 @@ mod tests {
         }
     }
 
-    /// map_reader()在bpf未加载(EbpfLoader::new())时应返回None。
     #[test]
     fn test_map_reader_none_when_not_loaded() {
         let loader = EbpfLoader::new();
         assert!(loader.map_reader().is_none());
     }
 
-    /// MockBpfMapReader.read_map_structured返回6个map的结构化桩数据。
     #[test]
     fn test_mock_read_map_structured_all_maps() {
         let mr = MockBpfMapReader;
@@ -798,21 +772,18 @@ mod tests {
         ] {
             let entries = mr.read_map_structured(name);
             assert!(!entries.is_empty(), "map {}应返回非空桩数据", name);
-            // 每个entry应是JSON对象
             for entry in &entries {
                 assert!(entry.is_object(), "entry应为JSON对象: {}", entry);
             }
         }
     }
 
-    /// 未知map名返回空数组,这是trait默认行为。
     #[test]
     fn test_mock_read_map_structured_unknown_returns_empty() {
         let mr = MockBpfMapReader;
         assert!(mr.read_map_structured("nonexistent_map").is_empty());
     }
 
-    /// risk_scores桩数据包含pid、risk_score、level字段。
     #[test]
     fn test_mock_read_map_structured_risk_scores_schema() {
         let mr = MockBpfMapReader;
@@ -828,23 +799,20 @@ mod tests {
         }
     }
 
-    /// process_tree桩数据包含父子关系(ppid链)。
     #[test]
     fn test_mock_read_map_structured_process_tree_chain() {
         let mr = MockBpfMapReader;
         let entries = mr.read_map_structured("process_tree");
         assert_eq!(entries.len(), 3);
-        // sshd(1234) bash(2345) nc(3456)父子链
         let sshd = entries[0].as_object().unwrap();
         let bash = entries[1].as_object().unwrap();
         let nc = entries[2].as_object().unwrap();
         assert_eq!(sshd["pid"].as_u64(), Some(1234));
         assert_eq!(sshd["ppid"].as_u64(), Some(1));
-        assert_eq!(bash["ppid"].as_u64(), Some(1234)); // bash父是sshd
-        assert_eq!(nc["ppid"].as_u64(), Some(2345)); // nc父是bash
+        assert_eq!(bash["ppid"].as_u64(), Some(1234));
+        assert_eq!(nc["ppid"].as_u64(), Some(2345));
     }
 
-    /// block_decisions桩数据包含expire_ns和reason字段。
     #[test]
     fn test_mock_read_map_structured_block_decisions() {
         let mr = MockBpfMapReader;
@@ -859,22 +827,18 @@ mod tests {
         }
     }
 
-    /// 内嵌eBPF字节码可按tier取出,且为合法ELF(\x7fELF魔数)。
     #[cfg(target_os = "linux")]
     #[test]
     fn test_ebpf_objects_embedded_and_elf() {
-        // modern tier由build.rs保证必编译成功,内嵌常量必存在。
         let modern = super::ebpf_objects::ebpf_object_for("modern")
             .expect("modern tier .o应内嵌进二进制");
         assert!(modern.len() > 1024, "modern .o字节数异常小: {}", modern.len());
         assert_eq!(&modern[..4], b"\x7fELF", "modern .o不是ELF(首4字节不匹配)");
-        // 其他tier编译成功则内嵌且为ELF,未编译返回None,不panic。
         for suffix in ["legacy", "ancient", "ancient_nobtf"] {
             if let Some(bytes) = super::ebpf_objects::ebpf_object_for(suffix) {
                 assert_eq!(&bytes[..4], b"\x7fELF", "{} .o不是ELF", suffix);
             }
         }
-        // 未知tier返回None,这是fail loud契约,不静默回退磁盘。
         assert!(super::ebpf_objects::ebpf_object_for("nonexistent").is_none());
     }
 }
