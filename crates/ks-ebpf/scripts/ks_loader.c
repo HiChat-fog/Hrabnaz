@@ -44,6 +44,7 @@
 
 static char log_buf[LOG_BUF_SIZE];
 static volatile sig_atomic_t stop = 0;
+static __u64 total_lost_events = 0;
 
 struct map_entry {
     char name[64];
@@ -109,10 +110,10 @@ static const struct known_map known_maps[] = {
     {"net_conn_history",  BPF_MAP_TYPE_HASH, 12, 8, 8192},
     {"freq_counters",     BPF_MAP_TYPE_HASH, 4, 48, 4096},
     {"process_tree",      BPF_MAP_TYPE_HASH, 4, 312, 65536},
-    {"net_flows",         BPF_MAP_TYPE_HASH, 20, 48, 8192},
+    {"net_flows",         BPF_MAP_TYPE_HASH, 16, 48, 8192},
     {"port_scan_map",     BPF_MAP_TYPE_HASH, 4, 24, 4096},
     {"process_whitelist", BPF_MAP_TYPE_HASH, 4, 1, 256},
-    {"syscall_ctxs",      BPF_MAP_TYPE_HASH, 8, 64, 10240},
+    {"syscall_ctxs",      BPF_MAP_TYPE_HASH, 8, 384, 10240},
     {"anomaly_relations", BPF_MAP_TYPE_HASH, 32, 2, 64},
     {"safe_patterns",     BPF_MAP_TYPE_HASH, 48, 1, 128},
     {"ks_scratch",        BPF_MAP_TYPE_ARRAY, 4, 1024, 256},
@@ -319,6 +320,10 @@ static int load_prog(Elf *e, int sec_idx, const char *sec_name) {
                     insns[insn_idx].src_reg = BPF_PSEUDO_MAP_FD;
                     insns[insn_idx].imm = map_fd;
                     insns[insn_idx + 1].imm = 0;
+                } else {
+                    /* 未知重定位类型:静默跳过会产出错误绑定,宁可 loud warn */
+                    fprintf(stderr, "  [!] unknown relocation type=%d for '%s' at insn %d — 未处理\n",
+                            rel_type, sym_name, insn_idx);
                 }
             }
         }
@@ -409,11 +414,13 @@ static int setup_perfbuf_for_map(int map_fd, struct perf_map_buf *pb) {
     size_t mmap_size = page_size * (1 + PERF_DATA_PAGES);
 
     pb->map_fd = map_fd;
-    pb->ncpus = ncpus;
+    /* 与下面的写循环同界截断:否则 cleanup/poll 按 ncpus 迭代 bufs[c] 会越界 */
+    pb->ncpus = (ncpus > MAX_CPUS) ? MAX_CPUS : ncpus;
 
     for (int cpu = 0; cpu < ncpus && cpu < MAX_CPUS; cpu++) {
         struct perf_event_attr pe;
         memset(&pe, 0, sizeof(pe));
+        pe.size = sizeof(pe); /* perf_copy_attr 要求 size >= PERF_ATTR_SIZE_VER0,为 0 一律 EINVAL */
         pe.type = PERF_TYPE_SOFTWARE;
         pe.config = PERF_COUNT_SW_BPF_OUTPUT;
         pe.sample_type = PERF_SAMPLE_RAW;
@@ -520,13 +527,23 @@ static void process_cpu_buffer(struct perf_cpu_buf *pcb, int cpu) {
 
         if (hdr_type == PERF_RECORD_SAMPLE) {
             const __u8 *sample = (const __u8 *)eh + sizeof(struct perf_event_header);
+            if (event_size < sizeof(struct perf_event_header) + sizeof(__u32)) {
+                data_tail += event_size;
+                continue;
+            }
             __u32 raw_size = *(__u32 *)sample;
+            /* 边界校验:raw 数据必须完整落在 event 内,否则越界读 */
+            if (sizeof(__u32) + (size_t)raw_size + sizeof(struct perf_event_header) != event_size) {
+                data_tail += event_size;
+                continue;
+            }
             const void *raw_data = sample + sizeof(__u32);
             write_frame(raw_data, raw_size);
         } else if (hdr_type == PERF_RECORD_LOST) {
             const __u64 *lost = (const __u64 *)((const __u8 *)eh + sizeof(struct perf_event_header));
-            fprintf(stderr, "[lost] cpu=%d count=%llu\n",
-                    cpu, (unsigned long long)lost[1]);
+            total_lost_events += lost[1];
+            fprintf(stderr, "[lost] cpu=%d count=%llu (total=%llu)\n",
+                    cpu, (unsigned long long)lost[1], (unsigned long long)total_lost_events);
         }
 
         data_tail += event_size;
@@ -570,6 +587,38 @@ static void sig_handler(int sig) {
     stop = 1;
 }
 
+/* 读取 syscount_map 的 drop/enter/exit 计数并输出到 stderr:
+   旧实现 BPF 侧的丢事件计数没有任何读取方,事件丢失完全不可观测 */
+static void log_drop_stats(void) {
+    int map_fd = find_map_fd("syscount_map");
+    if (map_fd < 0) return;
+    int ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
+    struct syscount_vals { __u64 enter, exit, drop; } vals[MAX_CPUS];
+    memset(vals, 0, sizeof(vals));
+
+    for (int cpu = 0; cpu < ncpu; cpu++) {
+        union bpf_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.map_fd = map_fd;
+        attr.key = (unsigned long)&cpu;
+        attr.value = (unsigned long)&vals[cpu];
+        if (bpf_syscall(BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr)) < 0) {
+            memset(&vals[cpu], 0, sizeof(vals[cpu]));
+        }
+    }
+
+    __u64 enter = 0, exit_n = 0, drop = 0;
+    for (int cpu = 0; cpu < ncpu; cpu++) {
+        enter += vals[cpu].enter;
+        exit_n += vals[cpu].exit;
+        drop += vals[cpu].drop;
+    }
+    fprintf(stderr, "[drop-stats] enter=%llu exit=%llu drop=%llu perf_lost=%llu\n",
+            (unsigned long long)enter, (unsigned long long)exit_n,
+            (unsigned long long)drop, (unsigned long long)total_lost_events);
+}
+
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [--stream | --load-only] <object.o>\n"
@@ -580,6 +629,32 @@ static void print_usage(const char *prog) {
         "                length=0 is a heartbeat (every %d s).\n"
         "                Logs/errors go to stderr; event data to stdout.\n",
         prog, HEARTBEAT_INTERVAL_SEC);
+}
+
+/* 已注册的 kprobe tag 记录:退出时清理,不在 debugfs 留残留 */
+#define MAX_KPROBE_TAGS 64
+static char kprobe_tags[MAX_KPROBE_TAGS][80];
+static int nkprobe_tags = 0;
+
+static void register_kprobe_tag(const char *tag) {
+    if (nkprobe_tags < MAX_KPROBE_TAGS) {
+        snprintf(kprobe_tags[nkprobe_tags], sizeof(kprobe_tags[0]), "%s", tag);
+        nkprobe_tags++;
+    }
+}
+
+static void cleanup_kprobe_tags(void) {
+    int kf = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND);
+    if (kf < 0) return;
+    for (int i = 0; i < nkprobe_tags; i++) {
+        char cmd[96];
+        int n = snprintf(cmd, sizeof(cmd), "-:kprobes/%s\n", kprobe_tags[i]);
+        if (n > 0 && write(kf, cmd, (size_t)n) < 0) {
+            fprintf(stderr, "[!] 清理 kprobe kprobes/%s 失败: %s\n",
+                    kprobe_tags[i], strerror(errno));
+        }
+    }
+    close(kf);
 }
 
 static int attach_program(int prog_fd, const char *sec_name) {
@@ -600,9 +675,18 @@ static int attach_program(int prog_fd, const char *sec_name) {
         }
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "p:%s %s\n", tag, func);
-        if (write(kf, cmd, strlen(cmd)) < 0) {
-        }
+        ssize_t wn = write(kf, cmd, strlen(cmd));
         close(kf);
+        if (wn < 0) {
+            if (errno != EEXIST) {
+                fprintf(stderr, "  [!] attach %s: 注册 kprobe '%s' 失败: %s\n",
+                        sec_name, tag, strerror(errno));
+                return -1;
+            }
+            /* EEXIST:上次运行残留的同名 kprobe,复用即可 */
+        } else {
+            register_kprobe_tag(tag);
+        }
         snprintf(id_path, sizeof(id_path), "%s/events/kprobes/%s/id", tracing, tag);
     } else {
         fprintf(stderr, "  [-] skip attach (section %s)\n", sec_name);
@@ -626,6 +710,7 @@ static int attach_program(int prog_fd, const char *sec_name) {
 
     struct perf_event_attr pe;
     memset(&pe, 0, sizeof(pe));
+    pe.size = sizeof(pe); /* 同上:缺 size 会导致 perf_event_open EINVAL */
     pe.type = PERF_TYPE_TRACEPOINT;
     pe.config = event_id;
     pe.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_TIME;
@@ -805,8 +890,18 @@ int main(int argc, char **argv) {
         }
 
         fprintf(stderr, "\n=== Step 3.5: Attach programs (per-CPU) ===\n");
+        int attach_ok = 0, attach_fail = 0;
         for (int i = 0; i < nprog_fds; i++) {
-            attach_program(prog_fds[i], prog_sec_names[i]);
+            if (attach_program(prog_fds[i], prog_sec_names[i]) == 0) {
+                attach_ok++;
+            } else {
+                attach_fail++;
+            }
+        }
+        if (attach_ok == 0 && attach_fail > 0) {
+            /* 全部 attach 失败还进心跳循环,上游会误以为探针正常但零事件 */
+            fprintf(stderr, "[FAIL] 所有程序 attach 失败 (%d),拒绝进入流模式\n", attach_fail);
+            goto cleanup_fail;
         }
 
         fprintf(stderr, "\n=== Step 4: Polling perfbuf (stream mode) ===\n");
@@ -820,12 +915,15 @@ int main(int argc, char **argv) {
             clock_gettime(CLOCK_MONOTONIC, &now);
             if (now.tv_sec - last_hb.tv_sec >= HEARTBEAT_INTERVAL_SEC) {
                 send_heartbeat();
+                log_drop_stats();
                 last_hb = now;
             }
         }
 
-        fprintf(stderr, "\n[*] exiting stream mode (stop=%d)\n", (int)stop);
+        fprintf(stderr, "\n[*] exiting stream mode (stop=%d, total_lost=%llu)\n",
+                (int)stop, (unsigned long long)total_lost_events);
         cleanup_perfbufs();
+        cleanup_kprobe_tags();
     }
 
     for (int i = 0; i < nattach_fds; i++) {
@@ -843,6 +941,7 @@ int main(int argc, char **argv) {
 
 cleanup_fail:
     cleanup_perfbufs();
+    cleanup_kprobe_tags();
     for (int i = 0; i < nprog_fds; i++) {
         if (prog_fds[i] > 0) close(prog_fds[i]);
     }

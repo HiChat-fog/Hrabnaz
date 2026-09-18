@@ -249,7 +249,7 @@ fn inject_protected_pid(bpf: &mut aya::Ebpf, self_pid: u32) -> Vec<u32> {
         Some(m) => match HashMap::<_, u32, u8>::try_from(m) {
             Ok(mut hm) => {
                 for &pid in &pids {
-                    if let Err(e) = hm.insert(&pid, &val, 0) {
+                    if let Err(e) = hm.insert(pid, val, 0) {
                         log::warn!("写入 protected_pids 失败(pid={}): {:?}", pid, e);
                     }
                 }
@@ -292,7 +292,7 @@ fn inject_protected_comms(bpf: &mut aya::Ebpf) -> Vec<String> {
                     let b = c.as_bytes();
                     let n = b.len().min(15);
                     key[..n].copy_from_slice(&b[..n]);
-                    if let Err(e) = hm.insert(&key, &val, 0) {
+                    if let Err(e) = hm.insert(key, val, 0) {
                         log::warn!("写入 protected_comms 失败({}): {:?}", c, e);
                     } else {
                         injected.push(c.clone());
@@ -534,7 +534,7 @@ impl EbpfLoader {
                 log::info!(
                     "[loader] {:?} tier: {} PerfEventArray buffers ({} CPUs × {} maps)",
                     tier,
-                    online_cpus().len() * RING_NAMES.len(),
+                    cpus.len() * RING_NAMES.len(),
                     cpus.len(),
                     RING_NAMES.len()
                 );

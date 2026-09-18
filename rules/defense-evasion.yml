@@ -1,0 +1,54 @@
+# 防御规避检测 — 全部走 exec args / comm（event_type=1 全量放行）
+
+- name: "审计日志清除"
+  description: "rm/shred/truncate/find 操作系统审计与登录日志"
+  severity: high
+  conditions:
+    - field: comm
+      operator: regex
+      value: "^(shred|rm|truncate|find)$"
+    - field: args
+      operator: regex
+      value: "/var/log/(auth|secure|syslog|messages|audit|wtmp|btmp|lastlog)"
+  alert_message: "检测到系统日志清除操作，疑似防御规避/反取证"
+  mitre_tactic: "TA0005"
+  mitre_technique: "T1070.002"
+
+- name: "文件不可变属性篡改"
+  description: "chattr +/-i 锁定/解锁文件不可变位（常用于锁定后门文件或解除系统保护）"
+  severity: high
+  conditions:
+    - field: comm
+      operator: equals
+      value: "chattr"
+    - field: args
+      operator: regex
+      value: "(\\+i|\\-i)"
+  alert_message: "检测到 chattr 修改文件不可变属性，疑似防御规避"
+  mitre_tactic: "TA0005"
+  mitre_technique: "T1222"
+
+- name: "base64解码执行"
+  description: "shell 中通过 base64 -d 管道解码载荷执行，规避明文检测"
+  severity: medium
+  conditions:
+    - field: comm
+      operator: regex
+      value: "^(bash|sh|zsh|dash)$"
+    - field: args
+      operator: regex
+      value: "base64[ ]+(-d|--decode)"
+  alert_message: "检测到 base64 解码管道执行，疑似混淆载荷"
+  mitre_tactic: "TA0005"
+  mitre_technique: "T1140"
+
+- name: "shell历史规避"
+  description: "unset HISTFILE / history -c / HISTSIZE=0 / shred 历史文件，规避命令记录"
+  severity: medium
+  conditions:
+    - field: args
+      operator: regex
+      value: "(unset[ ]+HISTFILE|history[ ]+-c|HISTSIZE=0|shred[ ]+.*history)"
+  alert_message: "检测到 shell 历史记录规避操作"
+  mitre_tactic: "TA0005"
+  mitre_technique: "T1070.001"

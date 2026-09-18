@@ -7,6 +7,18 @@ use std::path::Path;
 use colored::*;
 use super::ui::{banner, severity_colored};
 
+/// 进程画像每 pid 保留的展示样本数（展示只取前 5 条，样本再多没有意义）
+const PID_SAMPLE_KEEP: usize = 5;
+/// 攻击链条目上限：告警洪峰（历史 150 万条误报）时防止回放 OOM
+const MAX_ATTACK_CHAINS: usize = 100_000;
+
+/// 单个进程的回放画像：总数 + 前 N 条样本
+#[derive(Default)]
+struct PidProfile {
+    total: u64,
+    samples: Vec<(u64, u32, String)>,
+}
+
 fn mitre_phase_name(tactic: &str) -> &str {
     match tactic {
         "TA0001" => "初始入侵",
@@ -92,9 +104,13 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
     let mut event_types: BTreeMap<u32, u64> = BTreeMap::new();
     let mut severities: BTreeMap<String, u64> = BTreeMap::new();
     let mut pids: HashSet<u32> = HashSet::new();
-    let mut pid_events: HashMap<u32, Vec<(u64, u32, String)>> = HashMap::new();
+    // 进程画像只需"每 pid 总数 + 前 5 条样本"：旧实现把每个事件全量存进
+    // HashMap<u32, Vec<(u64,u32,String)>>，多天日志回放会吃掉数 GB 内存
+    let mut pid_profiles: HashMap<u32, PidProfile> = HashMap::new();
     let mut mitre_tags: HashMap<String, Vec<String>> = HashMap::new();
+    // 告警峰值可达百万级（loadgen 误报历史），同样设上限防 OOM
     let mut attack_chains: Vec<AttackChainEntry> = Vec::new();
+    let mut attack_chains_truncated = false;
     let mut first_ts: Option<u64> = None;
     let mut last_ts: Option<u64> = None;
 
@@ -190,19 +206,23 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
 
             let ts = record.get("timestamp_ns").and_then(|v| v.as_u64());
 
-            attack_chains.push(AttackChainEntry {
-                title: title.to_string(),
-                severity: severity.to_string(),
-                pid: pid as u32,
-                comm: comm.to_string(),
-                daddr: daddr.map(|s| s.to_string()),
-                dport: dport.map(|v| v as u16),
-                proto: proto.map(|s| s.to_string()),
-                filepath: filepath.map(|s| s.to_string()),
-                mitre_tactic: mitre_tactic.to_string(),
-                mitre_technique: mitre_technique.to_string(),
-                ts,
-            });
+            if attack_chains.len() >= MAX_ATTACK_CHAINS {
+                attack_chains_truncated = true;
+            } else {
+                attack_chains.push(AttackChainEntry {
+                    title: title.to_string(),
+                    severity: severity.to_string(),
+                    pid: pid as u32,
+                    comm: comm.to_string(),
+                    daddr: daddr.map(|s| s.to_string()),
+                    dport: dport.map(|v| v as u16),
+                    proto: proto.map(|s| s.to_string()),
+                    filepath: filepath.map(|s| s.to_string()),
+                    mitre_tactic: mitre_tactic.to_string(),
+                    mitre_technique: mitre_technique.to_string(),
+                    ts,
+                });
+            }
         } else {
             event_count += 1;
 
@@ -222,10 +242,11 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("?")
                     .to_string();
-                pid_events
-                    .entry(pid as u32)
-                    .or_default()
-                    .push((seq, etype as u32, comm));
+                let prof = pid_profiles.entry(pid as u32).or_default();
+                prof.total += 1;
+                if prof.samples.len() < PID_SAMPLE_KEEP {
+                    prof.samples.push((seq, etype as u32, comm));
+                }
             }
 
             if let Some(ts) = record.get("timestamp_ns").and_then(|v| v.as_u64()) {
@@ -249,6 +270,7 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
             "severities": severities,
             "event_types": event_types,
             "attack_chains": attack_chains.len(),
+            "attack_chains_truncated": attack_chains_truncated,
             "first_ts": first_ts,
             "last_ts": last_ts,
         });
@@ -349,6 +371,15 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
         println!();
         println!("{}", "── 阶段 7: 攻击链还原 ──".cyan().bold());
         println!();
+        if attack_chains_truncated {
+            println!(
+                "  {} 告警超过 {} 条，仅还原前 {} 条 (统计摘要仍基于全量数据)",
+                "[WARN]".yellow(),
+                MAX_ATTACK_CHAINS,
+                MAX_ATTACK_CHAINS
+            );
+            println!();
+        }
         println!("  从离散告警中还原攻击者的行为链:");
         println!();
 
@@ -458,23 +489,23 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
         }
     }
 
-    if !pid_events.is_empty() {
+    if !pid_profiles.is_empty() {
         println!();
         println!("{}", "── 阶段 8: 进程行为画像 (按 PID) ──".cyan().bold());
         println!();
         println!("  每个进程的事件序列 (用于识别异常行为模式):");
         println!();
 
-        for (pid, events) in pid_events.iter() {
-            if events.len() < 2 {
+        for (pid, prof) in pid_profiles.iter() {
+            if prof.total < 2 {
                 continue;
             }
-            println!("  PID {} ({} 条事件):", pid, events.len());
-            for (_, etype, comm) in events.iter().take(5) {
+            println!("  PID {} ({} 条事件):", pid, prof.total);
+            for (_, etype, comm) in prof.samples.iter() {
                 println!("    └─ {} [type={}]", comm, etype);
             }
-            if events.len() > 5 {
-                println!("    └─ ... (共 {} 条)", events.len());
+            if prof.total > prof.samples.len() as u64 {
+                println!("    └─ ... (共 {} 条)", prof.total);
             }
         }
     }

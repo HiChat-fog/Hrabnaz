@@ -45,24 +45,10 @@ fi
 echo ""
 
 # ========== 阶段 2: 编译 eBPF ==========
-echo "[2/4] 编译 eBPF 探针..."
-EBPF_DIR="crates/ks-ebpf/src/bpf"
-
-for probe in syscall_probe vfs_probe net_probe infer; do
-    if [ -f "${EBPF_DIR}/${probe}.bpf.c" ]; then
-        echo "      编译 ${probe}.bpf.c..."
-        if clang-15 \
-            -g -O2 -target bpf \
-            -D__TARGET_ARCH_x86 \
-            -I"${EBPF_DIR}" \
-            -c "${EBPF_DIR}/${probe}.bpf.c" \
-            -o "${EBPF_DIR}/${probe}.bpf.o" 2>/dev/null; then
-            echo "      ✓ ${probe}.bpf.o ($(stat -c%s "${EBPF_DIR}/${probe}.bpf.o") bytes)"
-        else
-            echo "      ✗ ${probe}.bpf.c 编译失败 (可能缺少 vmlinux.h)"
-        fi
-    fi
-done
+# 旧实现遍历的 syscall_probe/vfs_probe/net_probe/infer 源文件早已不存在；
+# eBPF 现由 ks-engine/build.rs 按 tier 矩阵（modern/legacy/ancient/*_nobtf）统一编译，
+# cargo build 阶段自动触发，这里只做提示
+echo "[2/4] 编译 eBPF 探针（由 ks-engine/build.rs 在 cargo build 时按 tier 自动编译）..."
 echo ""
 
 # ========== 阶段 3: 编译 Rust ==========

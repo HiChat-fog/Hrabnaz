@@ -128,6 +128,15 @@ async fn block_pid_handler(
     Path(pid): Path<u32>,
     Query(q): Query<BlockQuery>,
 ) -> impl IntoResponse {
+    // 与 CLI 内部阻断路径一致：保护名单（自身/祖先链/pid 1）不允许通过 REST 阻断
+    if st.is_protected_pid(pid).await {
+        log::warn!("PID {} 在保护名单内，拒绝阻断", pid);
+        return (
+            StatusCode::FORBIDDEN,
+            format!("pid {} is protected (engine self/ancestor/pid 1)", pid),
+        )
+            .into_response();
+    }
     let reason = ks_engine::blocker::BlockReason::from_u8(q.reason.unwrap_or(5));
     let trigger = q.trigger.unwrap_or_else(|| "rest_api".to_string());
     let added = st
@@ -142,10 +151,15 @@ async fn block_pid_handler(
             reason,
             trigger
         );
-        StatusCode::OK
+        StatusCode::OK.into_response()
     } else {
+        // 阻断功能未启用是服务端状态问题，不是客户端权限问题：409 而非 403
         log::warn!("PID {} 阻断未生效（阻断未启用？）", pid);
-        StatusCode::FORBIDDEN
+        (
+            StatusCode::CONFLICT,
+            "blocking is disabled (block_enabled=false)",
+        )
+            .into_response()
     }
 }
 
@@ -302,10 +316,10 @@ async fn stats(State(st): State<SharedState>) -> Json<StatsResponse> {
     })
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(st): State<SharedState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        uptime_secs: 0,
+        uptime_secs: st.uptime_secs(),
     })
 }
 
@@ -313,8 +327,14 @@ async fn tier_info(State(st): State<SharedState>) -> impl IntoResponse {
     format!("tier: {}", st.tier_label)
 }
 
-async fn reload() -> impl IntoResponse {
-    StatusCode::ACCEPTED
+async fn reload(State(st): State<SharedState>) -> impl IntoResponse {
+    // 旧实现是返回 202 但函数体为空的 stub。规则热加载循环在 start 侧每 5s 扫 mtime，
+    // 这里主动唤醒一次让变更立即生效；同一进程内未跑检测引擎时唤醒无副作用
+    st.reload_notify.notify_one();
+    (
+        StatusCode::ACCEPTED,
+        "reload triggered (rules hot-loader woken, changes apply within seconds)",
+    )
 }
 
 async fn version() -> Json<VersionResponse> {

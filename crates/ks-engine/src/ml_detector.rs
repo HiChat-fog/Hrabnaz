@@ -89,7 +89,7 @@ pub struct AdaptiveDetector {
     z_threshold: f64,
     cold_start_samples: usize,
     fixed_thresholds: FixedThresholds,
-    observe_until_ns: u64,
+    observe_until: Option<std::time::Instant>,
     max_pids: usize,
 }
 
@@ -116,14 +116,6 @@ impl Default for FixedThresholds {
     }
 }
 
-fn boot_monotonic_ns() -> u64 {
-    std::fs::read_to_string("/proc/uptime")
-        .ok()
-        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
-        .map(|f| (f * 1_000_000_000.0) as u64)
-        .unwrap_or(0)
-}
-
 impl Default for AdaptiveDetector {
     fn default() -> Self {
         Self::new()
@@ -142,7 +134,7 @@ impl AdaptiveDetector {
             z_threshold: DEFAULT_Z_THRESHOLD,
             cold_start_samples: COLD_START_SAMPLES,
             fixed_thresholds: FixedThresholds::default(),
-            observe_until_ns: 0,
+            observe_until: None,
             max_pids: 10_000,
         }
     }
@@ -157,13 +149,16 @@ impl AdaptiveDetector {
         let mut d = Self::new();
         d.fixed_thresholds = fixed_thresholds;
         if observe_sec > 0 {
-            d.observe_until_ns = boot_monotonic_ns().saturating_add(observe_sec * 1_000_000_000);
+            // 用 Instant 缓存学习期截止时刻：旧实现每次判定都同步读 /proc/uptime，
+            // 而 detect() 对每个事件每个 pid 都会调它——热路径上的文件系统 syscall
+            d.observe_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(observe_sec));
         }
         d
     }
 
     pub fn in_observe_period(&self) -> bool {
-        self.observe_until_ns > 0 && boot_monotonic_ns() < self.observe_until_ns
+        self.observe_until
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
     }
 
     pub fn from_env() -> Self {
@@ -250,16 +245,24 @@ impl AdaptiveDetector {
 
     fn evict_inactive_pids(&mut self) {
         let target = self.max_pids.saturating_sub(self.max_pids / 10);
-        while self.current_windows.len() > target {
-            let evict_pid = match self.current_windows.iter().min_by_key(|(_, w)| w.timestamp_ns) {
-                Some((p, _)) => *p,
-                None => break,
-            };
-            self.current_windows.remove(&evict_pid);
-            self.pid_sample_counts.remove(&evict_pid);
-            self.threshold_multipliers.remove(&evict_pid);
-            self.normal_samples_since_feedback.remove(&evict_pid);
-            self.states.retain(|(p, _), _| *p != evict_pid);
+        if self.current_windows.len() <= target {
+            return;
+        }
+        // 单次收集+排序取最旧的一批一次性淘汰：旧实现每淘汰 1 个 pid 就
+        // min_by_key 全表扫一遍（触发时单事件千万级比较）
+        let mut by_activity: Vec<(u32, u64)> = self
+            .current_windows
+            .iter()
+            .map(|(p, w)| (*p, w.timestamp_ns))
+            .collect();
+        by_activity.sort_unstable_by_key(|(_, ts)| *ts);
+        let excess = self.current_windows.len() - target;
+        for (pid, _) in by_activity.into_iter().take(excess) {
+            self.current_windows.remove(&pid);
+            self.pid_sample_counts.remove(&pid);
+            self.threshold_multipliers.remove(&pid);
+            self.normal_samples_since_feedback.remove(&pid);
+            self.states.retain(|(p, _), _| *p != pid);
         }
     }
 
@@ -438,7 +441,7 @@ mod tests {
 
         let mut agg = EventAggregator::new(100);
         let _ = seq;
-        agg.decode(&data).expect("decode failed")
+        (*agg.decode(&data).expect("decode failed")).clone()
     }
 
     #[test]

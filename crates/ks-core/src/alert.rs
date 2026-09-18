@@ -160,10 +160,17 @@ pub struct MitreInfo {
 }
 
 impl Alert {
-    pub fn new(severity: Severity, title: String, rule_name: String, process: ProcessInfo) -> Self {
+    pub fn new(
+        severity: Severity,
+        timestamp_ns: u64,
+        title: String,
+        rule_name: String,
+        process: ProcessInfo,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
-            timestamp_ns: 0,
+            // 回填来源事件的时间戳：旧实现恒为 0，导致 replay 告警时间线恒为空
+            timestamp_ns,
             severity,
             title,
             description: String::new(),

@@ -1,5 +1,5 @@
 use crate::aggregator::DecodedEvent;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct ProcessNode {
@@ -11,7 +11,8 @@ pub struct ProcessNode {
     pub exit_time_ns: u64,
     pub flags: ProcessFlags,
     pub risk_score: u32,
-    pub events: Vec<DecodedEvent>,
+    // VecDeque 使到达上限后的淘汰为 O(1)（旧 Vec::remove(0) 每次整体搬移，且在每事件热路径上）
+    pub events: VecDeque<DecodedEvent>,
     pub children: Vec<u32>,
 }
 
@@ -72,7 +73,9 @@ impl ProcessTreeManager {
             nodes: HashMap::new(),
             anomaly_patterns: Self::default_anomaly_patterns(),
             max_nodes: 10000,
-            max_events_per_node: 100,
+            // 旧值 100：最坏 10000 节点 × 100 条完整事件（每条 6+ String）≈ 数百 MB，
+            // 远超 memory_limit_mb=128。降到 16：单节点最近 16 条足够链还原使用
+            max_events_per_node: 16,
         }
     }
 
@@ -154,9 +157,9 @@ impl ProcessTreeManager {
             } else if event_type == 2 {
                 node.exit_time_ns = timestamp_ns;
             }
-            node.events.push(event.clone());
+            node.events.push_back(event.clone());
             while node.events.len() > self.max_events_per_node {
-                node.events.remove(0);
+                node.events.pop_front();
             }
             if uid == 0 {
                 node.flags.is_root = true;
@@ -181,7 +184,7 @@ impl ProcessTreeManager {
                         is_anomalous: is_anomalous_child,
                     },
                     risk_score: 0,
-                    events: vec![event.clone()],
+                    events: VecDeque::from(vec![event.clone()]),
                     children: Vec::new(),
                 },
             );
@@ -195,13 +198,19 @@ impl ProcessTreeManager {
         }
 
         if self.nodes.len() > self.max_nodes {
+            // 单次收集+排序按创建时间批量淘汰最旧一批，替代逐个 min_by_key 全表扫描
             let target = self.max_nodes.saturating_sub(self.max_nodes / 10);
-            while self.nodes.len() > target {
-                let evict_pid = match self.nodes.iter().min_by_key(|(_, n)| n.create_time_ns) {
-                    Some((p, _)) => *p,
-                    None => break,
-                };
-                self.nodes.remove(&evict_pid);
+            if self.nodes.len() > target {
+                let mut by_created: Vec<(u32, u64)> = self
+                    .nodes
+                    .iter()
+                    .map(|(p, n)| (*p, n.create_time_ns))
+                    .collect();
+                by_created.sort_unstable_by_key(|(_, ts)| *ts);
+                let excess = self.nodes.len() - target;
+                for (pid, _) in by_created.into_iter().take(excess) {
+                    self.nodes.remove(&pid);
+                }
             }
         }
     }

@@ -13,17 +13,20 @@
 #define EVENT_FLOW_CLOSE   53
 #define EVENT_FLOW_ANOMALY 54
 
+// key 用 socket 四元组：tcp_set_state/tcp_sendmsg 常在 softirq 或无关进程上下文触发，
+// 旧实现把"当前 pid"放 key 里，flow 状态大多 miss 且流量会被记到随机进程头上
 struct net_flow_key {
-    u32 pid, saddr, daddr;
+    u32 saddr, daddr;
     u16 sport, dport;
     u8  proto, _pad_key;
+    u16 _pad_key2;
 };
 
 struct net_flow_state {
     u8  tcp_state, _pad_state1;
     u16 anomaly_flags;
     u64 byte_count, packet_count, create_time_ns, last_update_ns;
-    u32 connect_count, _pad_state2;
+    u32 connect_count, owner_pid;   // owner_pid: connect 时的归属进程（softirq 事件回填用）
 };
 
 #define FLOW_ANOMALY_C2_HEARTBEAT   (1 << 0)
@@ -62,18 +65,20 @@ static __always_inline void netflow_handle_tcp_v4_connect(void *ctx, struct sock
     struct inet_sock *inet = (struct inet_sock *)sk;
     u32 saddr = BPF_CORE_READ(inet, inet_saddr);
     u16 sport = bpf_ntohs(BPF_CORE_READ(inet, inet_sport));
+    // uaddr 是用户态指针：旧实现 bpf_probe_read_kernel 在 5.5+ 恒 -EFAULT，
+    // 整个 netflow connect 路径在 modern tier 上静默失效
     struct sockaddr_in sin;
-    if (bpf_probe_read_kernel(&sin, sizeof(sin), uaddr) < 0) return;
+    if (bpf_probe_read_user(&sin, sizeof(sin), uaddr) < 0) return;
     u32 daddr = sin.sin_addr.s_addr;
     u16 dport = bpf_ntohs(sin.sin_port);
 
     struct net_flow_key key = {};
-    key.pid=pid; key.saddr=saddr; key.daddr=daddr;
-    key.sport=sport; key.dport=dport; key.proto=6; key._pad_key=0;
+    key.saddr=saddr; key.daddr=daddr;
+    key.sport=sport; key.dport=dport; key.proto=6; key._pad_key=0; key._pad_key2=0;
     struct net_flow_state state = {};
     state.tcp_state=TCP_SYN_SENT; state.create_time_ns=now;
     state.last_update_ns=now; state.connect_count=1;
-    state.packet_count=1;
+    state.packet_count=1; state.owner_pid=pid;
 
     struct net_flow_state *prev = bpf_map_lookup_elem(&net_flows, &key);
     if (prev) {
@@ -113,15 +118,16 @@ static __always_inline void netflow_handle_tcp_v4_connect(void *ctx, struct sock
 
 SEC("kprobe/tcp_set_state")
 int BPF_KPROBE(kprobe_tcp_set_state_flow, struct sock *sk, int new_state) {
+    // 不再以"当前 pid==0"早退：tcp_set_state 常在 softirq 触发，
+    // key 已改为 socket 四元组，softirq 也能正确更新/关闭 flow
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
-    if (pid == 0) return 0;
     u64 now = bpf_ktime_get_ns();
 
     struct inet_sock *inet = (struct inet_sock *)sk;
     struct sock_common common = BPF_CORE_READ(sk, __sk_common);
     struct net_flow_key key = {};
-    key.pid=pid; key.saddr=BPF_CORE_READ(inet, inet_saddr);
+    key.saddr=BPF_CORE_READ(inet, inet_saddr);
     key.daddr=common.skc_daddr; key.proto=6;
     key.sport=bpf_ntohs(BPF_CORE_READ(inet, inet_sport));
     key.dport=bpf_ntohs(common.skc_dport);
@@ -151,7 +157,9 @@ int BPF_KPROBE(kprobe_tcp_set_state_flow, struct sock *sk, int new_state) {
         struct net_flow_event *evt = KS_RESERVE(flow_events, struct net_flow_event);
         if (!evt) return 0;
         fill_header(&evt->header, EVENT_FLOW_STATE);
-        evt->pid=pid; evt->saddr=key.saddr; evt->daddr=key.daddr;
+        // softirq 上下文当前 pid 为 0：回填 connect 时的归属进程
+        evt->pid = pid ? pid : flow->owner_pid;
+        evt->saddr=key.saddr; evt->daddr=key.daddr;
         evt->sport=key.sport; evt->dport=key.dport; evt->proto=6;
         evt->tcp_state=our_state; evt->anomaly_flags=flow->anomaly_flags;
         evt->byte_count=flow->byte_count; evt->packet_count=flow->packet_count;
@@ -167,14 +175,11 @@ int BPF_KPROBE(kprobe_tcp_set_state_flow, struct sock *sk, int new_state) {
 
 SEC("kprobe/tcp_sendmsg")
 int BPF_KPROBE(kprobe_tcp_sendmsg_flow, struct sock *sk, struct msghdr *msg, size_t size) {
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
-    if (pid == 0) return 0;
-
+    // 同上：四元组 key 下 softirq 上下文的字节计数也能对上
     struct inet_sock *inet = (struct inet_sock *)sk;
     struct sock_common common = BPF_CORE_READ(sk, __sk_common);
     struct net_flow_key key = {};
-    key.pid=pid; key.saddr=BPF_CORE_READ(inet, inet_saddr);
+    key.saddr=BPF_CORE_READ(inet, inet_saddr);
     key.daddr=common.skc_daddr; key.proto=6;
     key.sport=bpf_ntohs(BPF_CORE_READ(inet, inet_sport));
     key.dport=bpf_ntohs(common.skc_dport);

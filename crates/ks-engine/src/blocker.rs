@@ -94,7 +94,8 @@ impl BlockManager {
         let expiry = if ttl == u64::MAX {
             0
         } else {
-            now + ttl * 1_000_000_000
+            // saturating：ttl 过大时旧的加法会溢出回绕，"永久封禁"瞬间变成"立刻过期"
+            now.saturating_add(ttl.saturating_mul(1_000_000_000))
         };
 
         self.blocked.insert(

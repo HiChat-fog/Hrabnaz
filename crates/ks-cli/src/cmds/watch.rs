@@ -1,10 +1,13 @@
 use anyhow::Result;
 use ks_core::alert::Alert;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use super::ui::{banner, severity_badge};
 use colored::Colorize;
+
+/// seen 集合上限：只增不减的 HashSet 在长跑 watch 里会缓慢膨胀
+const SEEN_CAP: usize = 10000;
 
 #[derive(clap::Args, Debug)]
 pub struct WatchArgs {
@@ -36,6 +39,7 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
     }
 
     let mut seen: HashSet<uuid::Uuid> = HashSet::new();
+    let mut seen_order: VecDeque<uuid::Uuid> = VecDeque::new();
     let mut count: usize = 0;
 
     loop {
@@ -59,6 +63,12 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
                         };
                         for a in &alerts {
                             if seen.insert(a.id) {
+                                seen_order.push_back(a.id);
+                                if seen_order.len() > SEEN_CAP {
+                                    if let Some(old) = seen_order.pop_front() {
+                                        seen.remove(&old);
+                                    }
+                                }
                                 count += 1;
                                 if json_mode {
                                     if let Ok(s) = serde_json::to_string(a) {

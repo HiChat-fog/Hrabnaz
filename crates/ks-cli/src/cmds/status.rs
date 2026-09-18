@@ -192,7 +192,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
                     println!("  {:<20} {:<14} {} 条", s.name, s.map_type, s.entry_count);
                 }
             }
-            match std::fs::read_to_string("/tmp/ks-status.json") {
+            match std::fs::read_to_string(super::status_file_path()) {
                 Ok(content) => println!("  运行实例: {}", content.trim().replace('\n', " ")),
                 Err(_) => println!("  运行实例: (未检测到 start 进程)"),
             }

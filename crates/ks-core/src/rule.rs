@@ -153,6 +153,7 @@ impl Field {
             "pid",
             "ppid",
             "uid",
+            "event_type",
             "syscall_nr",
             "filename",
             "args",

@@ -79,16 +79,14 @@ static __always_inline struct filter_decision should_send_event(
     if (decision.risk_score >= min_risk) return decision;
 
     struct freq_counter *fc = bpf_map_lookup_elem(&freq_counters, &pid);
-    if (fc) {
-        if (fc->anomaly_flags > 0) return decision;
-        decision.action=1; decision.reason=FILTER_REASON_NORMAL_FREQ; return decision;
-    }
+    if (fc && fc->anomaly_flags > 0) return decision;
 
     switch (event_type) {
-    case 1:  case 30: case 31: case 20:
+    case EVENT_FILE_OPEN:
+    case EVENT_FILE_READ:
+        decision.action=1;
+        decision.reason = fc ? FILTER_REASON_NORMAL_FREQ : FILTER_REASON_LOW_RISK;
         break;
-    case 10: case 11:
-        decision.action=1; decision.reason=FILTER_REASON_LOW_RISK; break;
     }
     return decision;
 }
@@ -118,7 +116,9 @@ static __always_inline void smart_filter_handle_vfs_open(struct path *path) {
     const char *name = KS_READ_DNAME(dentry);
 
     char name_buf[64] = {};
-    if (name) bpf_probe_read(name_buf, sizeof(name_buf), name);
+    // _str 变体保证 NUL 终止：旧实现 bpf_probe_read 整块拷 64 字节，
+    // 长文件名时 name_buf 无终止符，作为 safe_patterns key 会带上栈上垃圾
+    if (name) bpf_probe_read_kernel_str(name_buf, sizeof(name_buf), name);
 
     struct filter_decision decision = should_send_event(pid, EVENT_FILE_OPEN, name_buf);
     update_filter_stats(decision.action);

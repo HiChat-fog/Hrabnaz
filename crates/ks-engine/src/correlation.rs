@@ -250,7 +250,8 @@ impl CorrelationEngine {
         let window_ns = self.window_size_secs * 1_000_000_000;
         let current_ts = event.header.timestamp_ns;
         while let Some(front) = self.event_window.front() {
-            if current_ts - front.header.timestamp_ns > window_ns {
+            // perfbuf 多 ring 乱序到达时 current_ts 可能小于 front，非饱和减法会回绕出巨大窗口
+            if current_ts.saturating_sub(front.header.timestamp_ns) > window_ns {
                 self.event_window.pop_front();
             } else {
                 break;
@@ -260,6 +261,13 @@ impl CorrelationEngine {
             self.event_window.pop_front();
         }
         if self.sequence_trackers.len() > self.max_trackers {
+            // 先一次性清掉长时间无进展的死 tracker，避免逐条 min_by_key 全表扫描
+            let stale_ns = (self.window_size_secs * 3).max(300) * 1_000_000_000;
+            let now = current_ts;
+            self.sequence_trackers.retain(|_, t| {
+                t.last_step_timestamp_ns == 0
+                    || now.saturating_sub(t.last_step_timestamp_ns) <= stale_ns
+            });
             let target = self.max_trackers.saturating_sub(self.max_trackers / 10);
             while self.sequence_trackers.len() > target {
                 let evict_key = match self
@@ -275,62 +283,43 @@ impl CorrelationEngine {
         }
 
         let mut alerts = Vec::new();
-        let rule_checks: Vec<(usize, u64, Vec<CorrelationCondition>, u64)> = self
+        // 只收集 (规则下标, window_secs, max_gap_secs) 标量，条件按需借自 self.rules，
+        // 旧实现每事件把所有规则的 condition_a/b 与 steps 整个 Vec 深拷贝一遍
+        let rule_checks: Vec<(usize, u64, u64)> = self
             .rules
             .iter()
             .enumerate()
             .filter_map(|(i, rule)| match &rule.correlation_type {
-                CorrelationType::Window {
-                    window_secs,
-                    condition_a,
-                    condition_b,
-                } => Some((
-                    i,
-                    *window_secs,
-                    vec![condition_a.clone(), condition_b.clone()],
-                    0,
-                )),
-                CorrelationType::Sequence {
-                    steps,
-                    max_gap_secs,
-                } => Some((i, 0, steps.clone(), *max_gap_secs)),
+                CorrelationType::Window { window_secs, .. } => Some((i, *window_secs, 0)),
+                CorrelationType::Sequence { max_gap_secs, .. } => Some((i, 0, *max_gap_secs)),
                 CorrelationType::ProcessTree { .. } => None,
             })
             .collect();
 
-        for (rule_idx, window_secs, conditions, max_gap_secs) in rule_checks {
-            if window_secs > 0 && conditions.len() == 2 {
-                if let Some(alert) = self.check_window_correlation(
-                    event,
-                    window_secs,
-                    &conditions[0],
-                    &conditions[1],
-                ) {
-                    let rule = &self.rules[rule_idx];
-                    alerts.push(CorrelationAlert {
-                        rule_name: rule.name.clone(),
-                        correlation_type: rule.correlation_type.clone(),
-                        events: alert.events,
-                        description: rule.description.clone(),
-                        severity: rule.severity.clone(),
-                        mitre: rule.mitre.clone(),
-                        confidence: alert.confidence,
-                    });
+        for (rule_idx, window_secs, max_gap_secs) in rule_checks {
+            if window_secs > 0 {
+                if let CorrelationType::Window {
+                    condition_a,
+                    condition_b,
+                    ..
+                } = &self.rules[rule_idx].correlation_type
+                {
+                    if let Some(alert) = self.check_window_correlation(
+                        event,
+                        window_secs,
+                        condition_a,
+                        condition_b,
+                    ) {
+                        let rule = &self.rules[rule_idx];
+                        alerts.push(self.build_alert(rule, alert));
+                    }
                 }
-            } else if conditions.len() >= 2 && max_gap_secs > 0 {
+            } else if max_gap_secs > 0 {
                 if let Some(alert) =
-                    self.check_sequence_correlation(event, rule_idx, &conditions, max_gap_secs)
+                    self.check_sequence_correlation(event, rule_idx, max_gap_secs)
                 {
                     let rule = &self.rules[rule_idx];
-                    alerts.push(CorrelationAlert {
-                        rule_name: rule.name.clone(),
-                        correlation_type: rule.correlation_type.clone(),
-                        events: alert.events,
-                        description: rule.description.clone(),
-                        severity: rule.severity.clone(),
-                        mitre: rule.mitre.clone(),
-                        confidence: alert.confidence,
-                    });
+                    alerts.push(self.build_alert(rule, alert));
                 }
             }
         }
@@ -349,21 +338,25 @@ impl CorrelationEngine {
                         child_condition,
                         pt,
                     ) {
-                        alerts.push(CorrelationAlert {
-                            rule_name: rule.name.clone(),
-                            correlation_type: rule.correlation_type.clone(),
-                            events: alert.events,
-                            description: rule.description.clone(),
-                            severity: rule.severity.clone(),
-                            mitre: rule.mitre.clone(),
-                            confidence: alert.confidence,
-                        });
+                        alerts.push(self.build_alert(rule, alert));
                     }
                 }
             }
         }
 
         alerts
+    }
+
+    fn build_alert(&self, rule: &CorrelationRule, alert: PartialAlert) -> CorrelationAlert {
+        CorrelationAlert {
+            rule_name: rule.name.clone(),
+            correlation_type: rule.correlation_type.clone(),
+            events: alert.events,
+            description: rule.description.clone(),
+            severity: rule.severity.clone(),
+            mitre: rule.mitre.clone(),
+            confidence: alert.confidence,
+        }
     }
 
     fn check_process_tree_correlation(
@@ -440,7 +433,7 @@ impl CorrelationEngine {
     }
 
     fn check_window_correlation(
-        &mut self,
+        &self,
         event: &DecodedEvent,
         window_secs: u64,
         condition_a: &CorrelationCondition,
@@ -456,7 +449,9 @@ impl CorrelationEngine {
             .event_window
             .iter()
             .filter(|e| {
-                current_ts - e.header.timestamp_ns <= window_ns && matches_condition(e, condition_a)
+                // 饱和减法：perfbuf 乱序到达时 e 的时间戳可能晚于当前事件
+                current_ts.saturating_sub(e.header.timestamp_ns) <= window_ns
+                    && matches_condition(e, condition_a)
             })
             .cloned()
             .collect();
@@ -486,9 +481,14 @@ impl CorrelationEngine {
         &mut self,
         event: &DecodedEvent,
         rule_idx: usize,
-        steps: &[CorrelationCondition],
         max_gap_secs: u64,
     ) -> Option<PartialAlert> {
+        // steps 借自 self.rules（字段级借用，与 trackers 的可变借用不冲突），
+        // 免去调用方逐事件克隆整条 steps Vec
+        let steps: &[CorrelationCondition] = match &self.rules[rule_idx].correlation_type {
+            CorrelationType::Sequence { steps, .. } => steps,
+            _ => return None,
+        };
         let pid = event.header.pid;
         let tracker = self
             .sequence_trackers
@@ -508,7 +508,11 @@ impl CorrelationEngine {
         if matches_condition(event, &steps[tracker.current_step]) {
             let max_gap_ns = max_gap_secs * 1_000_000_000;
             if tracker.last_step_timestamp_ns > 0
-                && event.header.timestamp_ns - tracker.last_step_timestamp_ns > max_gap_ns
+                && event
+                    .header
+                    .timestamp_ns
+                    .saturating_sub(tracker.last_step_timestamp_ns)
+                    > max_gap_ns
             {
                 tracker.current_step = 0;
                 tracker.matched_events.clear();
@@ -534,7 +538,7 @@ impl CorrelationEngine {
                 let mut confidence: f64 = 0.7;
                 if events.len() >= 2 {
                     let duration = events.last().unwrap().header.timestamp_ns
-                        - events.first().unwrap().header.timestamp_ns;
+                        .saturating_sub(events.first().unwrap().header.timestamp_ns);
                     if duration < 3_000_000_000 {
                         confidence += 0.2;
                     }

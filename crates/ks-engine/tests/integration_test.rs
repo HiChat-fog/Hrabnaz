@@ -100,7 +100,7 @@ fn process_events(
 
     for data in events_data {
         let event = aggregator.decode(data).unwrap();
-        decoded_events.push(event.clone());
+        decoded_events.push((*event).clone());
 
         forensic.log_event(&event).unwrap();
 
@@ -1027,7 +1027,7 @@ async fn test_ransomware_full_chain() {
             Ok(e) => e,
             Err(_) => continue,
         };
-        decoded_events.push(event.clone());
+        decoded_events.push((*event).clone());
 
         forensic.log_event(&event).unwrap();
 
@@ -1146,7 +1146,7 @@ async fn test_privilege_escalation_full_chain() {
             Ok(e) => e,
             Err(_) => continue,
         };
-        decoded_events.push(event.clone());
+        decoded_events.push((*event).clone());
 
         forensic.log_event(&event).unwrap();
 

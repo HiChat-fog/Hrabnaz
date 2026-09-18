@@ -11,8 +11,11 @@ pub mod tls;
 
 pub use audit::{AuditConfig, AuditWriter};
 pub use auth::AuthToken;
+pub use server::bind_listener;
+pub use server::cors_layer;
 pub use server::run_server;
 pub use server::run_server_with_config;
+pub use server::run_server_with_listener;
 pub use server::run_server_with_state;
 pub use server::run_server_with_tier;
 pub use server::ServerConfig;

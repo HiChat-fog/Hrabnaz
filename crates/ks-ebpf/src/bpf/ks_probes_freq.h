@@ -1,6 +1,12 @@
 #ifndef KS_PROBES_FREQ_H
 #define KS_PROBES_FREQ_H
 
+/* 系统调用号硬编码 x86_64（59/2/257/42/101/62/313 等）：
+   换架构时这些 case 会静默失配，宁可编译失败也不要静默漏检 */
+#if !defined(__TARGET_ARCH_x86)
+#error "ks 探针的系统调用号为 x86_64 硬编码，仅支持 __TARGET_ARCH_x86"
+#endif
+
 #define EVENT_FREQ_UPDATE  60
 #define EVENT_FREQ_ANOMALY 61
 

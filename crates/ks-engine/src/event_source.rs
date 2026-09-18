@@ -443,6 +443,25 @@ pub use linux_impl::*;
 pub use mock_only::*;
 
 #[cfg(target_os = "linux")]
+static RELEASED_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// 清理本进程释放的私有临时目录（优雅退出路径调用；崩溃残留由下次启动的
+/// sweep_stale_run_dirs 兜底清扫）
+#[cfg(target_os = "linux")]
+pub fn cleanup_released_dirs() {
+    let dirs = RELEASED_DIRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for d in dirs.iter() {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cleanup_released_dirs() {}
+
+#[cfg(target_os = "linux")]
 mod linux_impl {
     pub use super::{EventSource, MockEventSource, SourceKind};
     use crate::ebpf_perf_source::EbpfPerfSource;
@@ -623,16 +642,69 @@ mod linux_impl {
         Ok((source, None))
     }
 
+    /// 本进程释放过的私有目录登记：优雅退出时统一删除
+    fn record_released_dir(dir: std::path::PathBuf) {
+        super::RELEASED_DIRS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(dir);
+    }
+
+    /// 启动期清扫：删除"其他进程"残留的 ks-run-* 目录（目录名内嵌 pid，
+    /// 仅当该 pid 的进程已不存在时才删，绝不碰仍在运行的实例）
+    fn sweep_stale_run_dirs(dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix("ks-run-") else { continue };
+            let Some(pid_str) = rest.split('-').next() else { continue };
+            let Ok(pid) = pid_str.parse::<u32>() else { continue };
+            if pid == std::process::id() {
+                continue; // 自己的目录由退出清理负责
+            }
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                let _ = std::fs::remove_dir_all(entry.path());
+                log::debug!("[cloader] 清扫残留临时目录 {}", entry.path().display());
+            }
+        }
+    }
+
     fn release_to_temp(name: &str, bytes: &[u8], mode: u32) -> anyhow::Result<std::path::PathBuf> {
         use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let dir = std::env::var_os("TMPDIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        let path = dir.join(format!("ks-{}-{}.bin", name, std::process::id()));
 
-        let mut f = std::fs::File::create(&path)
+        // 每次释放用 root-only 的私有子目录（随机后缀防预占/symlink），
+        // 旧实现用可预测文件名 File::create：跟随 symlink + 0644→chmod 有竞态窗口，
+        // root 引擎面临本地 symlink 攻击（攻击者可替换即将执行的 ks_loader）
+        let random: u64 = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+            nanos ^ ((std::process::id() as u64) << 32)
+        };
+        sweep_stale_run_dirs(&dir);
+
+        let sub = dir.join(format!("ks-run-{}-{:016x}", std::process::id(), random));
+        std::fs::create_dir(&sub)
+            .map_err(|e| anyhow::anyhow!("创建私有临时目录 {} 失败: {}", sub.display(), e))?;
+        // 收紧为 0700（create_dir 受 umask 影响）
+        let _ = std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700));
+        record_released_dir(sub.clone());
+
+        let path = sub.join(format!("{}.bin", name));
+        // O_EXCL(create_new) + O_NOFOLLOW：私有目录内再加一层防御
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(0o2000000) // O_NOFOLLOW
+            .open(&path)
             .map_err(|e| anyhow::anyhow!("创建临时文件 {} 失败: {}", path.display(), e))?;
         f.write_all(bytes)
             .map_err(|e| anyhow::anyhow!("写入临时文件 {} 失败: {}", path.display(), e))?;

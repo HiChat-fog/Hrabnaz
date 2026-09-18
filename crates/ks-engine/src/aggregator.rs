@@ -3,13 +3,18 @@ use ks_core::event::{af, EventHeader, RawEvent};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 pub struct EventAggregator {
-    buffer: VecDeque<DecodedEvent>,
+    // 存 Arc 避免热路径上每事件深拷贝一次进缓冲（DecodedEvent 含 6+ 个 String）
+    buffer: VecDeque<Arc<DecodedEvent>>,
     max_buffer: usize,
     seq: u64,
     pid_windows: HashMap<u32, VecDeque<u64>>,
     max_pids: usize,
+    // FIFO 淘汰队列：pid 首次出现时入队。空窗口（pid 已退出）直接淘汰，
+    // 仍有 60s 内活动的窗口重排队——O(1) 摊销，替代旧实现每次全 map min_by_key 扫描
+    evict_queue: VecDeque<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,10 +48,12 @@ impl EventAggregator {
             seq: 0,
             pid_windows: HashMap::new(),
             max_pids: 10000,
+            evict_queue: VecDeque::new(),
         }
     }
 
-    pub fn decode(&mut self, data: &[u8]) -> Result<DecodedEvent> {
+    /// 返回 Arc：调用方拿到的事件与内部缓冲共享同一份，免一次深拷贝
+    pub fn decode(&mut self, data: &[u8]) -> Result<Arc<DecodedEvent>> {
         let raw = unsafe { RawEvent::from_bytes(data) }
             .ok_or_else(|| anyhow::anyhow!("事件数据不足: {} 字节", data.len()))?;
 
@@ -58,13 +65,13 @@ impl EventAggregator {
             1 => {
                 let exec = unsafe { &raw.exec };
                 let fname = cstr_to_string(&exec.filename);
-                let args = cstr_to_string(&exec.args);
+                let args = exec_args_to_cmdline(&exec.args);
                 DecodedEvent {
                     seq: 0,
                     header,
                     comm,
                     filename: if fname.is_empty() { None } else { Some(fname) },
-                    args: if args.is_empty() { None } else { Some(args) },
+                    args,
                     saddr: None,
                     daddr: None,
                     sport: None,
@@ -300,6 +307,7 @@ impl EventAggregator {
         self.seq += 1;
         let mut event = decoded;
         event.seq = self.seq;
+        let event = Arc::new(event);
 
         if self.buffer.len() >= self.max_buffer {
             self.buffer.pop_front();
@@ -309,6 +317,7 @@ impl EventAggregator {
         {
             const WINDOW_NS: u64 = 60_000_000_000;
             let now_ns = event.header.timestamp_ns;
+            let is_new_pid = !self.pid_windows.contains_key(&event.header.pid);
             let win = self.pid_windows.entry(event.header.pid).or_default();
             win.push_back(now_ns);
             while let Some(&front) = win.front() {
@@ -318,20 +327,11 @@ impl EventAggregator {
                     break;
                 }
             }
+            if is_new_pid {
+                self.evict_queue.push_back(event.header.pid);
+            }
             if self.pid_windows.len() > self.max_pids {
-                let target = self.max_pids.saturating_sub(self.max_pids / 10);
-                while self.pid_windows.len() > target {
-                    let evict_pid = match self
-                        .pid_windows
-                        .iter()
-                        .filter_map(|(p, w)| w.front().map(|&t| (*p, t)))
-                        .min_by_key(|(_, t)| *t)
-                    {
-                        Some((p, _)) => p,
-                        None => break,
-                    };
-                    self.pid_windows.remove(&evict_pid);
-                }
+                self.evict_stale_pids();
             }
         }
 
@@ -342,12 +342,41 @@ impl EventAggregator {
         Ok(event)
     }
 
-    pub fn buffer(&self) -> &VecDeque<DecodedEvent> {
+    /// O(1) 摊销的 pid 淘汰：FIFO 队列，空窗口（进程已退出/窗口已滑空）直接删，
+    /// 仍有活动的窗口重排队。旧实现每淘汰一个就全 map min_by_key 扫一遍，
+    /// 触发阈值时单事件热路径上千万级比较，造成延迟尖峰
+    fn evict_stale_pids(&mut self) {
+        let target = self.max_pids.saturating_sub(self.max_pids / 10);
+        let mut attempts = 0usize;
+        let max_attempts = self.evict_queue.len();
+        while self.pid_windows.len() > target && attempts < max_attempts {
+            attempts += 1;
+            let Some(pid) = self.evict_queue.pop_front() else {
+                break;
+            };
+            let is_active = self
+                .pid_windows
+                .get(&pid)
+                .is_some_and(|w| !w.is_empty());
+            if is_active {
+                // 60s 窗口内仍活跃的 pid 重排队，不丢统计
+                self.evict_queue.push_back(pid);
+            } else {
+                self.pid_windows.remove(&pid);
+            }
+        }
+    }
+
+    pub fn buffer(&self) -> &VecDeque<Arc<DecodedEvent>> {
         &self.buffer
     }
 
     pub fn by_pid(&self, pid: u32) -> Vec<&DecodedEvent> {
-        self.buffer.iter().filter(|e| e.header.pid == pid).collect()
+        self.buffer
+            .iter()
+            .filter(|e| e.header.pid == pid)
+            .map(|e| e.as_ref())
+            .collect()
     }
 
     pub fn recent(&self, n: usize) -> Vec<&DecodedEvent> {
@@ -356,7 +385,11 @@ impl EventAggregator {
         } else {
             0
         };
-        self.buffer.iter().skip(skip).collect()
+        self.buffer
+            .iter()
+            .skip(skip)
+            .map(|e| e.as_ref())
+            .collect()
     }
 
     pub fn recent_syscall_count(&mut self, pid: u32, now_ns: u64) -> usize {
@@ -379,6 +412,7 @@ impl EventAggregator {
         self.buffer
             .iter()
             .filter(|e| e.header.timestamp_ns >= start_ns && e.header.timestamp_ns <= end_ns)
+            .map(|e| e.as_ref())
             .collect()
     }
 
@@ -396,6 +430,22 @@ impl EventAggregator {
 fn cstr_to_string(data: &[u8]) -> String {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     String::from_utf8_lossy(&data[..end]).into_owned()
+}
+
+fn exec_args_to_cmdline(args: &[u8; 512]) -> Option<String> {
+    let mut mingling_duan = Vec::new();
+    for duan in args.chunks(64).take(5) {
+        let zi_fu = cstr_to_string(duan);
+        if zi_fu.is_empty() {
+            break;
+        }
+        mingling_duan.push(zi_fu);
+    }
+    if mingling_duan.is_empty() {
+        None
+    } else {
+        Some(mingling_duan.join(" "))
+    }
 }
 
 fn ip_to_string(addr: u32) -> String {

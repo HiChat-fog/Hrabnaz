@@ -1,14 +1,18 @@
 #ifndef KS_PROBES_SYSCALL_H
 #define KS_PROBES_SYSCALL_H
 
+/* 系统调用号硬编码 x86_64（59/2/257/42/101/62/313 等）：
+   换架构时这些 case 会静默失配，宁可编译失败也不要静默漏检 */
+#if !defined(__TARGET_ARCH_x86)
+#error "ks 探针的系统调用号为 x86_64 硬编码，仅支持 __TARGET_ARCH_x86"
+#endif
+
 struct syscall_ctx {
     u64 args[6];
     u64 start_ns;
     u32 pid;
     u32 syscall_nr;
-#ifndef KS_NOBTF
     char exec_args[320];
-#endif
 };
 
 struct {
@@ -41,7 +45,7 @@ int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
     switch (syscall_nr) {
     case 59:  case 2:   case 257:
     case 0:   case 1:   case 42:
-    case 101: case 62:
+    case 101: case 62:  case 313:
         break;
     default:
         return 0;
@@ -59,7 +63,6 @@ int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
     sctx.args[5] = ctx->args[5];
 
     if (syscall_nr == 59) {
-#ifndef KS_NOBTF
         const char __user *const *argv_ptr = (const char __user *const *)sctx.args[1];
         if (argv_ptr) {
             const char __user *arg_ptr;
@@ -70,11 +73,10 @@ int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
             if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[2]) == 0 && arg_ptr)
                 bpf_probe_read_user_str(sctx.exec_args + 128,  64, arg_ptr);
             if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[3]) == 0 && arg_ptr)
-                bpf_probe_read_user_str(sctx.exec_args + 192,  64, arg_ptr);
+                bpf_probe_read_user_str(sctx.exec_args + 192, 64, arg_ptr);
             if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[4]) == 0 && arg_ptr)
                 bpf_probe_read_user_str(sctx.exec_args + 256,  64, arg_ptr);
         }
-#endif
     }
 
     bpf_map_update_elem(&syscall_ctxs, &pid_tgid, &sctx, BPF_ANY);
@@ -110,9 +112,7 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         const char __user *filename_ptr = (const char __user *)sctx->args[0];
         bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), filename_ptr);
 
-#ifndef KS_NOBTF
         __builtin_memcpy(evt->args, sctx->exec_args, sizeof(sctx->exec_args));
-#endif
 
         int verdict = infer_event(evt->header.pid, EVENT_PROCESS_EXEC,
                     (const char *)evt->filename, 0, 0, 0, 0);
@@ -236,6 +236,23 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
         if (ks_should_drop(evt->header.pid, EVENT_PROC_SIGNAL, NULL, verdict5)) {
             KS_DISCARD(evt); goto cleanup;
         }
+        KS_SUBMIT(ctx, events, evt);
+        goto cleanup;
+    }
+
+    if (syscall_nr == 313 && ret < 0) {
+        struct lkm_load_event *evt = KS_RESERVE(events, struct lkm_load_event);
+        if (!evt) { ks_count_drop(); goto cleanup; }
+
+        fill_header(&evt->header, EVENT_LKM_LOAD);
+        evt->header.syscall_nr = 313;
+        evt->header.retval = ret;
+        evt->pid = evt->header.pid;
+        evt->uid = evt->header.uid;
+        evt->_pad_lkm1 = 0;
+        __builtin_memcpy(evt->comm, evt->header.comm, sizeof(evt->comm));
+        __builtin_memcpy(evt->module_name, "finit_module", 13);
+
         KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }

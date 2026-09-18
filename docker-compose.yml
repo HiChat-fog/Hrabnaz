@@ -19,7 +19,8 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     command: ["--rules-dir", "/etc/kernelsentinel/rules", "--log-dir", "/var/log/kernelsentinel"]
     healthcheck:
-      test: ["CMD", "bash", "-c", "test -f /tmp/ks-status.json"]
+      # root 运行时状态文件在 /run/kernelsentinel/，非 root 回退 /tmp
+      test: ["CMD", "bash", "-c", "test -f /run/kernelsentinel/ks-status.json || test -f /tmp/ks-status.json"]
       interval: 30s
       timeout: 5s
       retries: 3

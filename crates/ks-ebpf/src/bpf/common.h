@@ -28,7 +28,10 @@ typedef __s64 i64;
     #define KS_LRU_HASH  1
 #endif
 
-#if defined(KS_TIER_ANCIENT) || (defined(KS_TIER_LEGACY) && defined(KS_NOBTF))
+/* read_kernel/read_user 的 user/kernel 拆分是 5.5+ 才有的 helper：
+   4.x（无论走不走 BTF）与 3.10 都必须回退 bpf_probe_read，
+   否则 legacy tier 在 4.19 上加载时 helper 不存在直接失败 */
+#if !defined(KS_TIER_MODERN)
     #define bpf_probe_read_kernel       bpf_probe_read
     #define bpf_probe_read_kernel_str   bpf_probe_read_str
     #define bpf_probe_read_user         bpf_probe_read
@@ -41,8 +44,14 @@ typedef __s64 i64;
     #define KS_OFF_SOCK_COMMON         0
     #define KS_OFF_PATH_DENTRY         8
     #define KS_OFF_DENTRY_DNAME_NAME   40
+    /* d_parent 在 3.10/4.19 x86_64 均为 24：d_flags(4)+d_seq(4)+d_hash(16) */
+    #define KS_OFF_DENTRY_D_PARENT     24
     #define KS_OFF_FILE_FPATH          16
     #define KS_OFF_SIN6_PORT           2
+    /* struct cred 前缀布局（usage 后紧跟 uid）在 3.10/4.19 稳定：
+       usage(0-4) uid(4-8) gid(8-12) suid(12-16) sgid(16-20) euid(20-24) */
+    #define KS_OFF_CRED_UID            4
+    #define KS_OFF_CRED_EUID           20
 
     #if defined(KS_TIER_LEGACY)
         #define KS_OFF_INET_SADDR          728
@@ -60,18 +69,97 @@ typedef __s64 i64;
     #define KS_NOREAD_inet_sport(ptr)   ({ u16 _v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_INET_SPORT); _v; })
     #define KS_NOREAD___sk_common(ptr)  ({ struct sock_common _v={}; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_SOCK_COMMON); _v; })
     #define KS_NOREAD_dentry(ptr)       ({ struct dentry *_v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_PATH_DENTRY); _v; })
+    #define KS_NOREAD_d_parent(ptr)     ({ struct dentry *_v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_DENTRY_D_PARENT); _v; })
     #define KS_NOREAD_f_path(ptr)       ({ struct path _v={}; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_FILE_FPATH); _v; })
     #define KS_NOREAD_sin6_port(ptr)    ({ u16 _v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_SIN6_PORT); _v; })
+    #define KS_NOREAD_uid(ptr)          ({ u32 _v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_CRED_UID); _v; })
+    #define KS_NOREAD_euid(ptr)         ({ u32 _v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_CRED_EUID); _v; })
 
     #define KS_READ_DNAME(ptr) ({ const char *_v=0; bpf_probe_read(&_v,sizeof(_v),(char*)(ptr)+KS_OFF_DENTRY_DNAME_NAME); _v; })
 #else
     #define KS_READ_DNAME(ptr) BPF_CORE_READ(ptr, d_name.name)
 #endif
 
+/*
+ * KS_D_APPEND_LEVEL：把一级目录名（24B 定长块，含 NUL+零填充）写到 dst[pos]，
+ * 并用 '/' 覆盖其 NUL。定长块拷贝保证 __builtin_memcpy 尺寸是编译期常量
+ * （BPF 不支持变长 memcpy）。空间不够时置 pos=-1，后续层级自动跳过
+ */
+#define KS_D_APPEND_LEVEL(dst, pos, nbuf, nlen, dst_len) do { \
+    if ((pos) >= 0) { \
+        int _p = (pos); \
+        int _need = (int)sizeof(nbuf) + 24; \
+        if (_p + _need <= (int)(dst_len)) { \
+            __builtin_memcpy((dst) + _p, (nbuf), sizeof(nbuf)); \
+            _p += (nlen); \
+            (dst)[_p] = '/'; \
+            (pos) = _p + 1; \
+        } else { \
+            (pos) = -1; \
+        } \
+    } \
+} while (0)
+
+/*
+ * KS_D_TREE：从 dentry 沿 d_parent 向上最多走 4 级，拼出
+ * "/祖先/…/父目录/文件名" 形式的路径。
+ * 旧实现只读 d_name.name 末段："/etc/shadow" 拿到的是 "shadow"，
+ * 规则里 FilenameContains("/etc/shadow")、"^/var/log/" 这类
+ * 带目录的路径判断在 kprobe 路径上全部失效。
+ * d_parent==自身 表示已到挂载点根部，停止上溯。
+ * 返回写入 dst 的字节数；读不到名字返回 0（调用方自行回退）。
+ */
+#define KS_D_TREE(dst, dst_len, dent) ({ \
+    char _n0[24] = {}, _n1[24] = {}, _n2[24] = {}, _n3[24] = {}, _n4[24] = {}; \
+    struct dentry *_d0 = (dent); \
+    const char *_c0 = _d0 ? KS_READ_DNAME(_d0) : 0; \
+    long _l0 = _c0 ? bpf_probe_read_kernel_str(_n0, sizeof(_n0), _c0) : -1; \
+    struct dentry *_d1 = (_l0 > 0) ? BPF_CORE_READ(_d0, d_parent) : 0; \
+    int _h1 = (_d1 && _d1 != _d0) ? 1 : 0; \
+    const char *_c1 = _h1 ? KS_READ_DNAME(_d1) : 0; \
+    long _l1 = _c1 ? bpf_probe_read_kernel_str(_n1, sizeof(_n1), _c1) : -1; \
+    _h1 = (_h1 && _l1 > 0) ? 1 : 0; \
+    struct dentry *_d2 = _h1 ? BPF_CORE_READ(_d1, d_parent) : 0; \
+    int _h2 = (_d2 && _d2 != _d1) ? 1 : 0; \
+    const char *_c2 = _h2 ? KS_READ_DNAME(_d2) : 0; \
+    long _l2 = _c2 ? bpf_probe_read_kernel_str(_n2, sizeof(_n2), _c2) : -1; \
+    _h2 = (_h2 && _l2 > 0) ? 1 : 0; \
+    struct dentry *_d3 = _h2 ? BPF_CORE_READ(_d2, d_parent) : 0; \
+    int _h3 = (_d3 && _d3 != _d2) ? 1 : 0; \
+    const char *_c3 = _h3 ? KS_READ_DNAME(_d3) : 0; \
+    long _l3 = _c3 ? bpf_probe_read_kernel_str(_n3, sizeof(_n3), _c3) : -1; \
+    _h3 = (_h3 && _l3 > 0) ? 1 : 0; \
+    struct dentry *_d4 = _h3 ? BPF_CORE_READ(_d3, d_parent) : 0; \
+    int _h4 = (_d4 && _d4 != _d3) ? 1 : 0; \
+    const char *_c4 = _h4 ? KS_READ_DNAME(_d4) : 0; \
+    long _l4 = _c4 ? bpf_probe_read_kernel_str(_n4, sizeof(_n4), _c4) : -1; \
+    _h4 = (_h4 && _l4 > 0) ? 1 : 0; \
+    int _pos = 0; \
+    if (_h4) KS_D_APPEND_LEVEL((dst), _pos, _n4, (int)(_l4 - 1), (dst_len)); \
+    if (_h3) KS_D_APPEND_LEVEL((dst), _pos, _n3, (int)(_l3 - 1), (dst_len)); \
+    if (_h2) KS_D_APPEND_LEVEL((dst), _pos, _n2, (int)(_l2 - 1), (dst_len)); \
+    if (_h1) KS_D_APPEND_LEVEL((dst), _pos, _n1, (int)(_l1 - 1), (dst_len)); \
+    ({ \
+        int _out = 0; \
+        if (_l0 > 0) { \
+            if (_pos >= 0 && _pos + (int)sizeof(_n0) <= (int)(dst_len)) { \
+                __builtin_memcpy((dst) + _pos, _n0, sizeof(_n0)); \
+                _out = _pos + (int)(_l0 - 1); \
+                ((char *)(dst))[_out] = 0; \
+            } else if (_pos < 0) { \
+                /* 全路径放不下：退化为纯文件名 */ \
+                __builtin_memcpy((dst), _n0, sizeof(_n0)); \
+                _out = (int)(_l0 - 1); \
+            } \
+        } \
+        _out; \
+    }); \
+})
+
+/* KS_D_PATH：struct path* 入口的树形路径（语义同 KS_D_TREE） */
 #define KS_D_PATH(buf, buf_len, path_ptr) ({ \
     struct dentry *_d = BPF_CORE_READ((path_ptr), dentry); \
-    const char *_n = KS_READ_DNAME(_d); \
-    bpf_probe_read_kernel_str((char *)(buf), (buf_len), _n); \
+    KS_D_TREE((buf), (buf_len), _d); \
 })
 
 #if KS_LRU_HASH
@@ -318,6 +406,11 @@ enum infer_config_key {
 };
 
 static __always_inline u32 get_config(u32 key, u32 default_val) {
+    // 先查 map：infer_config 里用户态写入的值优先；
+    // 旧实现对 key 0-4 硬编码直返，map 里对这些 key 的写入全是死配置
+    u32 *val = bpf_map_lookup_elem(&infer_config, &key);
+    if (val && *val != 0)
+        return *val;
     switch (key) {
     case CFG_RISK_THRESHOLD:      return 70;
     case CFG_PORT_SCAN_THRESHOLD: return 20;
@@ -326,8 +419,7 @@ static __always_inline u32 get_config(u32 key, u32 default_val) {
     case CFG_NEW_FILE_WINDOW_NS:  return 30;
     default: break;
     }
-    u32 *val = bpf_map_lookup_elem(&infer_config, &key);
-    return val ? *val : default_val;
+    return default_val;
 }
 
 static __always_inline u32 get_risk(u32 pid) {
@@ -456,45 +548,8 @@ static __always_inline int infer_event(u32 pid, u32 event_type, const char *file
 }
 
 
-static __always_inline void update_freq_counter(u32 pid, u32 event_type) {
-    struct freq_counter *fc = bpf_map_lookup_elem(&freq_counters, &pid);
-    u64 now = bpf_ktime_get_ns();
-    u64 window_ns = 60000000000ULL;
-
-    if (!fc) {
-        struct freq_counter new_fc = {};
-        new_fc.window_start_ns = now;
-        new_fc.last_update_ns = now;
-        if (event_type >= 1 && event_type <= 9)
-            new_fc.syscall_count_60s = 1;
-        else if (event_type >= 10 && event_type <= 19)
-            new_fc.file_op_count_60s = 1;
-        else if (event_type >= 20 && event_type <= 29)
-            new_fc.net_op_count_60s = 1;
-        else if (event_type >= 30 && event_type <= 39)
-            { new_fc.ptrace_count_60s = 1; new_fc.signal_count_60s = 1; }
-        bpf_map_update_elem(&freq_counters, &pid, &new_fc, BPF_ANY);
-        return;
-    }
-
-    if (now - fc->window_start_ns > window_ns)
-        fc->window_start_ns = now;
-
-    fc->last_update_ns = now;
-    if (event_type >= 1 && event_type <= 9)
-        fc->syscall_count_60s++;
-    else if (event_type >= 10 && event_type <= 19)
-        fc->file_op_count_60s++;
-    else if (event_type >= 20 && event_type <= 29)
-        fc->net_op_count_60s++;
-    else if (event_type == EVENT_NET_DNS)
-        fc->dns_op_count_60s++;
-    else if (event_type == EVENT_PROC_PTRACE)
-        fc->ptrace_count_60s++;
-    else if (event_type == EVENT_PROC_SIGNAL)
-        fc->signal_count_60s++;
-}
-
+/* 旧版 update_freq_counter 已删除：全部调用点走 freq.h 的 update_freq_counter_ex，
+   本函数语义与之不一致（窗口重置不清计数、DNS 分支永不命中），留着只会误导 */
 
 struct ks_event {
     u32 event_type;

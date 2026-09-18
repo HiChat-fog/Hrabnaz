@@ -1,0 +1,49 @@
+# 命令控制检测 — connect (event_type=20) 事件全量放行（ip_whitelist map 无写入方，恒空）
+# 内核 infer_suspicious_net 对 4444/1337/31337 等端口已有风险加成，此处覆盖云场景与横向移动特征
+
+- name: "云元数据接口访问"
+  description: "访问 169.254.169.254 云实例元数据接口，窃取临时凭证/主机信息的经典手法"
+  severity: high
+  conditions:
+    - field: daddr
+      operator: equals
+      value: "169.254.169.254"
+  alert_message: "检测到云元数据接口访问，疑似临时凭证窃取"
+  mitre_tactic: "TA0006"
+  mitre_technique: "T1552.005"
+
+- name: "Telnet明文出联"
+  description: "向 23 端口 (Telnet) 发起出站连接，服务器主动外联明文管理协议高度可疑"
+  severity: medium
+  conditions:
+    - field: dport
+      operator: equals
+      value: "23"
+  alert_message: "检测到 Telnet 明文协议出联，疑似命令控制或爆破活动"
+  mitre_tactic: "TA0011"
+  mitre_technique: "T1095"
+
+- name: "SMB外联横向移动"
+  description: "向 139/445 端口 (SMB/NetBIOS) 发起出站连接，Linux 服务器主动外联 Windows 共享疑似横向移动"
+  severity: high
+  conditions:
+    - field: dport
+      operator: regex
+      value: "^(139|445)$"
+  alert_message: "检测到 SMB 端口外联，疑似横向移动"
+  mitre_tactic: "TA0008"
+  mitre_technique: "T1021.002"
+
+- name: "载荷下载落地tmp"
+  description: "wget/curl 将可执行载荷下载到 /tmp（经典投递落点）"
+  severity: medium
+  conditions:
+    - field: comm
+      operator: regex
+      value: "^(wget|curl)$"
+    - field: args
+      operator: regex
+      value: "(/tmp/[A-Za-z0-9_.-]+|[ ]-O[ ]+/tmp/)"
+  alert_message: "检测到向 /tmp 下载文件，疑似载荷投递"
+  mitre_tactic: "TA0002"
+  mitre_technique: "T1105"

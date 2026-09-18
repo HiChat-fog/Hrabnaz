@@ -7,7 +7,14 @@ pub fn acquire() -> io::Result<File> {
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "无可用锁文件路径");
 
     for path in &candidates {
-        let f = match OpenOptions::new().create(true).read(true).write(true).truncate(true).open(path) {
+        // 先加锁再截断（截断发生在下方锁成功之后），这里显式 truncate(false)
+        let f = match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+        {
             Ok(f) => f,
             Err(e) => {
                 last_err = e;
@@ -22,8 +29,11 @@ pub fn acquire() -> io::Result<File> {
             l_pid: 0,
         }) };
         if ret == 0 {
-            use std::io::Write;
-            let _ = (&f).write_all(format!("{}\n", std::process::id()).as_bytes());
+            use std::io::{Seek, Write};
+            let mut f = f;
+            let _ = f.seek(std::io::SeekFrom::Start(0));
+            let _ = f.set_len(0);
+            let _ = f.write_all(format!("{}\n", std::process::id()).as_bytes());
             return Ok(f);
         }
         let e = io::Error::last_os_error();

@@ -7,6 +7,60 @@ use std::fs::{read_dir, remove_file, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+/// argv 中敏感值的脱敏正则（文档"已知安全缺口 #8：取证日志可能含敏感 argv"）：
+/// password=xxx / --token xxx / api_key: xxx 等形式，值替换为 ***
+static SECRET_VALUE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+fn secret_value_re() -> &'static regex::Regex {
+    SECRET_VALUE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)\b(password|passwd|pwd|passphrase|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|credentials?)(["']?\s*[=:]\s*["']?)([^\s"',;]+)"#,
+        )
+        .expect("secret 正则编译失败")
+    })
+}
+
+/// 空格分隔的长选项形式：--password hunter2 / --api-key xxx
+static SECRET_FLAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+fn secret_flag_re() -> &'static regex::Regex {
+    SECRET_FLAG_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)((?:--?)(?:password|passwd|pwd|passphrase|token|secret|api[_-]?key|access[_-]?key))\s+([^\s-][^\s]*)"#,
+        )
+        .expect("secret flag 正则编译失败")
+    })
+}
+
+/// 脱敏一条 argv/命令行：保留键名，值替换为 ***
+pub fn sanitize_secret(value: &str) -> String {
+    let s = secret_value_re().replace_all(value, "${1}${2}***").into_owned();
+    secret_flag_re().replace_all(&s, "${1} ***").into_owned()
+}
+
+/// 递归脱敏 JSON 记录中 args/cmdline 字段的字符串值（forensic 写路径统一入口）
+fn scrub_sensitive(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if matches!(k.as_str(), "args" | "cmdline") {
+                    if let serde_json::Value::String(s) = v {
+                        *s = sanitize_secret(s);
+                    }
+                } else {
+                    scrub_sensitive(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                scrub_sensitive(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub trait HashAlgorithm: Send + Sync {
     fn hash(&self, data: &str) -> String;
 }
@@ -105,7 +159,14 @@ impl ForensicLogger {
             if line.trim().is_empty() {
                 continue;
             }
-            if line.contains("\"seq\"") {
+            // 严格按"可解析 JSON 且含顶层 seq 数字字段"识别事件行。
+            // 旧实现 line.contains("\"seq\"") 子串匹配：description 含 "sequence"
+            // 的告警行会被误认成链尾，恢复出错误 prev_hash，哈希链从此静默断裂
+            let is_event_line = serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .filter(|v| v.get("seq").and_then(|s| s.as_u64()).is_some())
+                .is_some();
+            if is_event_line {
                 last_event_line = line;
             }
         }
@@ -146,18 +207,16 @@ impl ForensicLogger {
         self.writer = BufWriter::with_capacity(65536, new_file);
         self.current_file_size = 0;
         log::info!("日志轮转: 归档至 {}", archive_path.display());
+        if let Err(e) = cleanup_old_archives(&self.log_dir, self.rotation_config.retain_days) {
+            log::warn!("归档清理失败: {}", e);
+        }
 
         if self.rotation_config.compress_archives {
             let gzip_path = archive_path.with_extension("jsonl.gz");
             let src = archive_path.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = compress_gzip(&src, &gzip_path) {
-                    log::warn!("压缩归档失败: {} — {}", src.display(), e);
-                } else {
-                    let _ = remove_file(&src);
-                    log::info!("归档已压缩: {}", gzip_path.display());
-                }
-            });
+            // 单例压缩线程 + 有界通道：旧实现每次轮转 std::thread::spawn 分离线程
+            // 无并发上限，高频轮转会堆积线程；且 remove_file 失败被吞，留下 .jsonl/.gz 双份
+            spawn_gzip_worker(src, gzip_path);
         }
         Ok(())
     }
@@ -203,6 +262,9 @@ impl ForensicLogger {
             record["file_bytes"] = serde_json::json!(b);
         }
 
+        // 脱敏必须在哈希之前：保证链校验时重算的内容与落盘内容一致
+        scrub_sensitive(&mut record);
+
         let btree: BTreeMap<String, serde_json::Value> = record
             .as_object()
             .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -232,6 +294,9 @@ impl ForensicLogger {
         let mut record = serde_json::to_value(alert)?;
         record["type"] = serde_json::Value::String("alert".to_string());
 
+        // 告警的 process.cmdline 同样可能携带 argv 里的明文密码
+        scrub_sensitive(&mut record);
+
         let btree: BTreeMap<String, serde_json::Value> = record
             .as_object()
             .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -255,7 +320,32 @@ impl ForensicLogger {
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         self.last_flush_count = self.event_count;
+        self.export_chain_head();
         Ok(())
+    }
+
+    /// 链尾哈希外落（文档缺口 #6"无链尾外报"）：每次 flush 把链尾 hash 追加
+    /// 写到日志目录下的独立文件 chain_head.log。取证日志被整批删除/篡改时，
+    /// 该文件仍保留可对照的哈希记录（replay 验证结果可与之外部比对）。
+    /// 追加式且带时间戳，攻击者无法在不留痕迹的情况下"回填"历史链尾
+    fn export_chain_head(&self) {
+        let head_path = self.log_dir.join("chain_head.log");
+        let line = format!(
+            "{} seq={} hash={} file={}\n",
+            chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            self.event_count,
+            self.prev_hash,
+            self.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+        );
+        let write_res = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&head_path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+        if let Err(e) = write_res {
+            // 外落失败不影响主取证链路
+            log::debug!("chain_head 外落失败: {} — {}", head_path.display(), e);
+        }
     }
 
     pub fn path(&self) -> &PathBuf {
@@ -272,19 +362,21 @@ impl ForensicLogger {
     }
 
     pub fn verify_chain(path: &PathBuf) -> Result<ChainVerification> {
-        let content = std::fs::read_to_string(path)?;
+        // 流式逐行校验：旧实现 read_to_string 把 100MB+ 整个日志读进内存
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
         let mut prev_hash = GENESIS_HASH.to_string();
         let mut total_records = 0u64;
         let mut broken_at: Option<u64> = None;
         let hasher = Sha256Hash;
 
-        for line in content.lines() {
+        for line in reader.lines().map_while(Result::ok) {
             if line.trim().is_empty() {
                 continue;
             }
             total_records += 1;
 
-            let record: serde_json::Value = serde_json::from_str(line)?;
+            let record: serde_json::Value = serde_json::from_str(&line)?;
             let stored_prev = record
                 .get("prev_hash")
                 .and_then(|v| v.as_str())
@@ -353,6 +445,44 @@ fn compress_gzip(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 归档压缩 worker：进程内单线程 + 有界通道(8)。
+/// 通道满时跳过该次压缩并 warn（.jsonl 归档仍保留，清理任务会按保留期回收），
+/// 避免 rotate 热路径阻塞、也避免线程无界堆积
+fn spawn_gzip_worker(src: std::path::PathBuf, dst: std::path::PathBuf) {
+    use std::sync::mpsc;
+    use std::sync::OnceLock;
+    static WORKER: OnceLock<mpsc::SyncSender<(std::path::PathBuf, std::path::PathBuf)>> =
+        OnceLock::new();
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<(std::path::PathBuf, std::path::PathBuf)>(8);
+        std::thread::Builder::new()
+            .name("ks-gzip-rotate".into())
+            .spawn(move || {
+                while let Ok((src, dst)) = rx.recv() {
+                    match compress_gzip(&src, &dst) {
+                        Ok(()) => {
+                            if let Err(e) = remove_file(&src) {
+                                log::warn!(
+                                    "压缩后删除归档 {} 失败: {} (双份归档,由保留期清理回收)",
+                                    src.display(),
+                                    e
+                                );
+                            } else {
+                                log::info!("归档已压缩: {}", dst.display());
+                            }
+                        }
+                        Err(e) => log::warn!("压缩归档失败: {} — {}", src.display(), e),
+                    }
+                }
+            })
+            .expect("spawn gzip worker");
+        tx
+    });
+    if tx.try_send((src, dst)).is_err() {
+        log::warn!("压缩队列已满,本次归档暂不压缩 (保留 .jsonl 由清理任务回收)");
+    }
+}
+
 fn cleanup_old_archives(log_dir: &Path, retain_days: u32) -> Result<()> {
     let cutoff = chrono::Local::now() - chrono::Duration::days(retain_days as i64);
     let cutoff_secs = cutoff.timestamp();
@@ -384,6 +514,52 @@ mod tests {
     use super::*;
     use ks_core::event::EventHeader;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_sanitize_secret_kv_forms() {
+        assert_eq!(
+            sanitize_secret("mysql -u root -password=hunter2 -h db"),
+            "mysql -u root -password=*** -h db"
+        );
+        assert_eq!(
+            sanitize_secret("export API_KEY=abcd1234 && run"),
+            "export API_KEY=*** && run"
+        );
+        assert_eq!(
+            sanitize_secret("psql --dbname x --token: my-secret-token"),
+            "psql --dbname x --token: ***"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_secret_flag_form() {
+        assert_eq!(
+            sanitize_secret("kubectl create secret --password hunter2 --ns prod"),
+            "kubectl create secret --password *** --ns prod"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_keeps_normal_args() {
+        let normal = "gcc -O2 -o app main.c && tar -czf backup.tar.gz /data";
+        assert_eq!(sanitize_secret(normal), normal);
+        // 普通单词不能被误伤
+        assert_eq!(sanitize_secret("ls -la --color=auto"), "ls -la --color=auto");
+    }
+
+    #[test]
+    fn test_scrub_sensitive_walks_json() {
+        let mut v: serde_json::Value = serde_json::json!({
+            "pid": 1,
+            "args": "python -c 'token=abcdef'",
+            "process": { "cmdline": "curl -H 'Authorization: Bearer xyz' http://x" },
+            "comm": "bash"
+        });
+        scrub_sensitive(&mut v);
+        assert_eq!(v["args"], "python -c 'token=***'");
+        assert!(v["process"]["cmdline"].as_str().unwrap().contains("***"));
+        assert_eq!(v["comm"], "bash");
+    }
 
     fn make_event(seq: u64, pid: u32) -> DecodedEvent {
         let mut comm = [0u8; 16];

@@ -7,12 +7,22 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AuthToken {
 
     pub token: Option<String>,
 
     pub enabled: bool,
+}
+
+// 手写 Debug 脱敏：明文 token 不能随 {:?} 日志/调试输出泄漏
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.token {
+            Some(t) => write!(f, "AuthToken {{ token: Some(<redacted:{} chars>), enabled: {} }}", t.len(), self.enabled),
+            None => write!(f, "AuthToken {{ token: None, enabled: {} }}", self.enabled),
+        }
+    }
 }
 
 impl AuthToken {
@@ -40,12 +50,16 @@ struct AuthError {
 const WHITELIST_PATHS: &[&str] = &["/health", "/api/v1/health", "/version", "/metrics"];
 
 fn is_whitelisted(uri: &str) -> bool {
-    if uri.starts_with("/ws") {
-        return true;
-    }
-
     let path = uri.split('?').next().unwrap_or(uri);
     WHITELIST_PATHS.contains(&path)
+}
+
+/// WebSocket 升级前复用同一套 token 比对逻辑
+pub fn validate_token(auth: &AuthToken, provided: Option<&str>) -> bool {
+    match (&auth.token, provided) {
+        (Some(expected), Some(p)) => constant_time_eq(p, expected),
+        _ => false,
+    }
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -74,7 +88,18 @@ pub async fn auth_middleware(State(auth): State<AuthToken>, req: Request, next: 
 
     let expected = match &auth.token {
         Some(t) => t,
-        None => return next.run(req).await,
+        // fail-closed：鉴权已启用但未配置 token 时拒绝（与 CLI 启动横幅承诺的行为一致），
+        // 旧实现这里直接放行，导致"没配 token = 鉴权形同虚设"
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [("content-type", "application/json")],
+                Json(AuthError {
+                    error: "auth enabled but no token configured on server",
+                }),
+            )
+                .into_response()
+        }
     };
 
     let provided = req
@@ -117,8 +142,9 @@ mod tests {
         assert!(is_whitelisted("/api/v1/health"));
         assert!(is_whitelisted("/version"));
         assert!(is_whitelisted("/metrics"));
-        assert!(is_whitelisted("/ws/alerts"));
-        assert!(is_whitelisted("/ws"));
+        // /ws 不再走白名单前缀放行，由 ws_handler 升级前自行校验 token
+        assert!(!is_whitelisted("/ws/alerts"));
+        assert!(!is_whitelisted("/ws"));
 
         assert!(!is_whitelisted("/api/v1/alerts"));
         assert!(!is_whitelisted("/healthX"));
@@ -126,5 +152,27 @@ mod tests {
 
         assert!(is_whitelisted("/metrics?foo=bar"));
         assert!(is_whitelisted("/api/v1/health?check=quick"));
+    }
+
+    #[test]
+    fn test_validate_token() {
+        let auth = AuthToken::new("secret");
+        assert!(validate_token(&auth, Some("secret")));
+        assert!(!validate_token(&auth, Some("wrong")));
+        assert!(!validate_token(&auth, None));
+        // enabled=true 且未配 token：一律拒绝（fail-closed）
+        let no_token = AuthToken {
+            token: None,
+            enabled: true,
+        };
+        assert!(!validate_token(&no_token, Some("anything")));
+    }
+
+    #[test]
+    fn test_debug_redacts_token() {
+        let auth = AuthToken::new("super-secret-value");
+        let dbg = format!("{:?}", auth);
+        assert!(!dbg.contains("super-secret-value"));
+        assert!(dbg.contains("<redacted"));
     }
 }

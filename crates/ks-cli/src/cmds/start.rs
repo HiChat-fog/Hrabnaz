@@ -26,7 +26,6 @@ use crate::cmds::{build_server_config, SecurityArgs};
 enum ForensicOp {
     Event(DecodedEvent),
     Alert(Alert),
-    Flush,
 }
 
 #[derive(Clone)]
@@ -45,9 +44,6 @@ impl ForensicSink {
             log::warn!("forensic worker已退出,告警丢失");
         }
     }
-    async fn flush(&self) {
-        let _ = self.tx.send(ForensicOp::Flush).await;
-    }
 }
 
 async fn forensic_worker(
@@ -58,7 +54,6 @@ async fn forensic_worker(
         let r = match op {
             ForensicOp::Event(e) => forensic.lock().await.log_event(&e),
             ForensicOp::Alert(a) => forensic.lock().await.log_alert(&a),
-            ForensicOp::Flush => forensic.lock().await.flush(),
         };
         if let Err(e) = r {
             log::warn!("forensic写入失败: {}", e);
@@ -68,11 +63,6 @@ async fn forensic_worker(
         log::warn!("forensic flush失败: {}", e);
     }
 }
-
-#[cfg(target_os = "linux")]
-const STATUS_FILE: &str = "/tmp/ks-status.json";
-#[cfg(not(target_os = "linux"))]
-const STATUS_FILE: &str = "./ks-status.json";
 
 static PROF_NS: [std::sync::atomic::AtomicU64; 9] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
@@ -88,17 +78,27 @@ fn prof_add(idx: usize, ns: u64) {
 }
 
 fn prof_print() {
+    // 剖析产物不再无条件追加到可预测路径 /tmp/ks-prof.log，改为 KS_PROF=1 显式开启
+    if std::env::var("KS_PROF").as_deref() != Ok("1") {
+        return;
+    }
     let cnt = PROF_CNT.load(std::sync::atomic::Ordering::Relaxed);
     if cnt == 0 { return; }
     let names = ["decode","forensic_log","baseline","process_tree+corr","ml","detector_match","anomaly_score(incr)","forensic_alert","total"];
-    let mut s = String::from(format!("[prof] events={}\n", cnt));
+    let mut s = format!("[prof] events={}\n", cnt);
     for (i, n) in names.iter().enumerate() {
         let ns = PROF_NS[i].load(std::sync::atomic::Ordering::Relaxed);
         let avg_ns = ns / cnt.max(1);
         s.push_str(&format!("  {:<28} total={:>10}μs  avg={:>8}ns\n", n, ns/1000, avg_ns));
     }
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/ks-prof.log")
-        .and_then(|mut f| std::io::Write::write_all(&mut f, s.as_bytes()));
+    if let Some(path) = std::env::var("KS_PROF").ok().and_then(|v| {
+        if v == "1" { None } else { Some(std::path::PathBuf::from(v)) }
+    }) {
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, s.as_bytes()));
+    } else {
+        eprintln!("{}", s);
+    }
 }
 
 pub async fn run(
@@ -151,15 +151,39 @@ pub async fn run(
                 }
                 None => std::sync::Arc::new(ks_server::ServerState::with_tier(tier_label)),
             };
-            let st = state.clone();
             let server_config = build_server_config(security);
-            tokio::spawn(async move {
-                if let Err(e) = ks_server::run_server_with_config(st, port, server_config).await {
-                    log::warn!("ks-server 退出: {}", e);
+            let st = state.clone();
+            match server_config.tls {
+                // 明文路径：先同步 bind，端口被占/权限不足直接中止启动，
+                // 旧实现后台 warn 后继续跑，用户误以为数据服务正常
+                None => {
+                    let listener = ks_server::bind_listener(port).await?;
+                    println!("      数据服务: http://127.0.0.1:{}/api/v1/", port);
+                    println!("      WebSocket: ws://127.0.0.1:{}/ws/alerts", port);
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            ks_server::run_server_with_listener(st, listener, server_config).await
+                        {
+                            log::warn!("ks-server 退出: {}", e);
+                        }
+                    });
                 }
-            });
-            println!("      数据服务: http://127.0.0.1:{}/api/v1/", port);
-            println!("      WebSocket: ws://127.0.0.1:{}/ws/alerts", port);
+                Some(ref tls_cfg) => {
+                    println!(
+                        "      数据服务: https://127.0.0.1:{}/api/v1/ (cert={}, mTLS={})",
+                        port,
+                        tls_cfg.server_cert.display(),
+                        tls_cfg.is_mtls()
+                    );
+                    tokio::spawn(async move {
+                        if let Err(e) = ks_server::run_server_with_config(st, port, server_config).await
+                        {
+                            log::warn!("ks-server 退出: {}", e);
+                            eprintln!("  [!] 数据服务启动失败: {} (端口被占/证书问题?)", e);
+                        }
+                    });
+                }
+            }
             Some(state)
         }
         None => None,
@@ -238,8 +262,10 @@ pub async fn run(
     super::ui::step(6, 6, "启动规则热加载");
     let hot_reload_rules_dir = rules_dir.to_string();
     let hot_reload_detector = detector.clone();
+    // /api/v1/reload 通过这个 Notify 立即唤醒热加载循环（REST reload 真正生效）
+    let reload_notify = serve_state.as_ref().map(|st| st.reload_notify.clone());
     tokio::spawn(async move {
-        rule_hot_loader(&hot_reload_detector, &hot_reload_rules_dir).await;
+        rule_hot_loader(&hot_reload_detector, &hot_reload_rules_dir, reload_notify).await;
     });
     println!("      监听规则目录变更: {}", rules_dir);
 
@@ -265,6 +291,10 @@ pub async fn run(
 
     let protected_pids: std::collections::HashSet<u32> =
         source.protected_pids().iter().copied().collect();
+    // 保护名单同步给 REST 阻断端点：POST /api/v1/block/:pid 不允许阻断这些进程
+    if let Some(st) = &serve_state {
+        st.set_protected_pids(protected_pids.clone()).await;
+    }
 
     let mut sig = std::pin::pin!(tokio::signal::ctrl_c());
 
@@ -311,6 +341,8 @@ pub async fn run(
     println!("{}", "── 安全关闭 ──".cyan().bold());
     println!("      释放事件源（含 eBPF 探针 fd）...");
     drop(source);
+    // 清理本次运行释放到 /tmp 的 ks_loader 与 .o 私有目录
+    ks_engine::event_source::cleanup_released_dirs();
     println!("      Flush 取证日志...");
     drop(forensic_sink);
     let _ = forensic_worker_handle.await;
@@ -503,6 +535,7 @@ async fn process_event_bytes(
                 .unwrap_or_else(|| "unknown".to_string());
             let alert = Alert::new(
                 Severity::High,
+                event.header.timestamp_ns,
                 format!("基线偏离: {} (PID {})", dim, event.header.pid),
                 "baseline_deviation".to_string(),
                 ProcessInfo {
@@ -535,6 +568,7 @@ async fn process_event_bytes(
             };
             let alert = Alert::new(
                 Severity::High,
+                event.header.timestamp_ns,
                 format!(
                     "ML异常检测: {} (PID {}, {})",
                     dim_str, event.header.pid, model_str
@@ -562,6 +596,7 @@ async fn process_event_bytes(
                 for rel in &family.anomaly_relations {
                     let alert = Alert::new(
                         Severity::High,
+                        event.header.timestamp_ns,
                         format!("进程树异常: {}", rel.anomaly_type),
                         "process_tree_anomaly".to_string(),
                         ProcessInfo {
@@ -664,7 +699,8 @@ fn correlation_to_alert(ca: &CorrelationAlert) -> Alert {
         _ => Severity::Low,
     };
 
-    let mut alert = Alert::new(severity, ca.rule_name.clone(), ca.rule_name.clone(), proc);
+    let ts = ca.events.first().map(|e| e.header.timestamp_ns).unwrap_or(0);
+    let mut alert = Alert::new(severity, ts, ca.rule_name.clone(), ca.rule_name.clone(), proc);
     alert.description = ca.description.clone();
     alert.event_ids = ca.events.iter().map(|e| e.seq).collect();
     alert.mitre = ca.mitre.as_ref().map(|m| MitreInfo {
@@ -719,7 +755,7 @@ fn format_phase(phase: &ks_engine::chain::AttackPhase) -> &'static str {
 }
 
 fn write_status_file() {
-    let status_path = get_status_file_path();
+    let status_path = super::status_file_path();
     let pid = std::process::id();
     let start_time = chrono::Local::now().to_rfc3339();
 
@@ -734,21 +770,45 @@ fn write_status_file() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    if let Err(e) = std::fs::write(
-        status_path,
-        serde_json::to_string_pretty(&status).unwrap_or_default(),
-    ) {
-        log::warn!("状态文件写入失败: {} — {}", status_path, e);
+    let data = serde_json::to_string_pretty(&status).unwrap_or_default();
+    // 原子写：先写临时文件（0600）再 rename，避免读者看到半截 JSON，
+    // 也消除可预测文件名 + 非原子写的被篡改窗口
+    let tmp_path = status_path.with_extension(format!("json.tmp{}", pid));
+    let write_res = (|| -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            f.write_all(data.as_bytes())?;
+            f.sync_all()?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            f.write_all(data.as_bytes())?;
+        }
+        std::fs::rename(&tmp_path, &status_path)
+    })();
+    if let Err(e) = write_res {
+        log::warn!("状态文件写入失败: {} — {}", status_path.display(), e);
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }
 
 fn cleanup_status_file() {
-    let status_path = get_status_file_path();
+    let status_path = super::status_file_path();
     let _ = std::fs::remove_file(status_path);
-}
-
-fn get_status_file_path() -> &'static str {
-    STATUS_FILE
 }
 
 async fn load_rules(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str) -> Result<()> {
@@ -789,7 +849,11 @@ async fn load_rules(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str) -> 
     Ok(())
 }
 
-async fn rule_hot_loader(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str) {
+async fn rule_hot_loader(
+    detector: &Arc<Mutex<DetectionEngine>>,
+    rules_dir: &str,
+    reload_notify: Option<Arc<tokio::sync::Notify>>,
+) {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
@@ -797,7 +861,16 @@ async fn rule_hot_loader(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str
     let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
     loop {
-        scan_interval.tick().await;
+        // 5s 常规扫描；POST /api/v1/reload 时立即唤醒
+        tokio::select! {
+            _ = scan_interval.tick() => {}
+            _ = async {
+                match &reload_notify {
+                    Some(n) => n.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
 
         let rules_path = Path::new(rules_dir);
         if !rules_path.is_dir() {

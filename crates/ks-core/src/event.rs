@@ -138,6 +138,9 @@ pub fn min_event_size(event_type: u32) -> usize {
 }
 
 impl RawEvent {
+    /// # Safety
+    /// `data` 必须是 eBPF 事件原始字节（至少 EventHeader 大小，函数内部已做下界检查）；
+    /// 调用方需保证 data 来源为内核事件缓冲，且不与其他写者并发
     pub unsafe fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < core::mem::size_of::<EventHeader>() {
             return None;

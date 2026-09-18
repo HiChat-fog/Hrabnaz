@@ -44,7 +44,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   ebpf-compile:
-    name: eBPF compile (4 tiers)
+    name: eBPF compile (5 tiers)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -58,14 +58,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build ks-server (triggers ks-engine build.rs -> eBPF)
         run: cargo build -p ks-server --release
-      - name: Verify 4 eBPF .o files (modern/legacy/ancient/ancient_nobtf)
+      - name: Verify 5 eBPF .o files (modern/legacy/ancient/ancient_nobtf/legacy_nobtf)
         run: |
           set -e
           echo "=== Compiled eBPF objects ==="
           find target/release -name 'ks_main_*.o' -print
           count=$(find target/release -name 'ks_main_*.o' | wc -l)
-          echo "Found $count .o files (expected 4)"
-          test "$count" -eq 4
+          echo "Found $count .o files (expected 5)"
+          test "$count" -eq 5
 
   shellcheck:
     name: ShellCheck

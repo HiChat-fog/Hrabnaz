@@ -129,7 +129,11 @@ impl LinuxBpfMapReader {
     }
 
     fn read_entries(&self, map_name: &str) -> (usize, Vec<Value>) {
-        let bpf = self.bpf.lock().expect("Ebpf Mutex中毒");
+        // 锁中毒不 panic 整个进程：接管锁内容降级继续读
+        let bpf = self
+            .bpf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let map = match bpf.map(map_name) {
             Some(m) => m,
             None => return (0, Vec::new()),
@@ -238,7 +242,11 @@ impl LinuxBpfMapReader {
 
 impl BpfMapReader for LinuxBpfMapReader {
     fn read_map(&self, map_name: &str) -> anyhow::Result<MapSnapshot> {
-        let bpf = self.bpf.lock().expect("Ebpf Mutex中毒");
+        // 锁中毒不 panic 整个进程：接管锁内容降级继续读
+        let bpf = self
+            .bpf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let map_type_str = bpf
             .map(map_name)
             .map(Self::map_data_ref)

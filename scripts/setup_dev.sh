@@ -2,7 +2,7 @@
 # KernelSentinel 开发环境一键搭建脚本
 # 用法: chmod +x setup_dev.sh && ./setup_dev.sh
 
-set -e
+set -euo pipefail
 
 echo "========================================"
 echo " 内核哨兵 (KernelSentinel) 开发环境搭建"
@@ -19,9 +19,7 @@ sudo apt install -y \
     linux-headers-$(uname -r) \
     pkg-config \
     curl \
-    git \
-    nodejs \
-    npm
+    git
 
 # 2. Rust (如果没装)
 echo "[2/6] 检查 Rust 工具链..."
@@ -30,13 +28,12 @@ if ! command -v rustc &> /dev/null; then
     source "$HOME/.cargo/env"
 fi
 
-# 安装 bpf-linker (aya 需要的 eBPF 链接器)
-cargo install bpf-linker
+# 安装 bpf-linker (aya 需要的 eBPF 链接器)——可选步骤，失败不中断整个脚本
+cargo install bpf-linker || echo "  [warn] bpf-linker 安装失败（本项目用 clang 直接编译 eBPF，可不装）"
 
 # 3. Rust 目标平台
 echo "[3/6] 添加 Rust 交叉编译目标..."
-rustup target add wasm32-unknown-unknown  # 如需要 WASM
-# eBPF 目标: aya 用 bpf-linker 处理
+# eBPF 由 clang 直接编译（ks-engine/build.rs），无需额外 rust target
 
 # 4. bpf 工具链
 echo "[4/6] 安装 BPF 工具..."

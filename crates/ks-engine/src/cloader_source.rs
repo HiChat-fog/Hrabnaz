@@ -12,6 +12,13 @@ const STDERR_TAIL_BYTES: usize = 512;
 
 const STDERR_READ_CHUNK: usize = 256;
 
+/// 帧长上限：合法 payload 最大就是一个 RawEvent 的大小，给足余量到 64KB。
+/// 旧实现直接 vec![0u8; length]——帧流错位或被篡改时可一次分配近 4GiB 直接 OOM
+const MAX_FRAME_LEN: usize = 64 * 1024;
+
+/// 心跳超时：ks_loader 空闲时每 1s 发心跳帧；超过该时长无任何字节视为挂死
+const HEARTBEAT_TIMEOUT_SECS: u64 = 60;
+
 pub struct CLoaderSource {
     child: Mutex<Child>,
     stdout: Mutex<BufReader<ChildStdout>>,
@@ -27,6 +34,8 @@ impl CLoaderSource {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // 本体 drop（shutdown 路径）时 kill 子进程，防止 ks_loader 变孤儿继续跑探针
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow!("启动ks_loader失败: {} (path={})", e, loader_path))?;
 
@@ -88,6 +97,13 @@ where
         if length == 0 {
             continue;
         }
+        if length > MAX_FRAME_LEN {
+            return Err(anyhow!(
+                "ks_loader 帧长异常: {} 字节 (上限 {}) — 帧流错位或子进程异常",
+                length,
+                MAX_FRAME_LEN
+            ));
+        }
         let mut payload = vec![0u8; length];
         match r.read_exact(&mut payload).await {
             Ok(_) => {}
@@ -107,7 +123,20 @@ where
 impl EventSource for CLoaderSource {
     async fn next_bytes(&mut self) -> Result<Option<Vec<u8>>> {
         let mut stdout = self.stdout.lock().await;
-        match read_frame(&mut *stdout).await? {
+        // 心跳 watchdog：ks_loader 每 1s 心跳，超时说明子进程挂死，
+        // 旧实现无任何超时会静默停摆整条事件管线
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
+            read_frame(&mut *stdout),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "ks_loader {} 秒无任何帧输出（心跳超时），疑似挂死",
+                HEARTBEAT_TIMEOUT_SECS
+            )
+        })??;
+        match frame {
             Some(payload) => Ok(Some(payload)),
             None => {
                 drop(stdout);

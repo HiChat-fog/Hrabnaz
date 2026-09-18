@@ -33,6 +33,13 @@ impl DetectionEngine {
         let rules: Vec<DetectionRule> = serde_yaml::from_str(yaml_content)?;
         let count = rules.len();
         for rule in &rules {
+            // 重名规则会静默覆盖 rules_index（generate_alert 取错 MITRE 映射），显式 warn
+            if let Some(&old_idx) = self.rules_index.get(&rule.name) {
+                warn!(
+                    "规则名重复: '{}' (第 {} 条被第 {} 条覆盖索引) — 建议重命名",
+                    rule.name, old_idx, self.rules.len()
+                );
+            }
             let idx = self.rules.len();
             self.rules_index.insert(rule.name.clone(), idx);
         }
@@ -449,8 +456,15 @@ fn match_str(value: &str, op: &Operator, target: &str, cache: &HashMap<String, r
         | Operator::LessThan
         | Operator::GreaterThanOrEqual
         | Operator::LessThanOrEqual => {
-            let a: f64 = value.parse().unwrap_or(0.0);
-            let b: f64 = target.parse().unwrap_or(0.0);
+            // 非数字值不参与数值比较（恒 false）：旧实现 parse 失败静默当 0.0，
+            // 会把 "abc" < 10 判成 true 这类悄悄错误的规则语义
+            let (Ok(a), Ok(b)) = (value.parse::<f64>(), target.parse::<f64>()) else {
+                warn!(
+                    "数值比较遇到非数字值: '{}' vs '{}' — 条件按不匹配处理",
+                    value, target
+                );
+                return false;
+            };
             match op {
                 Operator::GreaterThan => a > b,
                 Operator::LessThan => a < b,

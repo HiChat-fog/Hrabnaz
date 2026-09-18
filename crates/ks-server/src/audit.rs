@@ -76,14 +76,15 @@ pub fn token_id(token: Option<&str>) -> String {
             let mut h = Sha256::new();
             h.update(t.as_bytes());
             let digest = h.finalize();
-            hex_short(&digest)
+            // 8 字节 (16 hex)：4 字节在多 token 环境下碰撞空间太小，审计归属不可靠
+            hex_short(&digest[..8])
         }
     }
 }
 
 fn hex_short(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(8);
-    for b in bytes.iter().take(4) {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         s.push_str(&format!("{:02x}", b));
     }
     s
@@ -97,10 +98,20 @@ fn extract_bearer(req: &Request) -> Option<String> {
 }
 
 fn extract_client_ip(req: &Request) -> String {
-    if let Some(xff) = req.headers().get("x-forwarded-for") {
-        if let Ok(s) = xff.to_str() {
-            if let Some(first) = s.split(',').next() {
-                return first.trim().to_string();
+    // 优先用连接层真实地址；XFF 仅在部署了可信反代（KS_TRUST_PROXY=1）时采信，
+    // 旧实现无条件信任 x-forwarded-for，任何客户端都能伪造审计 IP 污染溯源
+    if let Some(addr) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        return addr.0.ip().to_string();
+    }
+    if std::env::var("KS_TRUST_PROXY").as_deref() == Ok("1") {
+        if let Some(xff) = req.headers().get("x-forwarded-for") {
+            if let Ok(s) = xff.to_str() {
+                if let Some(first) = s.split(',').next() {
+                    return first.trim().to_string();
+                }
             }
         }
     }
@@ -179,7 +190,7 @@ mod tests {
         let id1 = token_id(Some("secret-token-abc"));
         let id2 = token_id(Some("secret-token-abc"));
         assert_eq!(id1, id2);
-        assert_eq!(id1.len(), 8);
+        assert_eq!(id1.len(), 16);
 
         let id3 = token_id(Some("different-token"));
         assert_ne!(id1, id3);

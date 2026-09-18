@@ -22,9 +22,12 @@ int BPF_KPROBE(kprobe_tcp_connect, struct sock *sk, struct sockaddr *uaddr, int 
     evt->saddr = BPF_CORE_READ(inet, inet_saddr);
     evt->sport = bpf_ntohs(BPF_CORE_READ(inet, inet_sport));
 
+    // uaddr 是用户态指针：5.5+ 内核区分 user/kernel 读取后，
+    // 旧实现 bpf_probe_read_kernel 在此恒 -EFAULT，connect 目标地址全丢。
+    // ancient/legacy_nobtf 由 common.h 宏回落 bpf_probe_read
     struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
-    bpf_probe_read_kernel(&evt->daddr, sizeof(evt->daddr), &addr->sin_addr.s_addr);
-    bpf_probe_read_kernel(&evt->dport, sizeof(evt->dport), &addr->sin_port);
+    bpf_probe_read_user(&evt->daddr, sizeof(evt->daddr), &addr->sin_addr.s_addr);
+    bpf_probe_read_user(&evt->dport, sizeof(evt->dport), &addr->sin_port);
     evt->dport = bpf_ntohs(evt->dport);
     evt->proto = 6;   evt->family = 2;
 
@@ -52,9 +55,14 @@ int BPF_KPROBE(kprobe_tcp_v6_connect, struct sock *sk, struct sockaddr *uaddr, i
     struct inet_sock *inet = (struct inet_sock *)sk;
     evt->sport = bpf_ntohs(BPF_CORE_READ(inet, inet_sport));
 
-    struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)uaddr;
-    evt->dport = bpf_ntohs(BPF_CORE_READ(addr6, sin6_port));
-    bpf_probe_read_kernel(evt->daddr6, sizeof(evt->daddr6), &addr6->sin6_addr);
+    // uaddr 是用户态指针：整块读入栈再取字段。
+    // 旧实现 BPF_CORE_READ/bpf_probe_read_kernel 直读用户地址，
+    // 5.5+ 内核上恒失败（v6 的 dport/daddr 一直是 0）
+    struct sockaddr_in6 sa6 = {};
+    if (bpf_probe_read_user(&sa6, sizeof(sa6), uaddr) < 0)
+        sa6.sin6_port = 0;
+    evt->dport = bpf_ntohs(sa6.sin6_port);
+    __builtin_memcpy(evt->daddr6, &sa6.sin6_addr, sizeof(evt->daddr6));
     evt->proto = 6;
 
     infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,

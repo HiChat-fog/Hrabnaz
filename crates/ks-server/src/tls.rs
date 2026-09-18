@@ -134,7 +134,8 @@ pub async fn serve_tls(
         socket_addr, mtls
     );
     axum_server::tls_rustls::bind_rustls(socket_addr, rustls_config)
-        .serve(app.into_make_service())
+        // 与明文路径一致：带 ConnectInfo，否则限流的 PeerIpKeyExtractor 取不到客户端 IP
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await
         .map_err(|e| anyhow!("TLS 服务器退出: {}", e))?;
     Ok(())

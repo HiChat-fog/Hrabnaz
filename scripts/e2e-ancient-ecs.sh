@@ -19,9 +19,10 @@
 set -euo pipefail
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
-readonly SSH_KEY="/home/hichat/下载/ubuntu.pem"
-readonly ECS_HOST="123.56.146.16"
-readonly ECS_USER="root"
+# 连接信息改由环境变量注入：旧实现把本机私钥绝对路径与服务器 IP 硬编码进仓库
+readonly SSH_KEY="${KS_E2E_SSH_KEY:?请设置 KS_E2E_SSH_KEY=/path/to/key}"
+readonly ECS_HOST="${KS_E2E_HOST:?请设置 KS_E2E_HOST=<服务器IP>}"
+readonly ECS_USER="${KS_E2E_USER:-root}"
 readonly REMOTE_DIR="/tmp/ks-e2e"
 readonly KS_LOADER_SRC_REL="crates/ks-ebpf/scripts/ks_loader.c"
 readonly OBJ_NAME="ks_main_ancient_nobtf.o"

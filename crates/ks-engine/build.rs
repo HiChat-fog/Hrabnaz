@@ -131,14 +131,26 @@ fn main() {
                 compiled.push(format!("ks_main_{}.o", suffix));
             }
             Ok(s) => {
-                println!("cargo:warning=eBPF ks_main_{}.o (tier={}) 编译失败(状态码 {:?}),跳过此tier",
-                         suffix, tier_flag, s.code());
+                // 编译失败不再静默跳过：交付的二进制可能缺 tier 而构建显示"成功"。
+                // modern 是申报书主路径(5.8+ BTF 内核)，缺了必须 fail loud
+                println!(
+                    "cargo:warning=eBPF ks_main_{}.o (tier={}) 编译失败(状态码 {:?})",
+                    suffix, tier_flag, s.code()
+                );
+                if *suffix == "modern" {
+                    panic!("modern tier eBPF 编译失败 — 主路径不可交付。如环境无 clang，请安装 llvm/clang 后重试");
+                }
+                println!("cargo:warning=跳过此tier (运行时该 tier 将不可用)");
             }
             Err(e) => {
                 println!(
-                    "cargo:warning=eBPF ks_main_{}.o (tier={}) 编译启动失败: {},跳过此tier",
+                    "cargo:warning=eBPF ks_main_{}.o (tier={}) 编译启动失败: {}",
                     suffix, tier_flag, e
                 );
+                if *suffix == "modern" {
+                    panic!("modern tier eBPF 无法启动编译: {} — 请检查 clang 环境", e);
+                }
+                println!("cargo:warning=跳过此tier (运行时该 tier 将不可用)");
             }
         }
     }

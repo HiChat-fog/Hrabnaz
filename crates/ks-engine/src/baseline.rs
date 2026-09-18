@@ -218,16 +218,21 @@ impl BaselineManager {
 
     fn evict_inactive_pids(&mut self) {
         let target = self.max_pids.saturating_sub(self.max_pids / 10);
-        while self.freq_history.len() > target {
-            let evict_pid = match self.freq_history.iter().min_by_key(|(_, snaps)| {
-                snaps.last().map(|s| s.timestamp_ns).unwrap_or(u64::MAX)
-            }) {
-                Some((p, _)) => *p,
-                None => break,
-            };
-            self.freq_history.remove(&evict_pid);
-            self.baselines.remove(&evict_pid);
-            self.established_pids.remove(&evict_pid);
+        if self.freq_history.len() <= target {
+            return;
+        }
+        // 单次收集+排序按最后活跃时间批量淘汰最旧一批，替代逐个 min_by_key 全表扫描
+        let mut by_activity: Vec<(u32, u64)> = self
+            .freq_history
+            .iter()
+            .map(|(p, snaps)| (*p, snaps.last().map(|s| s.timestamp_ns).unwrap_or(u64::MAX)))
+            .collect();
+        by_activity.sort_unstable_by_key(|(_, ts)| *ts);
+        let excess = self.freq_history.len() - target;
+        for (pid, _) in by_activity.into_iter().take(excess) {
+            self.freq_history.remove(&pid);
+            self.baselines.remove(&pid);
+            self.established_pids.remove(&pid);
         }
     }
 
