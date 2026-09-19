@@ -1,6 +1,7 @@
 pub mod aggregator;
 pub mod baseline;
 pub mod blocker;
+pub mod btf_source;
 pub mod chain;
 pub mod cloader_source;
 pub mod config;

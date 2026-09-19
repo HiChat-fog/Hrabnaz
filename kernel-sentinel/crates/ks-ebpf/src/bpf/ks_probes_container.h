@@ -75,8 +75,8 @@ int BPF_KPROBE(kprobe_commit_creds, struct cred *new) {
     {
         struct task_struct *tsk = (struct task_struct *)bpf_get_current_task();
         const struct cred *old = BPF_CORE_READ(tsk, cred);
-        evt->source_ns_inum = BPF_CORE_READ(old, user_ns->ns.inum);
-        evt->target_ns_inum = BPF_CORE_READ(new, user_ns->ns.inum);
+        evt->source_ns_inum = BPF_CORE_READ(old, user_ns, ns.inum);
+        evt->target_ns_inum = BPF_CORE_READ(new, user_ns, ns.inum);
         evt->cap_eff = (u32)BPF_CORE_READ(new, cap_effective.val);
     }
 #else

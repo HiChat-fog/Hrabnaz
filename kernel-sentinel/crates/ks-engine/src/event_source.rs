@@ -479,7 +479,7 @@ mod linux_impl {
                     Ok(_) => {
                         log::info!(
                             "[tier-detect] eBPF Modern tier加载成功,{}个程序已attach",
-                            loader.loaded_probes().len()
+                            loader.attached_probe_count()
                         );
                         let map_reader = loader.map_reader();
                         return (Box::new(EbpfModernSource::new(loader)), map_reader);
@@ -500,7 +500,7 @@ mod linux_impl {
                     Ok(_) => {
                         log::info!(
                             "[tier-detect] Legacy tier加载成功,{}个程序已attach",
-                            loader.loaded_probes().len()
+                            loader.attached_probe_count()
                         );
                         let map_reader = loader.map_reader();
                         return (
@@ -560,7 +560,7 @@ mod linux_impl {
                     Ok(_) => {
                         log::info!(
                             "[tier-detect] Ancient tier加载成功,{}个程序已attach",
-                            loader.loaded_probes().len()
+                            loader.attached_probe_count()
                         );
                         let map_reader = loader.map_reader();
                         return (

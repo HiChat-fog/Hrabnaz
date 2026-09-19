@@ -11,6 +11,32 @@
 #define __user
 #endif
 
+/* ancient 与 nobtf 变体用本地 tracepoint ctx 结构体：这些运行在 3.10/4.x 上，
+   (a) 老内核 BTF 没有 trace_event_raw_* 类型，用 vmlinux.h 的类型会让 aya 把重定位
+       静默毒化成 jmp 0xBAD2310，验证器拒绝整个程序；
+   (b) nobtf 对象本就剥离了 .BTF.ext，没有重定位，只能靠编译期偏移。
+   布局取自 3.10/4.x 的 tracefs format。modern/legacy 仍走 CO-RE：v6.15 起
+   sched_process_fork 的 comm 改成了 __string()，parent_pid 从 24 移到 12，
+   硬编码在这些内核上会读错字段，必须由重定位按目标内核布局改写。 */
+#if defined(KS_TIER_ANCIENT) || defined(KS_NOBTF)
+struct ks_tp_sys_enter { u16 type; u8 flags; u8 preempt_count; s32 pid; s64 id; u64 args[6]; };
+struct ks_tp_sys_exit  { u16 type; u8 flags; u8 preempt_count; s32 pid; s64 id; s64 ret; };
+struct ks_tp_sched_fork { u16 type; u8 flags; u8 preempt_count; s32 pid; char parent_comm[16]; s32 parent_pid; char child_comm[16]; s32 child_pid; };
+struct ks_tp_sched_exec { u16 type; u8 flags; u8 preempt_count; s32 pid; s32 __data_loc_filename; s32 new_pid; s32 old_pid; };
+struct ks_tp_sched_exit { u16 type; u8 flags; u8 preempt_count; s32 pid; char comm[16]; s32 exit_pid; s32 prio; };
+#define KS_TP_SYS_ENTER     struct ks_tp_sys_enter
+#define KS_TP_SYS_EXIT      struct ks_tp_sys_exit
+#define KS_TP_SCHED_FORK    struct ks_tp_sched_fork
+#define KS_TP_SCHED_EXEC    struct ks_tp_sched_exec
+#define KS_TP_SCHED_EXIT    struct ks_tp_sched_exit
+#else
+#define KS_TP_SYS_ENTER     struct trace_event_raw_sys_enter
+#define KS_TP_SYS_EXIT      struct trace_event_raw_sys_exit
+#define KS_TP_SCHED_FORK    struct trace_event_raw_sched_process_fork
+#define KS_TP_SCHED_EXEC    struct trace_event_raw_sched_process_exec
+#define KS_TP_SCHED_EXIT    struct trace_event_raw_sched_process_template
+#endif
+
 typedef __s32 i32;
 typedef __s64 i64;
 
@@ -84,16 +110,21 @@ typedef __s64 i64;
  * KS_D_APPEND_LEVEL：把一级目录名（24B 定长块，含 NUL+零填充）写到 dst[pos]，
  * 并用 '/' 覆盖其 NUL。定长块拷贝保证 __builtin_memcpy 尺寸是编译期常量
  * （BPF 不支持变长 memcpy）。空间不够时置 pos=-1，后续层级自动跳过
+ *
+ * 下标一律用无符号并显式钳制 nlen：nlen 是 bpf_probe_read_kernel_str 的返回值，
+ * 在验证器眼里是无界的，累加后做有符号转换会让 3.10/4.x 的老验证器推不出边界
+ * （"map_value pointer be out of bounds"），整个程序被拒。
  */
 #define KS_D_APPEND_LEVEL(dst, pos, nbuf, nlen, dst_len) do { \
     if ((pos) >= 0) { \
-        int _p = (pos); \
-        int _need = (int)sizeof(nbuf) + 24; \
-        if (_p + _need <= (int)(dst_len)) { \
+        u32 _p = (u32)(pos); \
+        u32 _n = (u32)(nlen); \
+        u32 _need = (u32)sizeof(nbuf) + 24; \
+        if (_n > (u32)sizeof(nbuf) - 1) _n = (u32)sizeof(nbuf) - 1; \
+        if (_p + _need <= (u32)(dst_len)) { \
             __builtin_memcpy((dst) + _p, (nbuf), sizeof(nbuf)); \
-            _p += (nlen); \
-            (dst)[_p] = '/'; \
-            (pos) = _p + 1; \
+            (dst)[_p + _n] = '/'; \
+            (pos) = (int)(_p + _n + 1); \
         } else { \
             (pos) = -1; \
         } \
@@ -140,16 +171,18 @@ typedef __s64 i64;
     if (_h2) KS_D_APPEND_LEVEL((dst), _pos, _n2, (int)(_l2 - 1), (dst_len)); \
     if (_h1) KS_D_APPEND_LEVEL((dst), _pos, _n1, (int)(_l1 - 1), (dst_len)); \
     ({ \
+        u32 _n0len = (u32)(_l0 - 1); \
         int _out = 0; \
         if (_l0 > 0) { \
+            if (_n0len > (u32)sizeof(_n0) - 1) _n0len = (u32)sizeof(_n0) - 1; \
             if (_pos >= 0 && _pos + (int)sizeof(_n0) <= (int)(dst_len)) { \
                 __builtin_memcpy((dst) + _pos, _n0, sizeof(_n0)); \
-                _out = _pos + (int)(_l0 - 1); \
+                _out = _pos + (int)_n0len; \
                 ((char *)(dst))[_out] = 0; \
             } else if (_pos < 0) { \
                 /* 全路径放不下：退化为纯文件名 */ \
                 __builtin_memcpy((dst), _n0, sizeof(_n0)); \
-                _out = (int)(_l0 - 1); \
+                _out = (int)_n0len; \
             } \
         } \
         _out; \

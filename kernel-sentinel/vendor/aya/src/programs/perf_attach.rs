@@ -123,9 +123,10 @@ fn perf_attach_either(
         }
     })?;
 
-    if let Some(event) = event.as_mut() {
-        event.disarm();
-    }
-
+    // vendor patch: 不再 disarm。上游在这里关掉 ProbeEvent 的 RAII 守卫，条目在
+    // PerfLink 存活期不会被误删，但 PerfLink 没有 Drop 实现，条目就再没人删——
+    // <4.17 的 debugfs 路径（3.10 等老内核）上每次启动都往 kprobe_events 留一批
+    // aya_<pid>_* 残留。保持守卫有效即可：PerfLink drop 时先关 perf 事件
+    // （perf_fd 字段声明在前）再删条目，顺序正确。
     Ok(PerfLinkInner::PerfLink(PerfLink { perf_fd, event }))
 }

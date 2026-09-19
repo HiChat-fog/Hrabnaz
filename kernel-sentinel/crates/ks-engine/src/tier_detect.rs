@@ -18,8 +18,14 @@ pub fn detect_ebpf_tier() -> Option<SourceKind> {
     Some(tier)
 }
 
+/// 是否有可用于 CO-RE 重定位的目标内核 BTF。
+///
+/// 判据是"`btf_source` 能解析出任意一份 BTF"——内核自带
+/// `/sys/kernel/btf/vmlinux`、`KS_BTF_PATH` 覆盖、或构建期内嵌表，任一成立即可。
+/// 旧实现只查 `/sys/kernel/btf/vmlinux` 是否存在，于是没有该文件的内核上会
+/// 静默丢掉 CO-RE 重定位（读错字段），而内嵌 BTF 正是为这类内核准备的。
 pub fn btf_available() -> bool {
-    std::path::Path::new("/sys/kernel/btf/vmlinux").exists()
+    crate::btf_source::target_btf_available()
 }
 
 const NOBTF_TARGET_RELEASE_PREFIX: &str = "3.10.0-1160";
@@ -58,7 +64,7 @@ pub fn legacy_nobtf_release_compatible() -> Result<(), String> {
     legacy_nobtf_release_compatible_for(&release)
 }
 
-fn read_kernel_release() -> Option<String> {
+pub(crate) fn read_kernel_release() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
         .map(|s| s.trim().to_string())

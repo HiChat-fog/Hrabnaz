@@ -50,7 +50,7 @@ static __always_inline struct pt_scratch *pt_scratch_get(void) {
 }
 
 SEC("tracepoint/sched/sched_process_fork")
-int trace_sched_fork(struct trace_event_raw_sched_process_fork *ctx) {
+int trace_sched_fork(KS_TP_SCHED_FORK *ctx) {
     u32 parent_pid = ctx->parent_pid;
     u32 child_pid  = ctx->child_pid;
     if (parent_pid == 0 || child_pid == 0) return 0;
@@ -121,7 +121,7 @@ int trace_sched_fork(struct trace_event_raw_sched_process_fork *ctx) {
 }
 
 SEC("tracepoint/sched/sched_process_exec")
-int trace_sched_exec_tree(struct trace_event_raw_sched_process_exec *ctx) {
+int trace_sched_exec_tree(KS_TP_SCHED_EXEC *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     if (pid == 0) return 0;
@@ -174,7 +174,7 @@ int trace_sched_exec_tree(struct trace_event_raw_sched_process_exec *ctx) {
 }
 
 SEC("tracepoint/sched/sched_process_exit")
-int trace_sched_exit_tree(struct trace_event_raw_sched_process_template *ctx) {
+int trace_sched_exit_tree(KS_TP_SCHED_EXIT *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     if (pid == 0) return 0;

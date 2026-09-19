@@ -178,6 +178,7 @@ pub struct EbpfLoader {
     #[cfg(target_os = "linux")]
     bpf: Option<Arc<Mutex<aya::Ebpf>>>,
     protected_pids: Vec<u32>,
+    attached_probes: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -339,6 +340,106 @@ fn set_infer_config(bpf: &mut aya::Ebpf, idx: u32, val: u32) {
 #[cfg(not(target_os = "linux"))]
 fn set_infer_config(_bpf: &mut (), _idx: u32, _val: u32) {}
 
+/// 内核符号是否存在。
+///
+/// kprobe 的目标函数在版本间会增删（3.10 没有 do_init_module，同名功能是 load_module），
+/// 而 attach 失败会沿着 `?` 一路冒泡、把整个 tier 拖进 mock 回退。逐探针检查可以让
+/// 缺失的符号只影响它自己。
+///
+/// kallsyms 读不到时返回 true：不做判断，交给 attach 自己报错，避免把"读不到"
+/// 误判成"符号不存在"而静默少挂探针。
+#[cfg(target_os = "linux")]
+fn symbol_exists(name: &str) -> bool {
+    static SYMBOLS: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    match SYMBOLS.get_or_init(|| {
+        let text = std::fs::read_to_string("/proc/kallsyms").ok()?;
+        Some(
+            text.lines()
+                .filter_map(|l| l.split_whitespace().nth(2).map(String::from))
+                .collect(),
+        )
+    }) {
+        None => true,
+        Some(syms) => syms.contains(name),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn symbol_exists(_name: &str) -> bool {
+    true
+}
+
+/// kprobe_events 路径（老内核的 debugfs 实现）。
+#[cfg(target_os = "linux")]
+const KPROBE_EVENTS: &str = "/sys/kernel/debug/tracing/kprobe_events";
+
+/// 从 kprobe_events 内容里挑出"所有者进程已不存在"的探针条目。
+///
+/// 两类条目都带 pid，pid 即创建它的进程：
+///   aya 侧 `aya_<pid>_<type>_<func>_<off>_<idx>`；ks_loader 侧 `ks<pid>_<func>`。
+/// 进程被 SIGKILL（崩溃，或父进程 kill_on_drop）时无人清理条目，反复重启会累积。
+/// 只清理 pid 已消失的条目，不碰仍在运行的实例的探针；旧格式 `ks_<func>` 没有
+/// pid 无法归属，不在此列（需人工确认后清理）。
+fn stale_probe_tags(kprobe_events: &str, pid_alive: impl Fn(u32) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in kprobe_events.lines() {
+        let Some(rest) = line.strip_prefix("p:kprobes/") else {
+            continue;
+        };
+        let Some(tag) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let pid = if let Some(mid) = tag.strip_prefix("aya_") {
+            mid.split('_').next().and_then(|p| p.parse::<u32>().ok())
+        } else if let Some(mid) = tag.strip_prefix("ks") {
+            mid.split('_').next().and_then(|p| p.parse::<u32>().ok())
+        } else {
+            None
+        };
+        if let Some(pid) = pid {
+            if !pid_alive(pid) {
+                out.push(tag.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 清理上一条命被强杀时残留的 aya kprobe 条目，返回清理条数。
+#[cfg(target_os = "linux")]
+fn sweep_stale_probes() -> usize {
+    let Ok(content) = std::fs::read_to_string(KPROBE_EVENTS) else {
+        return 0;
+    };
+    let stale = stale_probe_tags(&content, |pid| {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    });
+    if stale.is_empty() {
+        return 0;
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(KPROBE_EVENTS) else {
+        log::warn!(
+            "[loader] {} 不可写，{} 条残留探针未清理",
+            KPROBE_EVENTS,
+            stale.len()
+        );
+        return 0;
+    };
+    use std::io::Write as _;
+    let mut n = 0;
+    for tag in &stale {
+        // 必须一次 write 写完一整条命令：tracefs 按"每次 write 一条命令"处理，
+        // writeln! 会拆成多次 write("-:kprobes/", tag, "\n")，内核按半条命令解析
+        // 会返回错误（条目虽可能被缓冲后生效，但返回值不可信）
+        let cmd = format!("-:kprobes/{tag}\n");
+        if f.write_all(cmd.as_bytes()).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 impl EbpfLoader {
     pub fn new() -> Self {
         let probes: Vec<String> = vec![
@@ -370,6 +471,7 @@ impl EbpfLoader {
             #[cfg(target_os = "linux")]
             bpf: None,
             protected_pids: Vec::new(),
+            attached_probes: 0,
         }
     }
 
@@ -422,21 +524,39 @@ impl EbpfLoader {
                 tier,
                 obj.len()
             );
-            let bpf_load_result = aya::Ebpf::load(&obj);
-            let mut bpf = match bpf_load_result {
-                Ok(b) => b,
-                Err(e) => {
-                    if matches!(tier, SourceKind::EbpfAncient)
-                        && !crate::tier_detect::btf_available()
-                    {
-                        return Err(anyhow::anyhow!(
-                            "aya加载{}失败: {} - 建议用CLoaderSource(ks_loader --stream)替代aya加载",
-                            obj_name, e,
-                        ));
-                    }
-                    return Err(anyhow::anyhow!("aya加载{}失败: {}", obj_name, e));
-                }
+
+            // NOBTF 对象在构建期已剥离 .BTF.ext，CO-RE 重定位对它本就是 no-op：
+            // 它依赖 common.h 里针对 3.10.0-1160 实测的硬编码偏移，所以这里必须补
+            // release 守卫——旧实现会把它加载到任意 3.10 内核上，偏移不匹配时探针
+            // 照常 attach、读的却是错误字段。
+            // 其余 tier 必须拿到目标内核 BTF：aya 在没有 BTF 时会静默跳过重定位，
+            // 带着编译期（vmlinux.h 来源内核的）偏移继续加载，同样是静默错数据，
+            // 因此这里直接失败而不是降级。
+            let btf = if tier_suffix.ends_with("_nobtf") {
+                crate::tier_detect::nobtf_release_compatible().map_err(|reason| {
+                    anyhow::anyhow!("{} 依赖硬编码偏移，拒绝加载: {}", obj_name, reason)
+                })?;
+                log::warn!(
+                    "[loader] {} 走 NOBTF 硬编码偏移路径（无 CO-RE 重定位）",
+                    obj_name
+                );
+                None
+            } else {
+                let (btf, origin) = crate::btf_source::load_target_btf()
+                    .map_err(|e| anyhow::anyhow!("aya加载{}失败: {}", obj_name, e))?;
+                log::info!("[loader] CO-RE 重定位 BTF 来源: {}", origin);
+                Some(btf)
             };
+
+            // 注: EbpfLoader::new() 内部会先按 /sys/kernel/btf/vmlinux 解析一次，
+            // 随即被 btf() 覆盖；多出的这一次解析只在启动期发生，可接受。
+            let mut bpf = aya::EbpfLoader::new()
+                .btf(btf.as_ref())
+                .load(&obj)
+                .map_err(|e| anyhow::anyhow!("aya加载{}失败: {}", obj_name, e))?;
+
+            let mut n_attached = 0usize;
+            let mut n_skipped = 0usize;
 
             macro_rules! attach_tp {
                 ($name:expr, $cat:expr, $evt:expr) => {
@@ -446,6 +566,7 @@ impl EbpfLoader {
                         .try_into()?;
                     prog.load()?;
                     prog.attach($cat, $evt)?;
+                    n_attached += 1;
                 };
             }
             attach_tp!("trace_sys_enter", "raw_syscalls", "sys_enter");
@@ -454,14 +575,31 @@ impl EbpfLoader {
             attach_tp!("trace_sched_exec_tree", "sched", "sched_process_exec");
             attach_tp!("trace_sched_exit_tree", "sched", "sched_process_exit");
 
+            // 清掉上次被强杀时残留的 aya kprobe 条目（entry 生命周期随 PerfLink，
+            // 但 SIGKILL 下没人 drop）
+            match sweep_stale_probes() {
+                0 => {}
+                n => log::warn!("[loader] 清理了 {} 条上次残留的 kprobe 条目", n),
+            }
+
             macro_rules! attach_kp {
                 ($name:expr, $func:expr) => {
-                    let prog: &mut aya::programs::KProbe = bpf
-                        .program_mut($name)
-                        .ok_or_else(|| anyhow::anyhow!("kprobe程序'{}'未找到", $name))?
-                        .try_into()?;
-                    prog.load()?;
-                    prog.attach($func, 0)?;
+                    if !symbol_exists($func) {
+                        log::warn!(
+                            "[loader] 内核无符号 {}，跳过探针 {}（不影响其它探针）",
+                            $func,
+                            $name
+                        );
+                        n_skipped += 1;
+                    } else {
+                        let prog: &mut aya::programs::KProbe = bpf
+                            .program_mut($name)
+                            .ok_or_else(|| anyhow::anyhow!("kprobe程序'{}'未找到", $name))?
+                            .try_into()?;
+                        prog.load()?;
+                        prog.attach($func, 0)?;
+                        n_attached += 1;
+                    }
                 };
             }
             attach_kp!("kprobe_vfs_open", "vfs_open");
@@ -560,12 +698,23 @@ impl EbpfLoader {
                 log::info!("阻断模式: monitor(默认,KS_ENFORCE=1切换为enforce)");
             }
 
+            self.attached_probes = n_attached;
             self.bpf = Some(Arc::new(Mutex::new(bpf)));
-            log::info!(
-                "eBPF {} 加载完成：{} 个程序已 attach",
-                obj_name,
-                self.probes.len()
-            );
+            if n_skipped > 0 {
+                log::warn!(
+                    "eBPF {} 加载完成：{} 个程序已 attach，{} 个因内核缺符号跳过（配置共 {} 个）",
+                    obj_name,
+                    n_attached,
+                    n_skipped,
+                    self.probes.len()
+                );
+            } else {
+                log::info!(
+                    "eBPF {} 加载完成：{} 个程序已 attach",
+                    obj_name,
+                    n_attached
+                );
+            }
         }
 
         Ok(())
@@ -573,6 +722,11 @@ impl EbpfLoader {
 
     pub fn loaded_probes(&self) -> &[String] {
         &self.probes
+    }
+
+    /// 实际 attach 成功的探针数（`loaded_probes` 是配置清单，含因内核缺符号被跳过的）
+    pub fn attached_probe_count(&self) -> usize {
+        self.attached_probes
     }
 
     pub fn protected_pids(&self) -> &[u32] {
@@ -703,6 +857,35 @@ impl EbpfLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_stale_probe_tags_only_dead_pids() {
+        let content = "\
+p:kprobes/aya_100_p_vfs_open_0x0_0 vfs_open
+p:kprobes/aya_200_p_vfs_write_0x0_1 vfs_write
+p:kprobes/ks300_vfs_unlink vfs_unlink
+p:kprobes/ks100_commit_creds commit_creds
+p:kprobes/ks_vfs_open vfs_open
+r:kprobes/aya_100_r_tcp_sendmsg_0x0_2 tcp_sendmsg
+p:kprobes/aya_notapid_p_vfs_open_0x0_0 vfs_open
+garbage line
+";
+        let alive = |pid: u32| pid == 100;
+        let stale = stale_probe_tags(content, alive);
+        assert_eq!(
+            stale,
+            vec![
+                "aya_200_p_vfs_write_0x0_1".to_string(),
+                "ks300_vfs_unlink".to_string(),
+            ],
+            "只清 pid 已消失的；旧格式 ks_<func> 与存活 pid 都要保留"
+        );
+    }
+
+    #[test]
+    fn test_stale_probe_tags_empty_input() {
+        assert!(stale_probe_tags("", |_| false).is_empty());
+    }
 
     #[test]
     fn test_probe_list_contains_all_16_programs() {

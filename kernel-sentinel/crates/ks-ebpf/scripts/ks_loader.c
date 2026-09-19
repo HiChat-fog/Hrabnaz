@@ -667,7 +667,8 @@ static int attach_program(int prog_fd, const char *sec_name) {
     } else if (strncmp(sec_name, "kprobe/", 7) == 0) {
         const char *func = sec_name + 7;
         char tag[80];
-        snprintf(tag, sizeof(tag), "ks_%s", func);
+        /* 标签带 pid：便于 Rust 侧清扫被强杀时残留的条目（旧格式 ks_<func> 无法归属进程） */
+        snprintf(tag, sizeof(tag), "ks%d_%s", (int)getpid(), func);
         int kf = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY);
         if (kf < 0) {
             fprintf(stderr, "  [!] attach %s: open kprobe_events: %s\n", sec_name, strerror(errno));

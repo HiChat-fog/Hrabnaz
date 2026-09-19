@@ -32,7 +32,7 @@ static __always_inline void ks_count_drop(void) {
 }
 
 SEC("tracepoint/raw_syscalls/sys_enter")
-int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
+int trace_sys_enter(KS_TP_SYS_ENTER *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 syscall_nr = ctx->id;
 
@@ -84,7 +84,7 @@ int trace_sys_enter(struct trace_event_raw_sys_enter *ctx) {
 }
 
 SEC("tracepoint/raw_syscalls/sys_exit")
-int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
+int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
 
     {
