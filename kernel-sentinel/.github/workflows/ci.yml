@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + libelf-dev (eBPF build.rs needs clang)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+  lint:
+    name: Lint (clippy + fmt)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + libelf-dev (eBPF build.rs needs clang)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: rustfmt check
+        run: cargo fmt --all -- --check
+
+  ebpf-compile:
+    name: eBPF compile (5 tiers)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install llvm-18 / clang-18 / libelf-dev
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y libelf-dev libbpf-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ks-server (triggers ks-engine build.rs -> eBPF)
+        run: cargo build -p ks-server --release
+      - name: Verify 5 eBPF .o files (modern/legacy/ancient/ancient_nobtf/legacy_nobtf)
+        run: |
+          set -e
+          echo "=== Compiled eBPF objects ==="
+          find target/release -name 'ks_main_*.o' -print
+          count=$(find target/release -name 'ks_main_*.o' | wc -l)
+          echo "Found $count .o files (expected 5)"
+          test "$count" -eq 5
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck on scripts/*.sh
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: scripts
+
+  bench:
+    name: Benchmark (criterion)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + libelf-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run criterion benchmarks (compile check, no stats)
+        run: cargo bench -p ks-engine --no-run
+
+  security-audit:
+    name: Security Audit (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

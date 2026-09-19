@@ -1,0 +1,62 @@
+# 持久化检测 — 依赖的传感器面：
+#   exec args (event_type=1, 全量放行) / 文件写删 (12/13, kprobe 路径全量放行)
+#   文件打开 (10) 仅 /etc/shadow、/etc/gshadow、/etc/sudoers、/root/.ssh 前缀放行（内核 infer_sensitive_file）
+# 注意：vfs_write 只上报 >=1024 字节的写入，小文件编辑走 exec args 检测
+
+- name: "SSH后门公钥注入"
+  description: "对 authorized_keys 的写入/删除/打开（root 的 open 事件经 /root/.ssh 风险加成放行）"
+  severity: critical
+  conditions:
+    - field: filename
+      operator: contains
+      value: "authorized_keys"
+  alert_message: "检测到 authorized_keys 文件操作，疑似 SSH 后门公钥注入持久化"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1098.004"
+
+- name: "systemd服务持久化写入"
+  description: "通过 bash -c/tee/cp 等方式向 systemd 服务目录写入 unit 文件（argv 中出现目标路径）"
+  severity: high
+  conditions:
+    - field: args
+      operator: regex
+      value: "/(etc|usr/lib|usr/local/lib)/systemd/system/[A-Za-z0-9_.-]+\\.service"
+  alert_message: "检测到向 systemd 服务目录写入 unit 文件的命令，疑似服务持久化"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1543.002"
+
+- name: "crontab命令持久化"
+  description: "crontab 命令编辑定时任务（echo x | crontab - / crontab -e），小文件编辑写事件不可见，依赖 exec 事件"
+  severity: high
+  conditions:
+    - field: comm
+      operator: equals
+      value: "crontab"
+  alert_message: "检测到 crontab 定时任务编辑操作，疑似持久化"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1053.003"
+
+- name: "uid0后门用户创建"
+  description: "useradd -o -u 0 类 uid 克隆，创建与 root 同 ID 的后门账户"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: regex
+      value: "^(useradd|adduser|usermod)$"
+    - field: args
+      operator: regex
+      value: "(\\-u[ =]?0|\\-o[ ])"
+  alert_message: "检测到 uid=0 克隆用户创建，疑似后门账户"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1136"
+
+- name: "新增系统用户"
+  description: "useradd/adduser 账户创建操作（低危基线，配合 uid0 规则细分）"
+  severity: medium
+  conditions:
+    - field: comm
+      operator: regex
+      value: "^(useradd|adduser)$"
+  alert_message: "检测到新用户创建操作"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1136"

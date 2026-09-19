@@ -1,0 +1,29 @@
+# 影响与破坏检测 — 删除事件 (event_type=13, kprobe/vfs_unlink) 全量放行、多级路径已拼接
+
+- name: "磁盘擦除"
+  description: "dd 直接写入块设备 (of=/dev/sd* 等)，磁盘擦除/覆盖前兆"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: equals
+      value: "dd"
+    - field: args
+      operator: regex
+      value: "of=/dev/(sd|vd|nvme|hd|xvd|mmcblk)"
+  alert_message: "检测到 dd 直写块设备，疑似磁盘擦除/破坏"
+  mitre_tactic: "TA0040"
+  mitre_technique: "T1561"
+
+- name: "启动文件删除"
+  description: "删除 /boot 下的内核/引导文件（卸载事件带完整路径）"
+  severity: high
+  conditions:
+    - field: event_type
+      operator: equals
+      value: "13"
+    - field: filename
+      operator: starts_with
+      value: "/boot"
+  alert_message: "检测到 /boot 启动文件删除，疑似破坏系统或清理 Rootkit 痕迹"
+  mitre_tactic: "TA0040"
+  mitre_technique: "T1485"

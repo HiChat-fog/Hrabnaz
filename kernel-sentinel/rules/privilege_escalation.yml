@@ -1,0 +1,68 @@
+- name: "SUID 提权检测"
+  description: "检测通过 chmod 设置 SUID 位进行提权的行为"
+  severity: critical
+  conditions:
+    - field: comm
+      operator: equals
+      value: "chmod"
+    - field: args
+      operator: regex
+      value: "(\\+s|u\\+s|4755|4[0-9]{3})"
+  alert_message: "检测到 chmod 设置 SUID 位操作，疑似提权行为"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1548.001"
+
+- name: "ptrace 进程注入检测"
+  description: "检测通过 ptrace 系统调用注入其他进程的行为"
+  severity: critical
+  conditions:
+    - field: syscall_nr
+      operator: equals
+      value: "101"
+  alert_message: "检测到 ptrace 系统调用，疑似进程注入"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1055.009"
+
+- name: "sudo 配置篡改检测"
+  description: "检测对 /etc/sudoers 文件的写入操作"
+  severity: critical
+  conditions:
+    - field: filename
+      operator: contains
+      value: "/etc/sudoers"
+  alert_message: "检测到 /etc/sudoers 文件被修改"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1548.003"
+
+- name: "LD_PRELOAD 劫持检测"
+  description: "检测通过 LD_PRELOAD 环境变量进行动态链接库劫持(指向实际库路径,空值除外)"
+  severity: high
+  conditions:
+    - field: args
+      operator: regex
+      value: "LD_PRELOAD=[^ ]+\\.(so|so\\.[0-9])"
+  alert_message: "检测到进程设置 LD_PRELOAD 指向动态库，疑似 DLL 劫持"
+  mitre_tactic: "TA0004"
+  mitre_technique: "T1574.006"
+
+- name: "内核模块加载检测"
+  description: "检测通过 insmod/modprobe 加载内核模块"
+  severity: high
+  conditions:
+    - field: comm
+      operator: regex
+      value: "(insmod|modprobe)"
+  alert_message: "检测到内核模块加载操作，可能是 Rootkit 安装"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1547.006"
+
+- name: "Cron 定时任务持久化"
+  description: "检测向 /etc/crontab 或 cron.d 目录写入定时任务"
+  severity: high
+  conditions:
+    - field: filename
+      operator: regex
+      value: "^/etc/cron(tab|\\.d/)"
+  alert_message: "检测到修改系统定时任务配置，可能是持久化或提权组合攻击"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1053.003"
