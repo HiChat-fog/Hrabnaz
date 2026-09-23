@@ -9,11 +9,14 @@
 > at hann aptr ne komi,
 >
 > þó sjámk meirr um Munin.
-
+> 
+> — Grímnismál, Poetic Edda
 
 *奥丁双肩上栖息着的两只渡鸦，其名Huginn（福金）& Muninn（雾尼）*
 
 **Hrafn**    ~~KernelSentinel · 内核哨兵~~
+
+*Huginn thinks. Muninn remembers. Hrafn judges.*
 
 基于 eBPF 的内核态终端威胁检测系统。探针挂在系统调用、VFS、网络栈和进程调度路径上，内核里维护进程树拓扑、TCP 流状态机和六维频率基线，命中后写 SHA-256 哈希链取证日志；用户态引擎用 Rust 做规则匹配、跨事件关联、z-score基线偏离和攻击链还原。
 
