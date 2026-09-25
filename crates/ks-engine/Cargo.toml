@@ -26,6 +26,8 @@ aya-log = "0.2"
 async-trait = "0.1"
 # Phase E2.3: 运行时查找 ks_loader 二进制（PATH 查找），与 build.rs 共用同一版本
 which = "7"
+# blocker: block_decisions 下发的 expire 需与内核 bpf_ktime_get_ns 同源（CLOCK_MONOTONIC）
+libc = "0.2"
 
 [build-dependencies]
 which = "7"

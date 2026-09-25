@@ -173,6 +173,15 @@ impl MockEventSource {
                 flags: 0,
             }));
         }
+        // 8-31 探针补发射后真机可见的事件类型：批量 rename（新路径语义）也纳入回放，
+        // 与 sys_exit rename 分支的 file_event 布局一致
+        events.push(encode_struct(&FileEvent {
+            header: make_header(14, pid, base_ns + 455_000_000, b"encryptor", 82),
+            filename: make_cstr_256("archive.zip.encrypted"),
+            bytes: 0,
+            fd: -1,
+            flags: 0,
+        }));
         events.push(encode_struct(&FileEvent {
             header: make_header(12, pid, base_ns + 500_000_000, b"encryptor", 1),
             filename: make_cstr_256("README_FOR_DECRYPT.txt"),

@@ -145,9 +145,9 @@ pub async fn run(
     };
     let serve_state: Option<std::sync::Arc<ks_server::ServerState>> = match serve_port {
         Some(port) => {
-            let state = match map_reader {
+            let state = match map_reader.as_ref() {
                 Some(mr) => {
-                    std::sync::Arc::new(ks_server::ServerState::with_map_reader(tier_label, mr))
+                    std::sync::Arc::new(ks_server::ServerState::with_map_reader(tier_label, mr.clone()))
                 }
                 None => std::sync::Arc::new(ks_server::ServerState::with_tier(tier_label)),
             };
@@ -214,6 +214,21 @@ pub async fn run(
     {
         let mut bm = block_mgr.lock().await;
         bm.set_enabled(config.detection.block_enabled);
+        // ADR-011 闭环：block/unblock 同步下发内核 block_decisions map。
+        // serve_state 与本进程共享同一 BlockManager 实例，REST 阻断同样走此通道。
+        // C loader（NOBTF）与 mock 路径没有用户态 map 句柄（map_reader 为 None 或
+        // Mock 写入报错），阻断自动降级为仅记录用户态表——与 8-31 前行为一致。
+        match &map_reader {
+            Some(mr) => {
+                bm.set_kernel_sink(std::sync::Arc::new(
+                    ks_engine::blocker::MapWriterSink(mr.clone()),
+                ));
+                log::info!("block_decisions 内核下发通道已接通（阻断决策将写入内核 map，Modern tier 查表实杀）");
+            }
+            None => {
+                log::info!("当前事件源无 BPF map reader（C loader/mock），阻断仅记录用户态表，内核不会查表实杀");
+            }
+        }
     }
     let block_ttl = config.detection.block_ttl_secs;
     let block_severity_threshold = config.detection.block_severity_threshold.clone();
@@ -440,6 +455,7 @@ async fn process_event_bytes(
             println!("    MITRE: {} / {}", mitre.tactic, mitre.technique);
         }
         if severity_meets_threshold(&alert.severity, block_severity_threshold)
+            && !protected_pids.contains(&event.header.pid)
             && block_mgr.lock().await.block_pid(
                 event.header.pid,
                 block_ttl,
@@ -474,6 +490,7 @@ async fn process_event_bytes(
             println!("    MITRE: {} / {}", mitre.tactic, mitre.technique);
         }
         if severity_meets_threshold(&alert.severity, block_severity_threshold)
+            && !protected_pids.contains(&alert.process.pid)
             && block_mgr.lock().await.block_pid(
                 alert.process.pid,
                 block_ttl,

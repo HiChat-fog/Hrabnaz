@@ -1,6 +1,56 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::loader::BpfMapReader;
+
+/// 阻断决策的内核下发通道（ADR-011"用户态写 block_decisions → 内核查表实杀"闭环）。
+///
+/// 语义对齐内核侧 `ks_check_block()`：
+/// - `expire_monotonic_ns` 必须与 `bpf_ktime_get_ns()` 同源（CLOCK_MONOTONIC），
+///   `0` = 永久阻断（内核 `expire_ns==0` 即视为永久）；
+/// - `reason` 编码与 `BlockReason` 1..5 对齐；
+/// - 实杀只发生在 Modern tier（5.8+ 有 `bpf_send_signal`），Legacy/Ancient 仅查表标记；
+///   内核侧自动豁免 protected_pids，无需下发方重复判断。
+pub trait KernelBlockWriter: Send + Sync {
+    fn apply_block(&self, pid: u32, expire_monotonic_ns: u64, reason: u8) -> anyhow::Result<()>;
+    fn remove_block(&self, pid: u32) -> anyhow::Result<()>;
+}
+
+/// 经 `BpfMapReader`（aya 加载路径的 LinuxBpfMapReader）下发到内核 map 的适配器。
+/// C loader（NOBTF）与 mock 路径没有用户态 map 句柄，走 trait 默认实现并报错。
+pub struct MapWriterSink(pub Arc<dyn BpfMapReader>);
+
+impl KernelBlockWriter for MapWriterSink {
+    fn apply_block(&self, pid: u32, expire_monotonic_ns: u64, reason: u8) -> anyhow::Result<()> {
+        self.0.write_block_decision(pid, expire_monotonic_ns, reason)
+    }
+    fn remove_block(&self, pid: u32) -> anyhow::Result<()> {
+        self.0.remove_block_decision(pid)
+    }
+}
+
+/// 与 `bpf_ktime_get_ns()` 同源的 CLOCK_MONOTONIC 纳秒。
+/// /proc/uptime 是 boottime 口径（含 suspend），会话挂起后 TTL 会变长，故用 clock_gettime。
+#[cfg(target_os = "linux")]
+fn monotonic_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // clock_gettime 对合法 clockid 不返回错误
+    let ok = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0;
+    if !ok {
+        return 0;
+    }
+    (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
+}
+
+#[cfg(not(target_os = "linux"))]
+fn monotonic_now_ns() -> u64 {
+    0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockReason {
@@ -49,6 +99,8 @@ pub struct BlockManager {
     blocked: HashMap<u32, BlockedPid>,
     enabled: bool,
     default_ttl: u64,
+    // Some = block/unblock 同步下发内核 block_decisions map（aya 路径）
+    kernel: Option<Arc<dyn KernelBlockWriter>>,
 }
 
 impl Default for BlockManager {
@@ -63,6 +115,7 @@ impl BlockManager {
             blocked: HashMap::new(),
             enabled: false,
             default_ttl: 300,
+            kernel: None,
         }
     }
 
@@ -71,7 +124,14 @@ impl BlockManager {
             blocked: HashMap::new(),
             enabled,
             default_ttl,
+            kernel: None,
         }
+    }
+
+    /// 接通内核下发通道。只在 aya 加载路径调用（start.rs 侧按 map_reader 是否存在决定）。
+    /// 未接通时 block/unblock 仅记录用户态表——与 8-31 之前的行为一致。
+    pub fn set_kernel_sink(&mut self, sink: Arc<dyn KernelBlockWriter>) {
+        self.kernel = Some(sink);
     }
 
     pub fn block_pid(
@@ -108,11 +168,37 @@ impl BlockManager {
                 trigger: trigger.to_string(),
             },
         );
+
+        // 同步下发内核：同一 PID 的下一次 syscall 会在探针的 ks_check_block 查表中命中。
+        // 下发失败只降级为"仅用户态记录"，不推翻本次阻断决策本身
+        if let Some(k) = &self.kernel {
+            let expire_mono = if ttl == u64::MAX {
+                0
+            } else {
+                monotonic_now_ns().saturating_add(ttl.saturating_mul(1_000_000_000))
+            };
+            if let Err(e) = k.apply_block(pid, expire_mono, reason as u8) {
+                log::warn!(
+                    "block_decisions 内核下发失败(pid={}, reason={}): {} — 仅记录用户态表，内核不会查表实杀",
+                    pid,
+                    reason,
+                    e
+                );
+            }
+        }
         true
     }
 
     pub fn unblock_pid(&mut self, pid: u32) -> bool {
-        self.blocked.remove(&pid).is_some()
+        let removed = self.blocked.remove(&pid).is_some();
+        if removed {
+            if let Some(k) = &self.kernel {
+                if let Err(e) = k.remove_block(pid) {
+                    log::warn!("block_decisions 内核删除失败(pid={}): {} — TTL 到期后内核侧自动失效", pid, e);
+                }
+            }
+        }
+        removed
     }
 
     pub fn is_blocked(&mut self, pid: u32) -> bool {
@@ -260,5 +346,136 @@ mod tests {
         let list = mgr.list_blocked();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].reason, BlockReason::MlAnomaly);
+    }
+}
+
+/// 内核下发通道的记录桩：核对 block/unblock 触发的 apply/remove 参数
+#[cfg(test)]
+struct RecordingSink {
+    calls: std::sync::Mutex<Vec<(u32, u64, u8)>>,
+    removed: std::sync::Mutex<Vec<u32>>,
+    fail: bool,
+}
+
+#[cfg(test)]
+impl RecordingSink {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            removed: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl KernelBlockWriter for RecordingSink {
+    fn apply_block(&self, pid: u32, expire_monotonic_ns: u64, reason: u8) -> anyhow::Result<()> {
+        if self.fail {
+            anyhow::bail!("注入的内核写入失败");
+        }
+        self.calls
+            .lock()
+            .unwrap()
+            .push((pid, expire_monotonic_ns, reason));
+        Ok(())
+    }
+    fn remove_block(&self, pid: u32) -> anyhow::Result<()> {
+        if self.fail {
+            anyhow::bail!("注入的内核写入失败");
+        }
+        self.removed.lock().unwrap().push(pid);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod kernel_sync_tests {
+    use super::*;
+
+    #[test]
+    fn test_kernel_sink_called_on_block() {
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = BlockManager::with_config(true, 300);
+        mgr.set_kernel_sink(sink.clone());
+
+        assert!(mgr.block_pid(1234, 60, BlockReason::RuleMatch, "t"));
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (pid, expire, reason) = calls[0];
+        assert_eq!(pid, 1234);
+        assert_eq!(reason, BlockReason::RuleMatch as u8);
+        // TTL=60s：expire 应是未来的单调时钟值（且与 UNIX 时钟无关）
+        assert!(expire > monotonic_now_ns(), "expire 应在当前单调时刻之后");
+        assert!(expire <= monotonic_now_ns() + 61_000_000_000);
+    }
+
+    #[test]
+    fn test_kernel_sink_permanent_block_uses_zero_expire() {
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = BlockManager::with_config(true, 300);
+        mgr.set_kernel_sink(sink.clone());
+
+        assert!(mgr.block_pid(1234, u64::MAX, BlockReason::Manual, "t"));
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, 0, "永久阻断应写 expire_ns=0（内核语义：0=永久）");
+    }
+
+    #[test]
+    fn test_kernel_sink_not_called_when_disabled_or_unblock_only() {
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = BlockManager::with_config(false, 300);
+        mgr.set_kernel_sink(sink.clone());
+
+        assert!(!mgr.block_pid(1234, 60, BlockReason::Manual, "t"));
+        assert!(sink.calls.lock().unwrap().is_empty(), "阻断未启用时不应下发内核");
+        assert!(!mgr.unblock_pid(1234));
+        assert!(sink.removed.lock().unwrap().is_empty(), "未阻断的 unblock 不应下发内核");
+    }
+
+    #[test]
+    fn test_kernel_remove_on_unblock() {
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = BlockManager::with_config(true, 300);
+        mgr.set_kernel_sink(sink.clone());
+
+        mgr.block_pid(1234, 60, BlockReason::Manual, "t");
+        assert!(mgr.unblock_pid(1234));
+        assert_eq!(sink.removed.lock().unwrap().as_slice(), &[1234]);
+    }
+
+    #[test]
+    fn test_kernel_sink_error_still_records_table() {
+        let sink = Arc::new(RecordingSink {
+            calls: std::sync::Mutex::new(Vec::new()),
+            removed: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let mut mgr = BlockManager::with_config(true, 300);
+        mgr.set_kernel_sink(sink);
+
+        // 内核下发失败只降级：用户态表照常记录（决策不回滚），下次阻断重试
+        assert!(mgr.block_pid(1234, 60, BlockReason::Manual, "t"));
+        assert!(mgr.is_blocked(1234));
+    }
+
+    #[test]
+    fn test_monotonic_now_ns_positive_on_linux() {
+        // 与 bpf_ktime_get_ns 同源的时钟应给出正值（内核启动以来至少跑了些许时间）
+        assert!(monotonic_now_ns() > 0);
+    }
+
+    #[test]
+    fn test_ttl_zero_uses_default_for_kernel_expire() {
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = BlockManager::with_config(true, 300);
+        mgr.set_kernel_sink(sink.clone());
+
+        mgr.block_pid(1234, 0, BlockReason::Manual, "t");
+        let calls = sink.calls.lock().unwrap();
+        let (_, expire, _) = calls[0];
+        // ttl=0 → default_ttl=300s，内核 expire 应落在 ~300s 后而非 0（0 是永久语义，不能混用）
+        assert!(expire > monotonic_now_ns() + 299_000_000_000);
     }
 }

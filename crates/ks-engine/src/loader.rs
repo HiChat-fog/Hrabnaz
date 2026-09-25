@@ -67,6 +67,21 @@ pub trait BpfMapReader: Send + Sync {
     fn read_map_structured(&self, _map_name: &str) -> Vec<serde_json::Value> {
         Vec::new()
     }
+
+    /// 向内核 `block_decisions` map 写入一条阻断裁决（ADR-011 闭环的用户态写入点）。
+    ///
+    /// `expire_monotonic_ns` 与内核 `bpf_ktime_get_ns()` 同源（CLOCK_MONOTONIC），
+    /// `0` = 永久阻断；`reason` 编码 1..5 与 `BlockReason` 对齐。
+    /// 默认实现返回错误：mock / C loader（NOBTF）路径没有用户态 map 句柄，
+    /// 调用方（BlockManager）收到错误后降级为仅记录用户态表。
+    fn write_block_decision(&self, _pid: u32, _expire_monotonic_ns: u64, _reason: u8) -> anyhow::Result<()> {
+        anyhow::bail!("当前 map reader 不支持写 block_decisions（非 aya 加载路径或 mock）")
+    }
+
+    /// 解除内核侧阻断裁决（删除 block_decisions 条目）。默认实现同上。
+    fn remove_block_decision(&self, _pid: u32) -> anyhow::Result<()> {
+        anyhow::bail!("当前 map reader 不支持写 block_decisions（非 aya 加载路径或 mock）")
+    }
 }
 
 pub struct MockBpfMapReader;

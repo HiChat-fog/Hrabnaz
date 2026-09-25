@@ -152,6 +152,12 @@ static __always_inline void freq_handle_sys_exit(void *ctx, u32 syscall_nr) {
     case 42:           update_freq_counter_ex(ctx, pid, 20); break;
     case 101:          update_freq_counter_ex(ctx, pid, 30); break;
     case 62:           update_freq_counter_ex(ctx, pid, 31); break;
+    /* 8-31 白名单扩展后生效：批量 rename 是勒索软件的主签名，
+       此前 unlink(87) 虽在 switch 里但 sys_enter 白名单没有它，从未计入 */
+    case 82: case 264: case 316:
+                       update_freq_counter_ex(ctx, pid, 14); break;
+    case 90: case 91: case 268:
+                       update_freq_counter_ex(ctx, pid, 15); break;
     }
 }
 

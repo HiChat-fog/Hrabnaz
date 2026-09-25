@@ -53,6 +53,56 @@ impl LinuxBpfMapReader {
         Self { bpf }
     }
 
+    /// 打开内核 `block_decisions` map（阻断裁决下发通道）。
+    ///
+    /// key/value 用原始字节数组而非 repr(C) 结构体：布局必须逐字节对齐
+    /// common.h 的 `struct block_key {u32 pid; u32 _pad;}` /
+    /// `struct block_value {u64 expire_ns; u8 reason; u8 _pad[7];}`（native endian，同架构），
+    /// 字节数组写法让对齐契约在拷贝代码里可见，也免去补 Pod 派生。
+    fn open_block_map(
+        bpf: &mut aya::Ebpf,
+    ) -> anyhow::Result<aya::maps::HashMap<&mut aya::maps::MapData, [u8; 8], [u8; 16]>> {
+        let map = bpf
+            .map_mut("block_decisions")
+            .ok_or_else(|| anyhow::anyhow!("block_decisions map 不存在（该 tier 未加载或已被 take）"))?;
+        let hm = aya::maps::HashMap::<_, [u8; 8], [u8; 16]>::try_from(map)?;
+        Ok(hm)
+    }
+
+    pub fn write_block_decision(
+        &self,
+        pid: u32,
+        expire_monotonic_ns: u64,
+        reason: u8,
+    ) -> anyhow::Result<()> {
+        let mut bpf = self
+            .bpf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut hm = Self::open_block_map(&mut bpf)?;
+        let mut key = [0u8; 8];
+        key[..4].copy_from_slice(&pid.to_ne_bytes());
+        let mut value = [0u8; 16];
+        value[..8].copy_from_slice(&expire_monotonic_ns.to_ne_bytes());
+        value[8] = reason;
+        hm.insert(key, value, 0)
+            .map_err(|e| anyhow::anyhow!("写入 block_decisions[pid={}] 失败: {}", pid, e))?;
+        Ok(())
+    }
+
+    pub fn remove_block_decision(&self, pid: u32) -> anyhow::Result<()> {
+        let mut bpf = self
+            .bpf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut hm = Self::open_block_map(&mut bpf)?;
+        let mut key = [0u8; 8];
+        key[..4].copy_from_slice(&pid.to_ne_bytes());
+        hm.remove(&key)
+            .map_err(|e| anyhow::anyhow!("删除 block_decisions[pid={}] 失败: {}", pid, e))?;
+        Ok(())
+    }
+
     fn map_data_ref(map: &aya::maps::Map) -> &aya::maps::MapData {
         match map {
             aya::maps::Map::Array(md)
@@ -291,6 +341,19 @@ impl BpfMapReader for LinuxBpfMapReader {
                 }
             })
             .collect()
+    }
+
+    fn write_block_decision(
+        &self,
+        pid: u32,
+        expire_monotonic_ns: u64,
+        reason: u8,
+    ) -> anyhow::Result<()> {
+        LinuxBpfMapReader::write_block_decision(self, pid, expire_monotonic_ns, reason)
+    }
+
+    fn remove_block_decision(&self, pid: u32) -> anyhow::Result<()> {
+        LinuxBpfMapReader::remove_block_decision(self, pid)
     }
 }
 

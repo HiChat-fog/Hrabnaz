@@ -46,6 +46,11 @@ int trace_sys_enter(KS_TP_SYS_ENTER *ctx) {
     case 59:  case 2:   case 257:
     case 0:   case 1:   case 42:
     case 101: case 62:  case 313:
+    /* 8-31 补发射的事件源：rename(82/264/316)/chmod(90/268) 产出 FILE_RENAME/FILE_CHMOD
+       事件（勒索批量改名、持久化替换此前完全不可见）；unlink(87)/fchmod(91) 不产事件，
+       仅供 freq 计频（FILE_DELETE 事件由 vfs_unlink kprobe 发射，避免重复上报） */
+    case 82:  case 87:  case 90:  case 91:
+    case 264: case 268: case 316:
         break;
     default:
         return 0;
@@ -234,6 +239,61 @@ int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
         int verdict5 = infer_event(evt->header.pid, EVENT_PROC_SIGNAL, NULL, 0,0,0, evt->target_pid);
         KS_MAYBE_BLOCK(evt->header.pid, verdict5);
         if (ks_should_drop(evt->header.pid, EVENT_PROC_SIGNAL, NULL, verdict5)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
+        KS_SUBMIT(ctx, events, evt);
+        goto cleanup;
+    }
+
+    if ((syscall_nr == 82 || syscall_nr == 264 || syscall_nr == 316) && ret >= 0) {
+        struct file_event *evt = KS_RESERVE(events, struct file_event);
+        if (!evt) { ks_count_drop(); goto cleanup; }
+
+        fill_header(&evt->header, EVENT_FILE_RENAME);
+        evt->header.syscall_nr = syscall_nr;
+        evt->header.retval = ret;
+
+        /* filename 记录新路径：勒索软件批量改后缀（x.y → x.y.encrypted）与
+           持久化替换（替换 cron/systemd 单元）看的是改名后的名字。
+           rename(82) 新路径在 args[1]；renameat/at2(264/316) 在 args[3] */
+        const char __user *new_path = (syscall_nr == 82)
+            ? (const char __user *)sctx->args[1]
+            : (const char __user *)sctx->args[3];
+        bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), new_path);
+        evt->bytes = 0;  evt->fd = -1;  evt->flags = 0;
+
+        int verdict_r = infer_event(evt->header.pid, EVENT_FILE_RENAME,
+                        (const char *)evt->filename, 0, 0, 0, 0);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict_r);
+        if (ks_should_drop(evt->header.pid, EVENT_FILE_RENAME,
+                           (const char *)evt->filename, verdict_r)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
+        KS_SUBMIT(ctx, events, evt);
+        goto cleanup;
+    }
+
+    if ((syscall_nr == 90 || syscall_nr == 268) && ret >= 0) {
+        struct file_event *evt = KS_RESERVE(events, struct file_event);
+        if (!evt) { ks_count_drop(); goto cleanup; }
+
+        fill_header(&evt->header, EVENT_FILE_CHMOD);
+        evt->header.syscall_nr = syscall_nr;
+        evt->header.retval = ret;
+
+        /* chmod(90) 路径在 args[0]；fchmodat(268) 在 args[1]。
+           fchmod(91) 是 fd 描述符，无路径可读，只计频不发事件 */
+        const char __user *path_ptr = (syscall_nr == 90)
+            ? (const char __user *)sctx->args[0]
+            : (const char __user *)sctx->args[1];
+        bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), path_ptr);
+        evt->bytes = 0;  evt->fd = -1;  evt->flags = 0;
+
+        int verdict_c = infer_event(evt->header.pid, EVENT_FILE_CHMOD,
+                        (const char *)evt->filename, 0, 0, 0, 0);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict_c);
+        if (ks_should_drop(evt->header.pid, EVENT_FILE_CHMOD,
+                           (const char *)evt->filename, verdict_c)) {
             KS_DISCARD(evt); goto cleanup;
         }
         KS_SUBMIT(ctx, events, evt);

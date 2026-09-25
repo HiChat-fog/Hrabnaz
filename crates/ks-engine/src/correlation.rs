@@ -20,6 +20,15 @@ pub enum CorrelationType {
     },
 }
 
+/* correlationcondition“怎么判断一个事件满足某个条件”。
+EventType(u32)：事件类型等于某值。
+CommContains(String)：进程名包含某字符串。
+FilenameContains(String)：文件名包含某字符串。
+DportEquals(u16)：目标端口等于某值。
+DaddrMatches(String)：目标地址包含某字符串。
+ArgsContains(String)：参数包含某字符串。
+And(Vec<...>)：所有子条件都满足。 */
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CorrelationCondition {
     EventType(u32),
@@ -130,10 +139,9 @@ impl CorrelationEngine {
                 }),
             },
             CorrelationRule {
-                name: "勒索软件: 读→加密写→删".to_string(),
+                name: "勒索软件: 加密写→删".to_string(),
                 correlation_type: CorrelationType::Sequence {
                     steps: vec![
-                        CorrelationCondition::EventType(11),
                         CorrelationCondition::And(vec![
                             CorrelationCondition::EventType(12),
                             CorrelationCondition::FilenameContains(".encrypted".to_string()),
@@ -142,7 +150,11 @@ impl CorrelationEngine {
                     ],
                     max_gap_secs: 10,
                 },
-                description: "10秒内依次: 读文件→写.encrypted→删原文件".to_string(),
+                // 旧版三步"读→写.encrypted→删"的第一步依赖 FILE_READ(11)，
+                // 该事件类型无探针发射（读只计频不流式，见 ARCHITECTURE §5.3），
+                // 真机上整条规则永不命中。两步序列（写.encrypted→删原文件）的
+                // 两个事件都来自 kprobe 路径（vfs_write≥1024B / vfs_unlink），真机可命中
+                description: "10秒内依次: 写.encrypted→删原文件".to_string(),
                 severity: "critical".to_string(),
                 mitre: Some(MitreMapping {
                     tactic: "TA0040".to_string(),
@@ -247,6 +259,7 @@ impl CorrelationEngine {
         process_tree: Option<&ProcessTreeManager>,
     ) -> Vec<CorrelationAlert> {
         self.event_window.push_back(event.clone());
+        // 这个clone未来考虑优化一下 暂时不改
         let window_ns = self.window_size_secs * 1_000_000_000;
         let current_ts = event.header.timestamp_ns;
         while let Some(front) = self.event_window.front() {
@@ -668,7 +681,7 @@ mod tests {
     #[test]
     fn test_sequence_correlation_ransomware() {
         let mut engine = CorrelationEngine::new(30);
-        engine.detect_correlations(&make_event(1, 5678, 11, "encryptor", None, None, None));
+        // 两步序列：写 .encrypted → 删（FILE_READ 无探针发射，不再作为第一步）
         engine.detect_correlations(&make_event(
             2,
             5678,
@@ -687,7 +700,40 @@ mod tests {
             None,
             None,
         ));
-        assert!(alerts.iter().any(|a| a.rule_name.contains("勒索软件")));
+        assert!(
+            alerts.iter().any(|a| a.rule_name.contains("勒索软件")),
+            "写.encrypted→删 应触发勒索关联，实际: {:?}",
+            alerts.iter().map(|a| &a.rule_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_sequence_correlation_ransomware_gap_reset() {
+        // 第一步之后间隔超过 max_gap → tracker 重置，不应触发
+        let mut engine = CorrelationEngine::new(30);
+        engine.detect_correlations(&make_event(
+            2,
+            5678,
+            12,
+            "encryptor",
+            Some("x.encrypted"),
+            None,
+            None,
+        ));
+        // make_event 时间戳 = seq 秒；seq 100 → 距第一步 98s > 10s gap
+        let alerts = engine.detect_correlations(&make_event(
+            100,
+            5678,
+            13,
+            "encryptor",
+            Some("x"),
+            None,
+            None,
+        ));
+        assert!(
+            !alerts.iter().any(|a| a.rule_name.contains("勒索软件")),
+            "超 gap 的写删序列不应触发勒索关联"
+        );
     }
 
     #[test]

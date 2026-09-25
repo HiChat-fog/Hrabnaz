@@ -619,4 +619,47 @@ mod tests {
         addr[15] = 1;
         assert_eq!(ipv6_to_string(&addr), "::1");
     }
+
+    /// 构造 FileEvent 原始字节（8-31 新增的 rename/chmod 探针走同一 file_event 结构）
+    fn encode_file_event(event_type: u32, pid: u32, ts: u64, filename: &str, bytes: u64) -> Vec<u8> {
+        let mut fname = [0u8; 256];
+        let b = filename.as_bytes();
+        fname[..b.len().min(255)].copy_from_slice(&b[..b.len().min(255)]);
+        let fe = ks_core::event::FileEvent {
+            header: make_header(event_type, pid, ts),
+            filename: fname,
+            bytes,
+            fd: -1,
+            flags: 0,
+        };
+        let size = core::mem::size_of::<ks_core::event::FileEvent>();
+        let mut data = vec![0u8; size];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &fe as *const ks_core::event::FileEvent as *const u8,
+                data.as_mut_ptr(),
+                size,
+            );
+        }
+        data
+    }
+
+    #[test]
+    fn test_decode_file_rename_event() {
+        let mut agg = EventAggregator::new(10);
+        let data = encode_file_event(14, 4242, 7_000_000_000, "/etc/cron.d/backdoor", 0);
+        let e = agg.decode(&data).unwrap();
+        assert_eq!(e.header.event_type, 14);
+        assert_eq!(e.filename.as_deref(), Some("/etc/cron.d/backdoor"));
+        assert_eq!(e.file_bytes, None, "rename 事件 bytes=0 应解码为 None");
+    }
+
+    #[test]
+    fn test_decode_file_chmod_event() {
+        let mut agg = EventAggregator::new(10);
+        let data = encode_file_event(15, 4243, 8_000_000_000, "/usr/bin/backdoor", 0);
+        let e = agg.decode(&data).unwrap();
+        assert_eq!(e.header.event_type, 15);
+        assert_eq!(e.filename.as_deref(), Some("/usr/bin/backdoor"));
+    }
 }
