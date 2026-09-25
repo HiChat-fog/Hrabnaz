@@ -26,3 +26,6 @@ dist/
 /vendor/aya/*.md
 /.github/ISSUE_TEMPLATE/
 /.github/pull_request_template.md
+
+# 机器相关诊断脚本不进仓库
+scripts/ecs-ks-diag.sh
