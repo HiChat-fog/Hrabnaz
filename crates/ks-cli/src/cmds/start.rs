@@ -21,8 +21,6 @@ use tokio::sync::Mutex;
 use colored::Colorize;
 use super::ui::{banner, severity_badge};
 
-use crate::cmds::{build_server_config, SecurityArgs};
-
 enum ForensicOp {
     Event(DecodedEvent),
     Alert(Alert),
@@ -101,13 +99,7 @@ fn prof_print() {
     }
 }
 
-pub async fn run(
-    rules_dir: &str,
-    log_dir: &str,
-    serve_port: Option<u16>,
-    sd_notify: bool,
-    security: &SecurityArgs,
-) -> Result<()> {
+pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     let _singleton_guard = match crate::cmds::singleton::acquire() {
         Ok(f) => f,
@@ -130,7 +122,6 @@ pub async fn run(
 
     super::ui::step(2, 6, "加载 eBPF 探针（自动 tier 检测）");
     let detected_tier = ks_engine::tier_detect::detect_ebpf_tier();
-    let tier_label: &'static str = detected_tier.map(|t| t.as_str()).unwrap_or("unknown");
     if let Some(t) = detected_tier {
         println!("      检测到 tier: {}", t.as_str());
     }
@@ -142,51 +133,6 @@ pub async fn run(
     let (mut source, map_reader): (Box<dyn EventSource>, Option<Arc<dyn BpfMapReader>>) = {
         println!("      (非 Linux 平台，使用 mock 事件源)");
         default_event_source().await
-    };
-    let serve_state: Option<std::sync::Arc<ks_server::ServerState>> = match serve_port {
-        Some(port) => {
-            let state = match map_reader.as_ref() {
-                Some(mr) => {
-                    std::sync::Arc::new(ks_server::ServerState::with_map_reader(tier_label, mr.clone()))
-                }
-                None => std::sync::Arc::new(ks_server::ServerState::with_tier(tier_label)),
-            };
-            let server_config = build_server_config(security);
-            let st = state.clone();
-            match server_config.tls {
-                // 明文路径：先同步 bind，端口被占/权限不足直接中止启动，
-                // 旧实现后台 warn 后继续跑，用户误以为数据服务正常
-                None => {
-                    let listener = ks_server::bind_listener(port).await?;
-                    println!("      数据服务: http://127.0.0.1:{}/api/v1/", port);
-                    println!("      WebSocket: ws://127.0.0.1:{}/ws/alerts", port);
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            ks_server::run_server_with_listener(st, listener, server_config).await
-                        {
-                            log::warn!("ks-server 退出: {}", e);
-                        }
-                    });
-                }
-                Some(ref tls_cfg) => {
-                    println!(
-                        "      数据服务: https://127.0.0.1:{}/api/v1/ (cert={}, mTLS={})",
-                        port,
-                        tls_cfg.server_cert.display(),
-                        tls_cfg.is_mtls()
-                    );
-                    tokio::spawn(async move {
-                        if let Err(e) = ks_server::run_server_with_config(st, port, server_config).await
-                        {
-                            log::warn!("ks-server 退出: {}", e);
-                            eprintln!("  [!] 数据服务启动失败: {} (端口被占/证书问题?)", e);
-                        }
-                    });
-                }
-            }
-            Some(state)
-        }
-        None => None,
     };
     println!(
         "      事件源: {} [{}]",
@@ -203,19 +149,13 @@ pub async fn run(
     let baseline_mgr = Arc::new(Mutex::new(BaselineManager::new()));
     let correlation_engine = Arc::new(Mutex::new(CorrelationEngine::new(300)));
     let process_tree_mgr = Arc::new(Mutex::new(ProcessTreeManager::new()));
-    let ml_detector: Arc<Mutex<AdaptiveDetector>> = match &serve_state {
-        Some(st) => st.ml_detector.clone(),
-        None => Arc::new(Mutex::new(AdaptiveDetector::from_env())),
-    };
-    let block_mgr: Arc<Mutex<ks_engine::blocker::BlockManager>> = match &serve_state {
-        Some(st) => st.block_manager.clone(),
-        None => Arc::new(Mutex::new(ks_engine::blocker::BlockManager::new())),
-    };
+    let ml_detector: Arc<Mutex<AdaptiveDetector>> = Arc::new(Mutex::new(AdaptiveDetector::from_env()));
+    let block_mgr: Arc<Mutex<ks_engine::blocker::BlockManager>> =
+        Arc::new(Mutex::new(ks_engine::blocker::BlockManager::new()));
     {
         let mut bm = block_mgr.lock().await;
         bm.set_enabled(config.detection.block_enabled);
         // ADR-011 闭环：block/unblock 同步下发内核 block_decisions map。
-        // serve_state 与本进程共享同一 BlockManager 实例，REST 阻断同样走此通道。
         // C loader（NOBTF）与 mock 路径没有用户态 map 句柄（map_reader 为 None 或
         // Mock 写入报错），阻断自动降级为仅记录用户态表——与 8-31 前行为一致。
         match &map_reader {
@@ -277,10 +217,8 @@ pub async fn run(
     super::ui::step(6, 6, "启动规则热加载");
     let hot_reload_rules_dir = rules_dir.to_string();
     let hot_reload_detector = detector.clone();
-    // /api/v1/reload 通过这个 Notify 立即唤醒热加载循环（REST reload 真正生效）
-    let reload_notify = serve_state.as_ref().map(|st| st.reload_notify.clone());
     tokio::spawn(async move {
-        rule_hot_loader(&hot_reload_detector, &hot_reload_rules_dir, reload_notify).await;
+        rule_hot_loader(&hot_reload_detector, &hot_reload_rules_dir).await;
     });
     println!("      监听规则目录变更: {}", rules_dir);
 
@@ -306,18 +244,35 @@ pub async fn run(
 
     let protected_pids: std::collections::HashSet<u32> =
         source.protected_pids().iter().copied().collect();
-    // 保护名单同步给 REST 阻断端点：POST /api/v1/block/:pid 不允许阻断这些进程
-    if let Some(st) = &serve_state {
-        st.set_protected_pids(protected_pids.clone()).await;
-    }
 
     let mut sig = std::pin::pin!(tokio::signal::ctrl_c());
+    // systemctl stop 发 SIGTERM：不接住的话进程直接死，kprobe 条目/取证 flush 全跳过
+    #[cfg(target_os = "linux")]
+    let mut term: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = {
+        use tokio::signal::unix::{signal, SignalKind};
+        Box::pin(async move {
+            match signal(SignalKind::terminate()) {
+                Ok(mut s) => {
+                    let _ = s.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        })
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut term: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(std::future::pending::<()>());
 
     loop {
         tokio::select! {
             _ = &mut sig => {
                 println!();
                 println!("收到 Ctrl+C 信号，准备安全关闭...");
+                break;
+            }
+            _ = &mut term => {
+                println!();
+                println!("收到 SIGTERM，准备安全关闭...");
                 break;
             }
             result = async {
@@ -333,7 +288,7 @@ pub async fn run(
                     }
                     Err(e) => return Err(e),
                 };
-                process_event_bytes(&bytes, &aggregator, &detector, &forensic_sink, &chain_reconstructor, &mut stats, anomaly_threshold, &serve_state, &baseline_mgr, &correlation_engine, &process_tree_mgr, &ml_detector, &block_mgr, block_ttl, &block_severity_threshold, &protected_pids).await
+                process_event_bytes(&bytes, &aggregator, &detector, &forensic_sink, &chain_reconstructor, &mut stats, anomaly_threshold, &baseline_mgr, &correlation_engine, &process_tree_mgr, &ml_detector, &block_mgr, block_ttl, &block_severity_threshold, &protected_pids).await
             } => {
                 match result {
                     Ok(true) => {}
@@ -392,7 +347,6 @@ async fn process_event_bytes(
     chain_reconstructor: &ChainReconstructor,
     stats: &mut EventStats,
     anomaly_threshold: f64,
-    serve_state: &Option<std::sync::Arc<ks_server::ServerState>>,
     baseline_mgr: &Arc<Mutex<BaselineManager>>,
     correlation_engine: &Arc<Mutex<CorrelationEngine>>,
     process_tree_mgr: &Arc<Mutex<ProcessTreeManager>>,
@@ -446,10 +400,6 @@ async fn process_event_bytes(
             ca.confidence * 100.0
         );
         forensic.log_alert(&alert).await;
-        if let Some(st) = serve_state {
-            st.push_alert(alert.clone()).await;
-            st.push_correlation_alert(ca.clone()).await;
-        }
         stats.rule_alerts += 1;
         if let Some(mitre) = &alert.mitre {
             println!("    MITRE: {} / {}", mitre.tactic, mitre.technique);
@@ -482,9 +432,6 @@ async fn process_event_bytes(
         );
         forensic.log_alert(&alert).await;
         stats.rule_alerts += 1;
-        if let Some(st) = serve_state {
-            st.push_alert(alert.clone()).await;
-        }
 
         if let Some(mitre) = &alert.mitre {
             println!("    MITRE: {} / {}", mitre.tactic, mitre.technique);
@@ -534,16 +481,6 @@ async fn process_event_bytes(
         let need_heavy_scan = stats.consumed.is_multiple_of(500)
             || !matches.is_empty()
             || !corr_alerts.is_empty();
-        if let Some(st) = serve_state {
-            let snapshots: std::collections::HashMap<u32, _> = baseline_mgr
-                .lock()
-                .await
-                .all_baselines()
-                .iter()
-                .map(|(pid, b)| (*pid, b.clone()))
-                .collect();
-            st.update_baselines(snapshots).await;
-        }
         if !is_protected {
             if let Some(dev) = baseline_mgr.lock().await.detect_deviation(event.header.pid) {
             let dim = dev
@@ -565,9 +502,6 @@ async fn process_event_bytes(
                 },
             );
             forensic.log_alert(&alert).await;
-            if let Some(st) = serve_state {
-                st.push_alert(alert.clone()).await;
-            }
             stats.anomaly_alerts += 1;
             }
         }
@@ -601,9 +535,6 @@ async fn process_event_bytes(
                 },
             );
             forensic.log_alert(&alert).await;
-            if let Some(st) = serve_state {
-                st.push_alert(alert.clone()).await;
-            }
             stats.anomaly_alerts += 1;
             }
         }
@@ -630,9 +561,6 @@ async fn process_event_bytes(
                         rel.parent_comm, rel.child_comm, rel.anomaly_type
                     );
                     forensic.log_alert(&alert).await;
-                    if let Some(st) = serve_state {
-                        st.push_alert(alert.clone()).await;
-                    }
                     stats.anomaly_alerts += 1;
                 }
             }
@@ -866,11 +794,7 @@ async fn load_rules(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str) -> 
     Ok(())
 }
 
-async fn rule_hot_loader(
-    detector: &Arc<Mutex<DetectionEngine>>,
-    rules_dir: &str,
-    reload_notify: Option<Arc<tokio::sync::Notify>>,
-) {
+async fn rule_hot_loader(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str) {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
@@ -878,16 +802,7 @@ async fn rule_hot_loader(
     let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
     loop {
-        // 5s 常规扫描；POST /api/v1/reload 时立即唤醒
-        tokio::select! {
-            _ = scan_interval.tick() => {}
-            _ = async {
-                match &reload_notify {
-                    Some(n) => n.notified().await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {}
-        }
+        scan_interval.tick().await;
 
         let rules_path = Path::new(rules_dir);
         if !rules_path.is_dir() {

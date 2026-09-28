@@ -3,7 +3,6 @@ members = [
     "crates/ks-core",
     "crates/ks-engine",
     "crates/ks-cli",
-    "crates/ks-server",
 ]
 resolver = "2"
 

@@ -20,6 +20,7 @@ dist/
 
 # 文档不进仓库(只留README)
 /docs/
+/realdocs/
 /ARCHITECTURE.md
 /CONTRIBUTING.md
 /ROADMAP.md

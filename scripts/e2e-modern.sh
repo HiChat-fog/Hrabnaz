@@ -2,7 +2,7 @@
 # =============================================================================
 # E1.4 — Modern tier 端到端验证脚本
 # 验证 KernelSentinel 在 5.8+ 内核上的完整链路:
-#   eBPF 采集 → aggregator → detector → forensic → REST API + WebSocket 推送
+#   eBPF 采集 → aggregator → detector → forensic JSONL 落盘
 #
 # 退出码:
 #   0 — 全部断言通过
@@ -12,16 +12,12 @@
 set -euo pipefail
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
-readonly PORT=8443
 readonly LOG_DIR="/tmp/ks-e2e"
 readonly PID_FILE="/tmp/ks-e2e.pid"
-readonly BASE_URL="http://127.0.0.1:${PORT}"
-readonly WS_URL="ws://127.0.0.1:${PORT}/ws/alerts"
-readonly HEALTH_TIMEOUT=10        # 秒
-readonly HEALTH_POLL_INTERVAL=1 # 秒（bash (( )) 不支持浮点）
-readonly SCENARIO_GAP=2           # 秒
-readonly DIGEST_WAIT=5            # 秒
-readonly WS_WAIT=3                # 秒
+readonly STARTUP_TIMEOUT=10        # 秒
+readonly STARTUP_POLL_INTERVAL=1   # 秒
+readonly SCENARIO_GAP=2            # 秒
+readonly DIGEST_WAIT=5             # 秒
 
 # ── 项目根目录（脚本所在目录的上一级）──────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,12 +46,8 @@ fail() {
     echo "ASSERT FAILED: $1" >&2
     echo "------------------------------------------------------------" >&2
     if [[ -n "${KS_PID:-}" ]] && kill -0 "${KS_PID}" 2>/dev/null; then
-        echo ">>> /api/v1/health:" >&2
-        curl -fsS "${BASE_URL}/api/v1/health" 2>&1 | head -5 >&2 || echo "(curl 失败)" >&2
-        echo ">>> /api/v1/stats:" >&2
-        curl -fsS "${BASE_URL}/api/v1/stats" 2>&1 | head -10 >&2 || echo "(curl 失败)" >&2
-        echo ">>> /api/v1/alerts?limit=20:" >&2
-        curl -fsS "${BASE_URL}/api/v1/alerts?limit=20" 2>&1 | head -20 >&2 || echo "(curl 失败)" >&2
+        echo ">>> ks-stdout.log 末尾 10 行:" >&2
+        tail -10 "${LOG_DIR}/ks-stdout.log" >&2 || true
     fi
     if [[ -d "${LOG_DIR}" ]]; then
         echo ">>> ${LOG_DIR} 末尾 20 行日志:" >&2
@@ -78,7 +70,13 @@ cleanup() {
     if [[ -n "${KS_PID:-}" ]] && kill -0 "${KS_PID}" 2>/dev/null; then
         echo "[cleanup] 终止 kernelsentinel (pid=${KS_PID})..."
         kill "${KS_PID}" 2>/dev/null || true
-        sleep 0.5
+        # SIGTERM handler 触发优雅退出（清探针条目+flush 取证），最多等 10s，
+        # 别用固定 0.5s 的 kill -9 打断清理
+        local waited=0
+        while kill -0 "${KS_PID}" 2>/dev/null && (( waited < 10 )); do
+            sleep 1
+            waited=$((waited + 1))
+        done
         kill -9 "${KS_PID}" 2>/dev/null || true
     fi
     if [[ -f "${PID_FILE}" ]]; then
@@ -129,7 +127,7 @@ check_kernel_version() {
 # E1.4.2 — 启动 kernelsentinel 后台运行
 # =============================================================================
 start_kernelsentinel() {
-    echo "[E1.4.2] 启动 kernelsentinel: ${KS_BIN} start --serve ${PORT} --rules-dir ${RULES_DIR} --log-dir ${LOG_DIR}"
+    echo "[E1.4.2] 启动 kernelsentinel: ${KS_BIN} start --rules-dir ${RULES_DIR} --log-dir ${LOG_DIR}"
     if [[ ! -d "${RULES_DIR}" ]]; then
         echo "ERROR: 规则目录不存在: ${RULES_DIR}" >&2
         exit 1
@@ -137,7 +135,6 @@ start_kernelsentinel() {
     mkdir -p "${LOG_DIR}"
     # nohup + & 后台运行；stdout/stderr 落到日志文件便于事后排查
     nohup "${KS_BIN}" start \
-        --serve "${PORT}" \
         --rules-dir "${RULES_DIR}" \
         --log-dir "${LOG_DIR}" \
         >"${LOG_DIR}/ks-stdout.log" 2>&1 &
@@ -147,33 +144,28 @@ start_kernelsentinel() {
 }
 
 # =============================================================================
-# E1.4.3 — 等待 /api/v1/health 返回 status:ok（最多 10s）
+# E1.4.3 — 等待引擎完成初始化并开始落盘（最多 10s）
 # =============================================================================
-wait_for_health() {
-    echo "[E1.4.3] 等待健康检查（最多 ${HEALTH_TIMEOUT}s，每 ${HEALTH_POLL_INTERVAL}s 轮询）..."
+wait_for_startup() {
+    echo "[E1.4.3] 等待引擎初始化（最多 ${STARTUP_TIMEOUT}s，每 ${STARTUP_POLL_INTERVAL}s 轮询）..."
     local elapsed=0
-    while (( elapsed < HEALTH_TIMEOUT )); do
+    while (( elapsed < STARTUP_TIMEOUT )); do
         if ! kill -0 "${KS_PID}" 2>/dev/null; then
             echo "ERROR: kernelsentinel 进程已退出" >&2
             echo ">>> ks-stdout.log 末尾 20 行:" >&2
             tail -20 "${LOG_DIR}/ks-stdout.log" >&2 || true
             exit 1
         fi
-        local resp
-        resp="$(curl -fsS --max-time 2 "${BASE_URL}/api/v1/health" 2>/dev/null || true)"
-        if [[ -n "${resp}" ]]; then
-            local status
-            # 用 grep -oE 提取 status 字段（避免依赖 jq）
-            status="$(echo "${resp}" | grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*:"([^"]+)".*/\1/' || true)"
-            if [[ "${status}" == "ok" ]]; then
-                echo "         健康检查通过 (${elapsed}s): ${resp}"
-                return 0
-            fi
+        local latest
+        latest="$(ls -t "${LOG_DIR}"/events_*.jsonl 2>/dev/null | head -1 || true)"
+        if [[ -n "${latest}" && -s "${latest}" ]]; then
+            echo "         引擎已就绪并开始写取证日志 (${elapsed}s): ${latest}"
+            return 0
         fi
-        sleep "${HEALTH_POLL_INTERVAL}"
-        elapsed=$((elapsed + HEALTH_POLL_INTERVAL))
+        sleep "${STARTUP_POLL_INTERVAL}"
+        elapsed=$((elapsed + STARTUP_POLL_INTERVAL))
     done
-    fail "健康检查超时（${HEALTH_TIMEOUT}s 内 /api/v1/health 未返回 status:ok）"
+    fail "启动超时（${STARTUP_TIMEOUT}s 内未见非空 events_*.jsonl）"
 }
 
 # =============================================================================
@@ -227,64 +219,35 @@ run_scenarios() {
 }
 
 # =============================================================================
-# E1.4.5 — 断言 alerts >= 3, stats.by_severity 含 critical/high, version 有 version 字段
+# E1.4.5 — 断言取证日志: alert 记录 >= 3, severity 含 critical/high, --version 正常
 # =============================================================================
-assert_api_responses() {
+assert_local_outputs() {
     echo "[E1.4.5] 等待 ${DIGEST_WAIT}s 让事件消化..."
     sleep "${DIGEST_WAIT}"
 
-    # 1) alerts >= 3
-    local alerts_resp
-    alerts_resp="$(curl -fsS --max-time 5 "${BASE_URL}/api/v1/alerts?limit=20" 2>/dev/null \
-        || fail "curl /api/v1/alerts 失败")"
-    # alerts 是 JSON 数组，统计顶层元素个数（粗略：逗号分隔 + 边界）
+    local latest
+    latest="$(ls -t "${LOG_DIR}"/events_*.jsonl 2>/dev/null | head -1 || true)"
+    [[ -n "${latest}" ]] || fail "断言失败: ${LOG_DIR}/events_*.jsonl 不存在"
+
+    # 1) alert 记录 >= 3（forensic 落盘的告警行带 "type":"alert"）
     local alert_count
-    alert_count="$(echo "${alerts_resp}" | grep -oE '"id"' | wc -l)"
-    echo "         alerts count=${alert_count}"
-    (( alert_count >= 3 )) || fail "断言失败: alerts >= 3，实际 ${alert_count}"
+    alert_count="$(grep -c '"type":"alert"' "${latest}" || true)"
+    echo "         alert 记录=${alert_count}"
+    (( alert_count >= 3 )) || fail "断言失败: 取证日志 alert 记录 >= 3，实际 ${alert_count}"
 
-    # 2) stats.by_severity 含 critical 或 high
-    local stats_resp
-    stats_resp="$(curl -fsS --max-time 5 "${BASE_URL}/api/v1/stats" 2>/dev/null \
-        || fail "curl /api/v1/stats 失败")"
-    echo "         stats: ${stats_resp}"
-    if ! echo "${stats_resp}" | grep -qiE '"critical"' && ! echo "${stats_resp}" | grep -qiE '"high"'; then
-        fail "断言失败: by_severity 不含 critical 或 high"
+    # 2) severity 含 critical 或 high
+    if ! grep -q '"severity":"critical"' "${latest}" && ! grep -q '"severity":"high"' "${latest}"; then
+        fail "断言失败: 取证日志不含 critical/high 告警"
     fi
-    echo "         by_severity 含 critical/high ✓"
+    echo "         severity 含 critical/high ✓"
 
-    # 3) version 返回 version 字段
-    local version_resp
-    version_resp="$(curl -fsS --max-time 5 "${BASE_URL}/api/v1/version" 2>/dev/null \
-        || fail "curl /api/v1/version 失败")"
-    echo "         version: ${version_resp}"
-    echo "${version_resp}" | grep -qE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
-        || fail "断言失败: /api/v1/version 未返回 version 字段"
+    # 3) 二进制 --version 输出版本号
+    local version_out
+    version_out="$("${KS_BIN}" --version 2>&1 || fail "kernelsentinel --version 执行失败")"
+    echo "         version: ${version_out}"
+    echo "${version_out}" | grep -qE '[0-9]+\.[0-9]+' \
+        || fail "断言失败: --version 未输出版本号"
     echo "         version 字段存在 ✓"
-}
-
-# =============================================================================
-# E1.4.6 — WebSocket 测试（websocat 缺失时跳过 + warning，不失败）
-# =============================================================================
-test_websocket() {
-    echo "[E1.4.6] WebSocket 测试..."
-    if ! command -v websocat >/dev/null 2>&1; then
-        echo "         [WARNING] 未安装 websocat，跳过 WebSocket 测试（不影响 exit code）"
-        return 0
-    fi
-    # websocat 连接 3s，捕获首条消息；超时返回非 0
-    local ws_out
-    ws_out="$(timeout "${WS_WAIT}" websocat -t "${WS_URL}" 2>/dev/null || true)"
-    if [[ -z "${ws_out}" ]]; then
-        echo "         [WARNING] WebSocket 在 ${WS_WAIT}s 内未收到消息（可能场景未触发 WS 推送，跳过断言）"
-        return 0
-    fi
-    echo "         WS 收到: $(echo "${ws_out}" | head -1)"
-    # 断言至少 1 条告警 JSON（含 severity / title / id 之一即视为告警）
-    local ws_count
-    ws_count="$(echo "${ws_out}" | grep -cE '"(severity|title|id|alert_id)"' || true)"
-    (( ws_count >= 1 )) || fail "WebSocket 断言失败: 未收到告警 JSON"
-    echo "         WebSocket 收到 ${ws_count} 条告警 JSON ✓"
 }
 
 # =============================================================================
@@ -325,15 +288,13 @@ main() {
     echo " 二进制: ${KS_BIN}"
     echo " 规则:   ${RULES_DIR}"
     echo " 日志:   ${LOG_DIR}"
-    echo " 端口:   ${PORT}"
     echo "============================================================"
 
     check_kernel_version    # E1.4.1 (失败时 exit 2)
     start_kernelsentinel    # E1.4.2
-    wait_for_health         # E1.4.3
+    wait_for_startup        # E1.4.3
     run_scenarios           # E1.4.4
-    assert_api_responses    # E1.4.5
-    test_websocket          # E1.4.6
+    assert_local_outputs    # E1.4.5
     check_forensic_log      # E1.4.7
 
     echo "============================================================"

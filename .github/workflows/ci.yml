@@ -56,8 +56,8 @@ jobs:
           sudo apt-get install -y libelf-dev libbpf-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build ks-server (triggers ks-engine build.rs -> eBPF)
-        run: cargo build -p ks-server --release
+      - name: Build ks-cli (triggers ks-engine build.rs -> eBPF)
+        run: cargo build -p ks-cli --release
       - name: Verify 5 eBPF .o files (modern/legacy/ancient/ancient_nobtf/legacy_nobtf)
         run: |
           set -e

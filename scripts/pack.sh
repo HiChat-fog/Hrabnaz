@@ -50,7 +50,6 @@ musl 静态链接,不挑发行版(CentOS 7 / Ubuntu / Debian 均可)。
 ## 验证
   kernelsentinel --version
   kernelsentinel status
-  kernelsentinel serve
 
 ## 卸载
   sudo bash deploy/uninstall.sh

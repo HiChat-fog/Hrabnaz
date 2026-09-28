@@ -23,12 +23,8 @@ enum Commands {
         rules_dir: String,
         #[arg(short, long, default_value = "/var/log/ks")]
         log_dir: String,
-        #[arg(long)]
-        serve: Option<u16>,
         #[arg(long, default_value_t = false)]
         sd_notify: bool,
-        #[command(flatten)]
-        security: cmds::SecurityArgs,
     },
     Stop,
     Status {
@@ -42,10 +38,6 @@ enum Commands {
         file: String,
         #[arg(long, default_value_t = false)]
         json: bool,
-    },
-    Serve {
-        #[arg(short, long, default_value = "8443")]
-        port: u16,
     },
     Baseline {
         #[command(flatten)]
@@ -91,23 +83,17 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start {
             rules_dir,
             log_dir,
-            serve,
             sd_notify,
-            security,
         } => {
             cmds::ui::banner(&format!("内核哨兵 v{} 启动中", env!("CARGO_PKG_VERSION")));
             println!("  规则目录: {}", rules_dir);
             println!("  日志目录: {}", log_dir);
-            if let Some(port) = serve {
-                println!("  REST API (可选demo): http://localhost:{}/api/v1/", port);
-                print_security_status(&security);
-            }
             if sd_notify {
                 println!("  sd-notify: 启用 (Type=notify)");
             }
             println!();
 
-            cmds::start::run(&rules_dir, &log_dir, serve, sd_notify, &security).await?;
+            cmds::start::run(&rules_dir, &log_dir, sd_notify).await?;
         }
         Commands::Stop => {
             cmds::stop::run().await?;
@@ -115,9 +101,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status { watch, interval } => cmds::status::run(watch, interval).await?,
         Commands::Replay { file, json } => {
             cmds::replay::run(&file, json).await?;
-        }
-        Commands::Serve { port } => {
-            cmds::serve::run(port).await?;
         }
         Commands::Baseline { args } => {
             cmds::baseline::run(&args).await?;
@@ -130,34 +113,4 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn print_security_status(args: &cmds::SecurityArgs) {
-    let auth_status = if args.no_auth {
-        "DISABLED (--no-auth)"
-    } else if args.auth_token.is_some() || std::env::var("KS_AUTH_TOKEN").is_ok() {
-        "ENABLED"
-    } else {
-        "ENABLED (no token — 401 for all authed endpoints)"
-    };
-    println!("      鉴权: {}", auth_status);
-    match (&args.tls_cert, &args.tls_key) {
-        (Some(c), Some(k)) => {
-            println!("      TLS:  启用 (cert={}, key={})", c, k);
-            if let Some(ca) = &args.tls_client_ca {
-                println!("      mTLS: 启用 (client_ca={})", ca);
-            }
-        }
-        (Some(c), None) => println!(
-            "      TLS:  仅指定 --tls-cert={} 但未指定 --tls-key，TLS 不启用",
-            c
-        ),
-        (None, Some(k)) => println!(
-            "      TLS:  仅指定 --tls-key={} 但未指定 --tls-cert，TLS 不启用",
-            k
-        ),
-        (None, None) => println!("      TLS:  未启用 (HTTP)"),
-    }
-    println!("      限流: {} req/min/IP", args.rate_limit);
-    println!("      审计: {}", args.audit_log);
 }
