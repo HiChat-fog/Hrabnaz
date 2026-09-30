@@ -82,6 +82,17 @@ pub trait BpfMapReader: Send + Sync {
     fn remove_block_decision(&self, _pid: u32) -> anyhow::Result<()> {
         anyhow::bail!("当前 map reader 不支持写 block_decisions（非 aya 加载路径或 mock）")
     }
+
+    /// 读全表 (pid, expire_monotonic_ns, reason)，供非 Modern tier 的用户态 killer 使用。
+    /// 默认空：mock / C loader 路径无 map 句柄，killer 拿不到裁决自然不动作。
+    fn read_block_decisions(&self) -> Vec<(u32, u64, u8)> {
+        Vec::new()
+    }
+
+    /// 把 block_decisions map pin 到 bpffs，供 `ks block` 等独立进程跨进程访问。
+    fn pin_block_map(&self, _path: &str) -> anyhow::Result<()> {
+        anyhow::bail!("当前 map reader 不支持 pin block_decisions（非 aya 加载路径或 mock）")
+    }
 }
 
 pub struct MockBpfMapReader;
@@ -281,7 +292,7 @@ fn inject_protected_pid(bpf: &mut aya::Ebpf, self_pid: u32) -> Vec<u32> {
 #[cfg(not(target_os = "linux"))]
 fn inject_protected_pid(_bpf: &mut (), _self_pid: u32) {}
 
-const DEFAULT_PROTECTED_COMMS: &[&str] = &[
+pub const DEFAULT_PROTECTED_COMMS: &[&str] = &[
     "sshd", "systemd", "cron", "crond", "journald", "dbus-daemon",
     "sudo", "login", "agetty", "rsyslogd", "systemd-journal",
 ];

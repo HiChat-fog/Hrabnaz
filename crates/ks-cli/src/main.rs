@@ -27,6 +27,17 @@ enum Commands {
         sd_notify: bool,
     },
     Stop,
+    /// 手动下发阻断裁决（写引擎 pin 的 block_decisions map，--ttl 0 = 永久）
+    Block {
+        pid: u32,
+        /// TTL 秒数，0 = 永久
+        #[arg(long, default_value_t = 600)]
+        ttl: u64,
+    },
+    /// 解除手动/自动的阻断裁决
+    Unblock { pid: u32 },
+    /// 列出生效中的阻断裁决
+    Blocked,
     Status {
         #[arg(long, default_value_t = false)]
         watch: bool,
@@ -97,6 +108,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Stop => {
             cmds::stop::run().await?;
+        }
+        Commands::Block { pid, ttl } => {
+            cmds::block::run_block(pid, ttl).await?;
+        }
+        Commands::Unblock { pid } => {
+            cmds::block::run_unblock(pid).await?;
+        }
+        Commands::Blocked => {
+            cmds::block::run_blocked().await?;
         }
         Commands::Status { watch, interval } => cmds::status::run(watch, interval).await?,
         Commands::Replay { file, json } => {

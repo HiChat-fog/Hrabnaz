@@ -1,3 +1,4 @@
+# lkm-load.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "LKM Rootkit 加载检测"
   description: "检测加载可疑内核模块 (rootkit/backdoor/nf_hook) (event_type=81, 探针: kprobe/do_init_module)"
   severity: critical

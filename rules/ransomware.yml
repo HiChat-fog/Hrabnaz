@@ -1,3 +1,4 @@
+# ransomware.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "勒索软件加密行为"
   description: "检测文件写入加密后缀 (.encrypted/.locked/.crypto) 或批量文件删除操作"
   severity: critical

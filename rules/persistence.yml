@@ -1,3 +1,4 @@
+# persistence.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 # 持久化检测 — 依赖的传感器面：
 #   exec args (event_type=1, 全量放行) / 文件写删 (12/13, kprobe 路径全量放行)
 #   文件打开 (10) 仅 /etc/shadow、/etc/gshadow、/etc/sudoers、/root/.ssh 前缀放行（内核 infer_sensitive_file）

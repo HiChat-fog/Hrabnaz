@@ -1,3 +1,4 @@
+# defense-evasion.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 # 防御规避检测 — 全部走 exec args / comm（event_type=1 全量放行）
 
 - name: "审计日志清除"

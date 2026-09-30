@@ -1,3 +1,4 @@
+# ebpf-tamper.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "eBPF 程序篡改检测"
   description: "检测 BPF 程序被卸载/篡改 (event_type=82, 探针: kprobe/security_bpf_prog_free)"
   severity: critical

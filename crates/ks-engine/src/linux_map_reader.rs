@@ -103,6 +103,41 @@ impl LinuxBpfMapReader {
         Ok(())
     }
 
+    /// 读全表：killer 与列表命令共用。(pid, expire_mono, reason)
+    pub fn read_block_decisions(&self) -> Vec<(u32, u64, u8)> {
+        let mut bpf = self
+            .bpf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(mut hm) = Self::open_block_map(&mut bpf) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for kv in hm.iter() {
+            if let Ok((key, value)) = kv {
+                let pid = u32::from_ne_bytes(key[..4].try_into().unwrap_or([0; 4]));
+                let expire = u64::from_ne_bytes(value[..8].try_into().unwrap_or([0; 8]));
+                out.push((pid, expire, value[8]));
+            }
+        }
+        out
+    }
+
+    /// pin 到 bpffs。先删同路径残留（上次崩溃遗留的 pin 指向已死的 map）。
+    pub fn pin_block_map(&self, path: &str) -> anyhow::Result<()> {
+        let _ = std::fs::remove_file(path);
+        let mut bpf = self
+            .bpf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = bpf
+            .map_mut("block_decisions")
+            .ok_or_else(|| anyhow::anyhow!("block_decisions map 不存在"))?;
+        map.pin(path)
+            .map_err(|e| anyhow::anyhow!("pin {} 失败: {}（/sys/fs/bpf 未挂载?）", path, e))?;
+        Ok(())
+    }
+
     fn map_data_ref(map: &aya::maps::Map) -> &aya::maps::MapData {
         match map {
             aya::maps::Map::Array(md)
@@ -354,6 +389,14 @@ impl BpfMapReader for LinuxBpfMapReader {
 
     fn remove_block_decision(&self, pid: u32) -> anyhow::Result<()> {
         LinuxBpfMapReader::remove_block_decision(self, pid)
+    }
+
+    fn read_block_decisions(&self) -> Vec<(u32, u64, u8)> {
+        LinuxBpfMapReader::read_block_decisions(self)
+    }
+
+    fn pin_block_map(&self, path: &str) -> anyhow::Result<()> {
+        LinuxBpfMapReader::pin_block_map(self, path)
     }
 }
 

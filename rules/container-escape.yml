@@ -1,3 +1,4 @@
+# container-escape.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "容器逃逸检测"
   description: "检测容器内进程通过 commit_creds 切换命名空间或提升权限 (event_type=80, 探针: kprobe/commit_creds)"
   severity: critical

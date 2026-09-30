@@ -1,5 +1,6 @@
 pub mod ui;
 pub mod baseline;
+pub mod block;
 pub mod correlation;
 pub mod replay;
 pub mod singleton;

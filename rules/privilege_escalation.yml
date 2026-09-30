@@ -1,3 +1,4 @@
+# privilege_escalation.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "SUID 提权检测"
   description: "检测通过 chmod 设置 SUID 位进行提权的行为"
   severity: critical

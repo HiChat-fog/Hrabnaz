@@ -1,3 +1,4 @@
+# command-and-control.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 # 命令控制检测 — connect (event_type=20) 事件全量放行（ip_whitelist map 无写入方，恒空）
 # 内核 infer_suspicious_net 对 4444/1337/31337 等端口已有风险加成，此处覆盖云场景与横向移动特征
 

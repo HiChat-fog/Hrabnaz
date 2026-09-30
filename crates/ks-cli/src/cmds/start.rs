@@ -173,6 +173,78 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
     let block_ttl = config.detection.block_ttl_secs;
     let block_severity_threshold = config.detection.block_severity_threshold.clone();
 
+    // pin block_decisions 到 bpffs：ks block 等独立进程靠它跨进程写裁决
+    let block_pinned = if let Some(mr) = &map_reader {
+        match mr.pin_block_map(ks_engine::blocker::BLOCK_DECISIONS_PIN) {
+            Ok(()) => {
+                println!(
+                    "      裁决通道: {} (ks block 可用)",
+                    ks_engine::blocker::BLOCK_DECISIONS_PIN
+                );
+                true
+            }
+            Err(e) => {
+                log::warn!("block_decisions pin 失败: {} — ks block 不可用，自动阻断不受影响", e);
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // 非 Modern tier 的用户态实杀：老内核 ks_check_block 只查表不杀（无 bpf_send_signal），
+    // 由本进程轮询 block_decisions 全表补 SIGKILL。Modern 由内核即时杀，无需重复。
+    let protected_pids: std::collections::HashSet<u32> =
+        source.protected_pids().iter().copied().collect();
+    let user_kill_enabled = config.detection.block_enabled
+        && map_reader.is_some()
+        && detected_tier != Some(ks_engine::event_source::SourceKind::EbpfModern)
+        && std::env::var("KS_USER_KILL").as_deref() != Ok("0");
+    if user_kill_enabled {
+        let mr = map_reader.clone().expect("map_reader 已判定存在");
+        let protected_for_kill = protected_pids.clone();
+        let killed: Arc<Mutex<std::collections::HashMap<u32, u64>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        tokio::spawn(async move {
+            let protect = ks_engine::blocker::protected_comms();
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(300));
+            loop {
+                tick.tick().await;
+                let entries = mr.read_block_decisions();
+                if entries.is_empty() {
+                    continue;
+                }
+                let fired = {
+                    let mut killed = killed.lock().await;
+                    ks_engine::blocker::user_kill_tick(
+                        &entries,
+                        &mut killed,
+                        &protected_for_kill,
+                        ks_engine::blocker::monotonic_now_ns(),
+                        ks_engine::blocker::kill_pid_sigkill,
+                    )
+                };
+                for (pid, reason) in fired {
+                    // comm 保护兜底：内核 ks_check_block 只在 Modern 生效，killer 侧同样豁免
+                    if let Some(comm) = ks_engine::blocker::comm_of(pid) {
+                        if protect.iter().any(|p| *p == comm) {
+                            log::info!("跳过实杀 pid={} (comm={} 在保护名单)", pid, comm);
+                            continue;
+                        }
+                    }
+                    log::info!("用户态实杀 pid={} (reason={}, 内核无 bpf_send_signal)", pid, reason);
+                    println!(
+                        "  {} PID {} 用户态实杀 ({}), 非Modern tier由ks补杀",
+                        "阻断".red().bold(),
+                        pid,
+                        reason
+                    );
+                }
+            }
+        });
+        log::info!("用户态 killer 已启用（非 Modern tier，300ms 轮询 block_decisions）");
+    }
+
     let resolved_log_dir = if Path::new(log_dir).exists() || log_dir != "/var/log/ks" {
         log_dir.to_string()
     } else {
@@ -241,9 +313,6 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
     let mut stats = EventStats::new();
     let anomaly_threshold = config.detection.anomaly_threshold;
     let continue_on_empty = !source.is_mock();
-
-    let protected_pids: std::collections::HashSet<u32> =
-        source.protected_pids().iter().copied().collect();
 
     let mut sig = std::pin::pin!(tokio::signal::ctrl_c());
     // systemctl stop 发 SIGTERM：不接住的话进程直接死，kprobe 条目/取证 flush 全跳过
@@ -331,6 +400,9 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
     );
     println!("      运行时长: {:.1}s", elapsed.as_secs_f64());
 
+    if block_pinned {
+        let _ = std::fs::remove_file(ks_engine::blocker::BLOCK_DECISIONS_PIN);
+    }
     cleanup_status_file();
     prof_print();
     banner("内核哨兵已安全退出");
@@ -405,6 +477,7 @@ async fn process_event_bytes(
             println!("    MITRE: {} / {}", mitre.tactic, mitre.technique);
         }
         if severity_meets_threshold(&alert.severity, block_severity_threshold)
+            && ca.enforce
             && !protected_pids.contains(&event.header.pid)
             && block_mgr.lock().await.block_pid(
                 event.header.pid,
@@ -436,7 +509,8 @@ async fn process_event_bytes(
         if let Some(mitre) = &alert.mitre {
             println!("    MITRE: {} / {}", mitre.tactic, mitre.technique);
         }
-        if severity_meets_threshold(&alert.severity, block_severity_threshold)
+        if m.enforce
+            && severity_meets_threshold(&alert.severity, block_severity_threshold)
             && !protected_pids.contains(&alert.process.pid)
             && block_mgr.lock().await.block_pid(
                 alert.process.pid,
@@ -928,6 +1002,7 @@ mod tests {
 
     fn make_correlation_alert(severity: &str, with_mitre: bool) -> CorrelationAlert {
         CorrelationAlert {
+            enforce: false,
             rule_name: "测试关联规则".to_string(),
             correlation_type: CorrelationType::Window {
                 window_secs: 30,
@@ -975,6 +1050,7 @@ mod tests {
     #[test]
     fn test_correlation_to_alert_empty_events() {
         let ca = CorrelationAlert {
+            enforce: false,
             rule_name: "空事件".to_string(),
             correlation_type: CorrelationType::Window {
                 window_secs: 30,

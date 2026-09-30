@@ -1,3 +1,4 @@
+# dns_tunnel.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "dns_tunnel_suspicious_domain"
   description: "DNS 查询指向公网 DNS 服务器,若配合高频/长域名查询则为 DNS 隧道特征"
   severity: medium

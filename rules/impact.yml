@@ -1,3 +1,4 @@
+# impact.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 # 影响与破坏检测 — 删除事件 (event_type=13, kprobe/vfs_unlink) 全量放行、多级路径已拼接
 
 - name: "磁盘擦除"

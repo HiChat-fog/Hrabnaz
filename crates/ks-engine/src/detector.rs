@@ -85,6 +85,7 @@ impl DetectionEngine {
                         .iter()
                         .map(|c| format!("{} {} {}", c.field, op_to_str(&c.operator), c.value))
                         .collect(),
+                    enforce: rule.enforce,
                 });
             }
         }

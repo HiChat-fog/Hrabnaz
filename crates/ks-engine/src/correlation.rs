@@ -49,6 +49,7 @@ pub struct CorrelationAlert {
     pub severity: String,
     pub mitre: Option<MitreMapping>,
     pub confidence: f64,
+    pub enforce: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +79,8 @@ pub struct CorrelationRule {
     pub description: String,
     pub severity: String,
     pub mitre: Option<MitreMapping>,
+    /// 阻断模式下是否允许写 block_decisions 实杀（默认 false=audit，搬 KubeArmor action 分离）
+    pub enforce: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +123,7 @@ impl CorrelationEngine {
                     tactic: "TA0010".to_string(),
                     technique: "T1041".to_string(),
                 }),
+                enforce: false,
             },
             CorrelationRule {
                 name: "数据窃取: 读取SSH密钥后建立外部连接".to_string(),
@@ -137,6 +141,7 @@ impl CorrelationEngine {
                     tactic: "TA0010".to_string(),
                     technique: "T1048".to_string(),
                 }),
+                enforce: false,
             },
             CorrelationRule {
                 name: "勒索软件: 加密写→删".to_string(),
@@ -160,6 +165,7 @@ impl CorrelationEngine {
                     tactic: "TA0040".to_string(),
                     technique: "T1486".to_string(),
                 }),
+                enforce: false,
             },
             CorrelationRule {
                 name: "反弹Shell: bash交互模式后外连".to_string(),
@@ -178,6 +184,7 @@ impl CorrelationEngine {
                     tactic: "TA0002".to_string(),
                     technique: "T1059.004".to_string(),
                 }),
+                enforce: false,
             },
             CorrelationRule {
                 name: "提权+持久化: SUID设置后修改sudoers".to_string(),
@@ -201,6 +208,7 @@ impl CorrelationEngine {
                     tactic: "TA0004".to_string(),
                     technique: "T1548.001".to_string(),
                 }),
+                enforce: false,
             },
             CorrelationRule {
                 name: "DNS隧道: 高频DNS+可疑目标".to_string(),
@@ -215,6 +223,7 @@ impl CorrelationEngine {
                     tactic: "TA0011".to_string(),
                     technique: "T1071.004".to_string(),
                 }),
+                enforce: false,
             },
             CorrelationRule {
                 name: "进程树异常: sshd→bash→网络工具".to_string(),
@@ -228,6 +237,7 @@ impl CorrelationEngine {
                     tactic: "TA0001".to_string(),
                     technique: "T1059.004".to_string(),
                 }),
+                enforce: false,
             },
             CorrelationRule {
                 name: "进程树异常: cron→下载工具".to_string(),
@@ -241,6 +251,7 @@ impl CorrelationEngine {
                     tactic: "TA0003".to_string(),
                     technique: "T1053.003".to_string(),
                 }),
+                enforce: false,
             },
         ]
     }
@@ -369,6 +380,7 @@ impl CorrelationEngine {
             severity: rule.severity.clone(),
             mitre: rule.mitre.clone(),
             confidence: alert.confidence,
+            enforce: rule.enforce,
         }
     }
 

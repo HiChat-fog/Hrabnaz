@@ -1,3 +1,4 @@
+# data_exfil.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "敏感日志文件访问"
   description: "检测对系统日志目录的异常访问 (可能为数据窃取做准备)"
   severity: medium

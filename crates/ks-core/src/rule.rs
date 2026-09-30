@@ -10,6 +10,11 @@ pub struct DetectionRule {
     pub alert_message: String,
     pub mitre_tactic: Option<String>,
     pub mitre_technique: Option<String>,
+    /// 阻断模式下是否允许写 block_decisions 实杀。默认 false——severity 只决定告警级别，
+    /// 实杀权必须显式声明（搬 KubeArmor 的 action 分离；未声明即 audit）。
+    /// 编写守则：只给匹配条件精确（comm/syscall 级）、monitor 模式观察过零误报的规则标 true。
+    #[serde(default)]
+    pub enforce: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,4 +219,5 @@ pub struct MatchResult {
     pub severity: Severity,
     pub alert_message: String,
     pub matched_conditions: Vec<String>,
+    pub enforce: bool,
 }

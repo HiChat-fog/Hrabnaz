@@ -5,6 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::loader::BpfMapReader;
 
+/// block_decisions 在 bpffs 的 pin 路径：引擎启动 pin、退出摘除，
+/// `ks block` 等独立进程经此跨进程读写裁决（map 是契约，进程不是）
+pub const BLOCK_DECISIONS_PIN: &str = "/sys/fs/bpf/kernelsentinel_block_decisions";
+
 /// 阻断决策的内核下发通道（ADR-011"用户态写 block_decisions → 内核查表实杀"闭环）。
 ///
 /// 语义对齐内核侧 `ks_check_block()`：
@@ -34,7 +38,7 @@ impl KernelBlockWriter for MapWriterSink {
 /// 与 `bpf_ktime_get_ns()` 同源的 CLOCK_MONOTONIC 纳秒。
 /// /proc/uptime 是 boottime 口径（含 suspend），会话挂起后 TTL 会变长，故用 clock_gettime。
 #[cfg(target_os = "linux")]
-fn monotonic_now_ns() -> u64 {
+pub fn monotonic_now_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -241,6 +245,142 @@ fn now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// 非 Modern tier 的用户态实杀：老内核无 `bpf_send_signal`，`ks_check_block` 只查表不杀，
+/// 由用户态读 block_decisions 全表补一刀（ADR-011 闭环在 Legacy/Ancient 上的出口）。
+///
+/// 纯函数便于测试：entries 为内核 map 全表，killed 记录"上次杀时的 expire"
+/// （expire 变了说明同 pid 被重新裁决，要再杀），返回本轮实际执行 kill 的 pid 列表。
+pub fn user_kill_tick(
+    entries: &[(u32, u64, u8)],
+    killed: &mut HashMap<u32, u64>,
+    protected: &std::collections::HashSet<u32>,
+    now_mono_ns: u64,
+    kill_fn: impl Fn(u32) -> bool,
+) -> Vec<(u32, BlockReason)> {
+    let mut fired = Vec::new();
+    for &(pid, expire, reason) in entries {
+        if pid == 0 || protected.contains(&pid) {
+            continue;
+        }
+        if expire != 0 && expire <= now_mono_ns {
+            continue;
+        }
+        if killed.get(&pid) == Some(&expire) {
+            continue;
+        }
+        if kill_fn(pid) {
+            killed.insert(pid, expire);
+            fired.push((pid, BlockReason::from_u8(reason)));
+        } else {
+            killed.remove(&pid);
+        }
+    }
+    fired
+}
+
+pub fn kill_pid_sigkill(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // ESRCH（进程已死）视为成功：裁决已达成，等 LRU/TTL 清条目
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        rc == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// 系统进程 comm 保护（与内核 protected_comms 同一名单 + KS_PROTECTED_COMMS 扩展）：
+/// killer 侧兜底，防手动 `ks block` 或误配置把 sshd 等写进裁决。
+pub fn protected_comms() -> Vec<String> {
+    let mut comms: Vec<String> = crate::loader::DEFAULT_PROTECTED_COMMS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Ok(extra) = std::env::var("KS_PROTECTED_COMMS") {
+        for c in extra.split(',') {
+            let c = c.trim();
+            if !c.is_empty() && !comms.iter().any(|x| x == c) {
+                comms.push(c.to_string());
+            }
+        }
+    }
+    comms
+}
+
+#[cfg(target_os = "linux")]
+pub fn comm_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// 跨进程访问 pinned block_decisions 的薄封装（`ks block` 用）。
+/// key [u8;8]=pid+pad，value [u8;16]=expire_mono(8)+reason(1)+pad(7)，
+/// 与 common.h 的 block_key/block_value 逐字节对齐（native endian，同架构）。
+#[cfg(target_os = "linux")]
+pub struct PinnedBlockMap {
+    inner: aya::maps::HashMap<aya::maps::MapData, [u8; 8], [u8; 16]>,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedBlockMap {
+    pub fn open() -> anyhow::Result<Self> {
+        let md = aya::maps::MapData::from_pin(BLOCK_DECISIONS_PIN).map_err(|e| {
+            anyhow::anyhow!(
+                "打开 {} 失败: {} — 引擎未运行（引擎启动时才 pin）",
+                BLOCK_DECISIONS_PIN,
+                e
+            )
+        })?;
+        Ok(Self {
+            inner: aya::maps::HashMap::try_from(aya::maps::Map::HashMap(md))?,
+        })
+    }
+
+    fn key(pid: u32) -> [u8; 8] {
+        let mut k = [0u8; 8];
+        k[..4].copy_from_slice(&pid.to_ne_bytes());
+        k
+    }
+
+    pub fn write(&mut self, pid: u32, expire_mono_ns: u64, reason: u8) -> anyhow::Result<()> {
+        let mut value = [0u8; 16];
+        value[..8].copy_from_slice(&expire_mono_ns.to_ne_bytes());
+        value[8] = reason;
+        self.inner
+            .insert(Self::key(pid), value, 0)
+            .map_err(|e| anyhow::anyhow!("写入裁决失败: {}", e))
+    }
+
+    /// 返回 false = 该 pid 无裁决（aya 对 delete ENOENT 报 SyscallError 而非 KeyNotFound）
+    pub fn remove(&mut self, pid: u32) -> anyhow::Result<bool> {
+        match self.inner.remove(&Self::key(pid)) {
+            Ok(_) => Ok(true),
+            Err(aya::maps::MapError::SyscallError(aya::sys::SyscallError { io_error, .. }))
+                if io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(anyhow::anyhow!("删除裁决失败: {}", e)),
+        }
+    }
+
+    pub fn entries(&self) -> Vec<(u32, u64, u8)> {
+        let mut out = Vec::new();
+        for kv in self.inner.iter() {
+            if let Ok((key, value)) = kv {
+                let pid = u32::from_ne_bytes(key[..4].try_into().unwrap_or([0; 4]));
+                let expire = u64::from_ne_bytes(value[..8].try_into().unwrap_or([0; 8]));
+                out.push((pid, expire, value[8]));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -477,5 +617,74 @@ mod kernel_sync_tests {
         let (_, expire, _) = calls[0];
         // ttl=0 → default_ttl=300s，内核 expire 应落在 ~300s 后而非 0（0 是永久语义，不能混用）
         assert!(expire > monotonic_now_ns() + 299_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod user_kill_tests {
+    use super::*;
+
+    fn set(v: &[u32]) -> std::collections::HashSet<u32> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn test_kills_active_decision_once() {
+        let mut killed = HashMap::new();
+        let now = 1_000_000;
+        let entries = [(111, now + 60_000_000, BlockReason::Manual as u8)];
+        let fired = user_kill_tick(&entries, &mut killed, &set(&[]), now, |p| {
+            assert_eq!(p, 111);
+            true
+        });
+        assert_eq!(fired.len(), 1);
+        // 下一轮同 expire 不重复杀
+        let fired2 = user_kill_tick(&entries, &mut killed, &set(&[]), now, |_| true);
+        assert!(fired2.is_empty());
+    }
+
+    #[test]
+    fn test_permanent_and_expired() {
+        let mut killed = HashMap::new();
+        let now = 1_000_000;
+        // expire=0 永久；expire<now 已过期不杀
+        let entries = [(1, 0u64, 5u8), (2, now - 1, 1u8)];
+        let fired = user_kill_tick(&entries, &mut killed, &set(&[]), now, |_| true);
+        assert_eq!(fired, vec![(1, BlockReason::Manual)]);
+    }
+
+    #[test]
+    fn test_protected_and_self_skipped() {
+        let mut killed = HashMap::new();
+        let now = 1_000_000;
+        let entries = [(1, 0u64, 5u8), (42, 0u64, 5u8), (0, 0u64, 5u8)];
+        let fired = user_kill_tick(&entries, &mut killed, &set(&[1, 42]), now, |_| {
+            panic!("protected 条目不应触发 kill")
+        });
+        assert!(fired.is_empty());
+    }
+
+    #[test]
+    fn test_rearm_on_expire_change() {
+        let mut killed = HashMap::new();
+        let now = 1_000_000;
+        let e1 = [(111u32, now + 60_000_000u64, 5u8)];
+        user_kill_tick(&e1, &mut killed, &set(&[]), now, |_| true);
+        // 同 pid 重新裁决（新 expire）→ 再杀
+        let e2 = [(111u32, now + 120_000_000u64, 1u8)];
+        let fired = user_kill_tick(&e2, &mut killed, &set(&[]), now, |_| true);
+        assert_eq!(fired, vec![(111, BlockReason::RuleMatch)]);
+    }
+
+    #[test]
+    fn test_kill_failure_does_not_remember() {
+        let mut killed = HashMap::new();
+        let now = 1_000_000;
+        let entries = [(111, 0u64, 5u8)];
+        // kill 失败不记 killed，下轮重试
+        let fired = user_kill_tick(&entries, &mut killed, &set(&[]), now, |_| false);
+        assert!(fired.is_empty());
+        let fired2 = user_kill_tick(&entries, &mut killed, &set(&[]), now, |_| true);
+        assert_eq!(fired2.len(), 1);
     }
 }

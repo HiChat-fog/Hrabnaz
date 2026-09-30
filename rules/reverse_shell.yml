@@ -1,3 +1,4 @@
+# reverse_shell.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "反弹Shell检测"
   description: "检测通过 bash -i 或 /dev/tcp 建立的反弹 Shell 连接"
   severity: critical
