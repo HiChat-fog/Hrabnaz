@@ -214,24 +214,27 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
                 if entries.is_empty() {
                     continue;
                 }
-                let fired = {
+                let outcome = {
                     let mut killed = killed.lock().await;
                     ks_engine::blocker::user_kill_tick(
                         &entries,
                         &mut killed,
                         &protected_for_kill,
+                        // comm 可伪造（prctl PR_SET_NAME），与内核 ks_check_block 同款守卫：
+                        // 从 /tmp、/dev/shm 等可疑路径启动的进程不享受 comm 豁免
+                        |pid| {
+                            ks_engine::blocker::comm_of(pid)
+                                .is_some_and(|comm| protect.iter().any(|p| *p == comm))
+                                && !ks_engine::blocker::exe_path_suspicious(pid)
+                        },
                         ks_engine::blocker::monotonic_now_ns(),
                         ks_engine::blocker::kill_pid_sigkill,
                     )
                 };
-                for (pid, reason) in fired {
-                    // comm 保护兜底：内核 ks_check_block 只在 Modern 生效，killer 侧同样豁免
-                    if let Some(comm) = ks_engine::blocker::comm_of(pid) {
-                        if protect.iter().any(|p| *p == comm) {
-                            log::info!("跳过实杀 pid={} (comm={} 在保护名单)", pid, comm);
-                            continue;
-                        }
-                    }
+                for pid in outcome.exempt {
+                    log::info!("跳过实杀 pid={} (comm 在保护名单且 exe 路径可信)", pid);
+                }
+                for (pid, reason) in outcome.fired {
                     log::info!("用户态实杀 pid={} (reason={}, 内核无 bpf_send_signal)", pid, reason);
                     println!(
                         "  {} PID {} 用户态实杀 ({}), 非Modern tier由ks补杀",

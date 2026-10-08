@@ -37,12 +37,19 @@ static __always_inline int ks_comm_protected(void) {
     return p && *p == 1;
 }
 
+/* ks_exe_path_suspicious 定义在 ks_semantics.h（本头之后包含），前向声明以便
+   ks_check_block 复用同一套防伪造守卫 */
+static __always_inline int ks_exe_path_suspicious(void);
+
 static __always_inline int ks_check_block(u32 pid) {
     struct block_key bk = { .pid = pid, ._pad_blk = 0 };
     struct block_value *bv = bpf_map_lookup_elem(&block_decisions, &bk);
     if (!bv) return 0;
     if (bv->expire_ns == 0 || bpf_ktime_get_ns() < bv->expire_ns) {
-        if (!ks_current_protected() && !ks_comm_protected())
+        /* comm 是进程自设的（prctl PR_SET_NAME），可伪造；从 /tmp、/dev/shm
+           等可疑路径启动的进程即使 comm 撞上保护名单也不豁免 */
+        if (!ks_current_protected() &&
+            !(ks_comm_protected() && !ks_exe_path_suspicious()))
             bpf_send_signal(9);
         return 1;
     }

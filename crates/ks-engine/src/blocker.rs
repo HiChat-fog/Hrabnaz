@@ -247,19 +247,31 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// 一轮实杀的结果：实际执行的 pid 与被豁免跳过的 pid。
+/// 豁免必须在 kill 之前判定——comm 是进程自设的，且读 comm 需要进程还活着。
+pub struct KillTickOutcome {
+    pub fired: Vec<(u32, BlockReason)>,
+    pub exempt: Vec<u32>,
+}
+
 /// 非 Modern tier 的用户态实杀：老内核无 `bpf_send_signal`，`ks_check_block` 只查表不杀，
 /// 由用户态读 block_decisions 全表补一刀（ADR-011 闭环在 Legacy/Ancient 上的出口）。
 ///
-/// 纯函数便于测试：entries 为内核 map 全表，killed 记录"上次杀时的 expire"
-/// （expire 变了说明同 pid 被重新裁决，要再杀），返回本轮实际执行 kill 的 pid 列表。
+/// 纯函数便于测试：entries 为内核 map 全表，killed 记录"上次处理时的 expire"
+/// （expire 变了说明同 pid 被重新裁决，要再处理），is_exempt 在 kill 前判定豁免
+/// （保护名单、comm 匹配等），返回本轮实际执行 kill 的 pid 列表与被跳过的 pid 列表。
 pub fn user_kill_tick(
     entries: &[(u32, u64, u8)],
     killed: &mut HashMap<u32, u64>,
     protected: &std::collections::HashSet<u32>,
+    is_exempt: impl Fn(u32) -> bool,
     now_mono_ns: u64,
     kill_fn: impl Fn(u32) -> bool,
-) -> Vec<(u32, BlockReason)> {
-    let mut fired = Vec::new();
+) -> KillTickOutcome {
+    let mut out = KillTickOutcome {
+        fired: Vec::new(),
+        exempt: Vec::new(),
+    };
     for &(pid, expire, reason) in entries {
         if pid == 0 || protected.contains(&pid) {
             continue;
@@ -270,14 +282,20 @@ pub fn user_kill_tick(
         if killed.get(&pid) == Some(&expire) {
             continue;
         }
+        // 豁免判定先于 kill：读 /proc/pid/comm 需要进程存活，且豁免进程不能被杀
+        if is_exempt(pid) {
+            killed.insert(pid, expire);
+            out.exempt.push(pid);
+            continue;
+        }
         if kill_fn(pid) {
             killed.insert(pid, expire);
-            fired.push((pid, BlockReason::from_u8(reason)));
+            out.fired.push((pid, BlockReason::from_u8(reason)));
         } else {
             killed.remove(&pid);
         }
     }
-    fired
+    out
 }
 
 pub fn kill_pid_sigkill(pid: u32) -> bool {
@@ -317,6 +335,21 @@ pub fn comm_of(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
         .map(|s| s.trim().to_string())
+}
+
+/// 与内核 `ks_exe_path_suspicious` 同款判定：exe 位于 /tmp、/dev/shm、/var/tmp
+/// 等可写目录的进程不享受 comm 豁免（comm 可由 prctl(PR_SET_NAME) 伪造）。
+/// 读不到 exe（内核线程、权限不足、进程已退出）时不判可疑。
+#[cfg(target_os = "linux")]
+pub fn exe_path_suspicious(pid: u32) -> bool {
+    const PREFIXES: [&str; 3] = ["/tmp", "/dev/shm", "/var/tmp"];
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(p) => {
+            let s = p.to_string_lossy();
+            PREFIXES.iter().any(|pre| s.starts_with(pre))
+        }
+        Err(_) => false,
+    }
 }
 
 /// 跨进程访问 pinned block_decisions 的薄封装（`ks block` 用）。
@@ -633,14 +666,30 @@ mod user_kill_tests {
         let mut killed = HashMap::new();
         let now = 1_000_000;
         let entries = [(111, now + 60_000_000, BlockReason::Manual as u8)];
-        let fired = user_kill_tick(&entries, &mut killed, &set(&[]), now, |p| {
+        let out = user_kill_tick(&entries, &mut killed, &set(&[]), |_| false, now, |p| {
             assert_eq!(p, 111);
             true
         });
-        assert_eq!(fired.len(), 1);
+        assert_eq!(out.fired.len(), 1);
         // 下一轮同 expire 不重复杀
-        let fired2 = user_kill_tick(&entries, &mut killed, &set(&[]), now, |_| true);
-        assert!(fired2.is_empty());
+        let out2 = user_kill_tick(&entries, &mut killed, &set(&[]), |_| false, now, |_| true);
+        assert!(out2.fired.is_empty());
+    }
+
+    #[test]
+    fn test_exempt_checked_before_kill() {
+        // 豁免进程绝不能被 kill_fn 碰到（读 comm 需要进程存活，且豁免意味着不杀）
+        let mut killed = HashMap::new();
+        let now = 1_000_000;
+        let entries = [(42, 0u64, BlockReason::Manual as u8)];
+        let out = user_kill_tick(&entries, &mut killed, &set(&[]), |p| p == 42, now, |_| {
+            panic!("豁免进程不应进入 kill_fn")
+        });
+        assert!(out.fired.is_empty());
+        assert_eq!(out.exempt, vec![42]);
+        // 已记录，下轮不再重复判定
+        let out2 = user_kill_tick(&entries, &mut killed, &set(&[]), |_| true, now, |_| true);
+        assert!(out2.exempt.is_empty() && out2.fired.is_empty());
     }
 
     #[test]
@@ -649,8 +698,8 @@ mod user_kill_tests {
         let now = 1_000_000;
         // expire=0 永久；expire<now 已过期不杀
         let entries = [(1, 0u64, 5u8), (2, now - 1, 1u8)];
-        let fired = user_kill_tick(&entries, &mut killed, &set(&[]), now, |_| true);
-        assert_eq!(fired, vec![(1, BlockReason::Manual)]);
+        let out = user_kill_tick(&entries, &mut killed, &set(&[]), |_| false, now, |_| true);
+        assert_eq!(out.fired, vec![(1, BlockReason::Manual)]);
     }
 
     #[test]
@@ -658,10 +707,10 @@ mod user_kill_tests {
         let mut killed = HashMap::new();
         let now = 1_000_000;
         let entries = [(1, 0u64, 5u8), (42, 0u64, 5u8), (0, 0u64, 5u8)];
-        let fired = user_kill_tick(&entries, &mut killed, &set(&[1, 42]), now, |_| {
+        let out = user_kill_tick(&entries, &mut killed, &set(&[1, 42]), |_| false, now, |_| {
             panic!("protected 条目不应触发 kill")
         });
-        assert!(fired.is_empty());
+        assert!(out.fired.is_empty());
     }
 
     #[test]
@@ -669,11 +718,11 @@ mod user_kill_tests {
         let mut killed = HashMap::new();
         let now = 1_000_000;
         let e1 = [(111u32, now + 60_000_000u64, 5u8)];
-        user_kill_tick(&e1, &mut killed, &set(&[]), now, |_| true);
+        user_kill_tick(&e1, &mut killed, &set(&[]), |_| false, now, |_| true);
         // 同 pid 重新裁决（新 expire）→ 再杀
         let e2 = [(111u32, now + 120_000_000u64, 1u8)];
-        let fired = user_kill_tick(&e2, &mut killed, &set(&[]), now, |_| true);
-        assert_eq!(fired, vec![(111, BlockReason::RuleMatch)]);
+        let out = user_kill_tick(&e2, &mut killed, &set(&[]), |_| false, now, |_| true);
+        assert_eq!(out.fired, vec![(111, BlockReason::RuleMatch)]);
     }
 
     #[test]
@@ -682,9 +731,9 @@ mod user_kill_tests {
         let now = 1_000_000;
         let entries = [(111, 0u64, 5u8)];
         // kill 失败不记 killed，下轮重试
-        let fired = user_kill_tick(&entries, &mut killed, &set(&[]), now, |_| false);
-        assert!(fired.is_empty());
-        let fired2 = user_kill_tick(&entries, &mut killed, &set(&[]), now, |_| true);
-        assert_eq!(fired2.len(), 1);
+        let out = user_kill_tick(&entries, &mut killed, &set(&[]), |_| false, now, |_| false);
+        assert!(out.fired.is_empty());
+        let out2 = user_kill_tick(&entries, &mut killed, &set(&[]), |_| false, now, |_| true);
+        assert_eq!(out2.fired.len(), 1);
     }
 }
