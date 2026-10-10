@@ -105,9 +105,8 @@ systemd部署用deploy/install.sh,Type=notify,capability限到CAP_BPF、CAP_PERF
 ## 未来工作
 
 - 架构方向:内嵌 BTF 重定位正式化,aya 上游化。3.10 真机已经证明 CO-RE 重定位完全在用户态完成,内核侧 BTF 支持根本不是必要条件，只要同一 CO-RE 对象配上目标内核的 BTF 就能在老内核跑,按内核版本硬编码偏移的 nobtf 路径没有存在必要。暂定未来落地分三步:①把本项目积累的三层 vendor 补丁整理成可提交上游的系列(老内核 BTF 清洗:kind_flag/位域结构/空枚举值名;BPF_PROG_LOAD 字段按 5.0 门控;<4.17 kprobe 条目先关 perf fd 再删的 EBUSY 修复);②补齐下限验证,vanilla 4.4/4.9(Debian 9/Ubuntu 16.04 世代)大概率可行,3.10 能跑靠的是 RHEL backport;③BTF 获取自动化(BTFHub 按 release 拉取,或 debuginfo+pahole 现场生成),最终删除 nobtf 编译档与 C loader,"每个内核版本编译一份硬编码偏移对象"的模式退役
-- 非 Modern tier 实杀闭环: bpf_send_signal 要 5.5+,3.10/4.19 的 block 决策已写入内核 map 但不实杀，补一个用户态 killer(轮询 map 读出待杀 PID 后用户态 SIGKILL),让 enforce 在全 tier 闭环
+- unsafe 收敛: 当前引擎+CLI 共 20 处(聚合器字节流解析 11、libc 封装 6、Pod 声明 2、rlimit 1)。聚合器大头可用 bytemuck/zerocopy 的 try_from_bytes 带校验安全转换替代手工 read_unaligned,越界检查从人工 if 升级为库返回 Result,与编译期布局断言成双保险;libc 调用边界(6 处)不可消除但收拢到单一 sys 模块统一审计。终态: unsafe ≤6 处、集中单模块,每处 unsafe 的存在理由只剩"语言边界"一种
 - legacy 长稳: 4.19 走完功能验证但没跑过 systemd 长稳 soak,纳入长稳矩阵(本地 QEMU 即可)
-- CI: GitHub Actions 跑无 root 测试套(198 测试 + BTF 等价性/毒化回归),push 即验,不让"BTF 缺类型假绿"这类问题靠人肉发现
 - BTF 预埋扩容: BTFHub 覆盖的 Ubuntu 4.15/5.4、RHEL8/9 等常见企业内核,每份约十分钟接入并被等价性测试自动验证
 - 单线程吞吐: 瓶颈应为取事件环节，处理层61μs/事件(理论 16400/s),实测 1200-1977/s,差约 10 倍;已试无效的是 ringbuf 加大(1MB→16MB,drop 未减)和 yield_now 替代 sleep,瓶颈在 aya 逐条 next() 的取事件结构,不在容量也不在轮询间隔。方向全部保持在单消费者架构内:每 tick 批量 drain 各 map 再统一处理(消掉逐条取的调度开销)、复用缓冲消除每事件 to_vec 拷贝、负载高时自适应 busy-poll、处理侧把 anomaly recent(1000) 全量 clone(占处理层 45%)改 per-pid 计数复用(27μs→<1μs)。 CLoader 批量版因 3.10 真机卡死回退,但 3.10 已改走 aya perfbuf,旧实现与新路径无关。
 - 清理: C loader/nobtf 编译档已无真实场景,随架构方向落地考虑是否删除
