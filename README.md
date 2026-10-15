@@ -14,7 +14,7 @@
 
 *奥丁双肩上栖息着的两只渡鸦，其名Huginn（福金）& Muninn（雾尼）*
 
-**Hrabnaz**    ~~KernelSentinel · 内核哨兵~~
+**Hrabnaz** 
 
 *Huginn thinks. Muninn remembers. Hrabnaz judges.*
 

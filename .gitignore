@@ -21,9 +21,9 @@ dist/
 # 文档不进仓库(只留README)
 /docs/
 /realdocs/
-/ARCHITECTURE.md
 /CONTRIBUTING.md
-/ROADMAP.md
+!ARCHITECTURE.md
+!ROADMAP.md
 /vendor/aya/*.md
 /.github/ISSUE_TEMPLATE/
 /.github/pull_request_template.md
