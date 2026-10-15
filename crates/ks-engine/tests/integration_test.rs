@@ -1661,3 +1661,101 @@ async fn test_ebpf_tamper_rule_critical() {
     assert!(forensic.event_count() >= 1, "forensic event_count应 >= 1");
     assert!(aggregator.seq() >= 1, "aggregator seq应 >= 1");
 }
+
+/// H-1.2 等价性测试补 udp 路径用例：探针 kprobe_udp_sendmsg 发出的 net_event
+/// 原始字节必须能完整解码出真实的 saddr/sport/daddr/dport。
+///
+/// 背景：3.10(RHEL7) 的 udp_sendmsg 带 kiocb 首参，修复前探针把 args[0] 当 sk，
+/// 真机上 UDP 事件 daddr/dport 恒 0（76 条全 0），DNS 判定分支（dport==53）永不可达。
+/// 本用例锁定字节级契约：NetEvent 各字段在 native 字节布局下的解码结果，
+/// 与 e2e 真机验证（3.10 dport=53 事件 164 条 + DNS 隧道告警）互为证据。
+#[test]
+fn test_udp_sendmsg_net_event_raw_bytes_decode() {
+    let make_udp = |saddr: u32, sport: u16, daddr: u32, dport: u16, ts: u64| {
+        let mut header = EventHeader {
+            event_type: 24,
+            _pad1: 0,
+            timestamp_ns: ts,
+            pid: 10702,
+            tid: 10702,
+            uid: 0,
+            ppid: 0,
+            comm: [0; 16],
+            syscall_nr: 44,
+            _pad2: 0,
+            retval: 0,
+        };
+        header.comm[..6].copy_from_slice(b"python");
+        NetEvent {
+            header,
+            saddr,
+            daddr,
+            sport,
+            dport,
+            proto: 17,
+            family: af::AF_INET,
+            saddr6: [0u8; 16],
+            daddr6: [0u8; 16],
+            _pad3: [0u8; 2],
+        }
+    };
+
+    // 真机实测样本形态：内网 saddr、公网 DNS daddr、非 53 源端口
+    let event = make_udp(
+        ipv4_to_u32("172.24.46.21"),
+        51821,
+        ipv4_to_u32("100.100.2.136"),
+        53,
+        2250834984494223,
+    );
+    let mut agg = EventAggregator::new(100);
+    let decoded = agg.decode(&encode_struct(&event)).expect("UDP net_event 应可解码");
+
+    assert_eq!(decoded.header.event_type, 24);
+    assert_eq!(decoded.comm, "python");
+    assert_eq!(decoded.proto.as_ref().unwrap(), "UDP");
+    assert_eq!(decoded.saddr.as_ref().unwrap(), "172.24.46.21");
+    assert_eq!(decoded.sport.unwrap(), 51821);
+    assert_eq!(
+        decoded.daddr.as_ref().unwrap(),
+        "100.100.2.136",
+        "daddr 必须解码出真实目的地（3.10 修复前恒 0.0.0.0）"
+    );
+    assert_eq!(
+        decoded.dport.unwrap(),
+        53,
+        "dport 必须解码出真实端口（3.10 修复前恒 0，dport==53 判定永不可达）"
+    );
+
+    // dport!=0 是 DNS 规则的可达性前提：dport==53 的 not_regex 公网地址规则必须命中
+    let mut detector = DetectionEngine::new();
+    detector
+        .load_rules_from_yaml(
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/dns_tunnel.yml"),
+            )
+            .unwrap()
+            .as_str(),
+        )
+        .unwrap();
+    let matches = detector.match_event(&decoded);
+    assert!(
+        !matches.is_empty(),
+        "修复后 UDP:53 事件应命中 dns_tunnel.yml 规则"
+    );
+
+    // 非外部 DNS 的内网查询不命中公网规则
+    let internal = make_udp(
+        ipv4_to_u32("172.24.46.21"),
+        40000,
+        ipv4_to_u32("172.24.0.2"),
+        53,
+        2250835000000000,
+    );
+    let decoded_internal = agg.decode(&encode_struct(&internal)).unwrap();
+    let matches_internal = detector.match_event(&decoded_internal);
+    assert!(
+        matches_internal.is_empty(),
+        "内网 DNS 查询不应命中公网 DNS 规则"
+    );
+}

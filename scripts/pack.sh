@@ -33,7 +33,7 @@ echo "[2/4] 组装 staging -> kernelsentinel-${VERSION}/"
 mkdir -p "$PKG/deploy" "$PKG/rules" "$PKG/target/release"
 # 二进制放 target/release/(gnu路径名),install.sh 的 KS_BIN 默认找这里
 cp "$BIN" "$PKG/target/release/kernelsentinel"
-cp deploy/install.sh deploy/uninstall.sh deploy/kernelsentinel.service "$PKG/deploy/"
+cp deploy/install.sh deploy/uninstall.sh deploy/kernelsentinel.service deploy/kernelsentinel-watchdog.service deploy/kernelsentinel-watchdog.timer "$PKG/deploy/"
 cp rules/*.yml "$PKG/rules/"
 cat > "$PKG/README.md" <<EOF
 # KernelSentinel v${VERSION} 交付包

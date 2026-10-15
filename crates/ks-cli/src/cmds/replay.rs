@@ -79,9 +79,16 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
         println!();
 
         if verification.is_valid {
+            // 锚定于上一世代（首条 prev_hash 指向前代文件）是按天滚动/重启续链的
+            // 正常形态：链校验只看文件内连续性与逐条自身哈希
+            let anchor_note = if verification.anchored {
+                " (首条锚定于上一世代)"
+            } else {
+                ""
+            };
             println!(
-                "  [✓] 链完整性: 通过 — {} 条记录, 链完整无断裂",
-                verification.total_records
+                "  [✓] 链完整性: 通过 — {} 条记录, 链完整无断裂{}",
+                verification.total_records, anchor_note
             );
         } else {
             println!(
@@ -263,6 +270,7 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
                 "valid": verification.is_valid,
                 "total_records": verification.total_records,
                 "broken_at": verification.broken_at,
+                "anchored": verification.anchored,
             },
             "events": event_count,
             "alerts": alert_count,
@@ -286,7 +294,11 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
     println!(
         "  链完整性: {}",
         if verification.is_valid {
-            "通过 ✓"
+            if verification.anchored {
+                "通过 ✓ (锚定于上一世代)"
+            } else {
+                "通过 ✓"
+            }
         } else {
             "断裂 ✗"
         }

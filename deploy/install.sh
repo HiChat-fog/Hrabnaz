@@ -43,6 +43,18 @@ echo "=== 启用服务 ==="
 systemctl daemon-reload
 systemctl enable kernelsentinel
 
+# 5. 可选: watchdog（H-1.6 引擎心跳停摆自动恢复）
+WATCHDOG_TIMER=/etc/systemd/system/kernelsentinel-watchdog.timer
+WATCHDOG_UNIT=/etc/systemd/system/kernelsentinel-watchdog.service
+install -m 0644 "$SCRIPT_DIR/kernelsentinel-watchdog.service" "$WATCHDOG_UNIT"
+install -m 0644 "$SCRIPT_DIR/kernelsentinel-watchdog.timer" "$WATCHDOG_TIMER"
+if [[ "${KS_WITH_WATCHDOG:-0}" == "1" ]]; then
+    systemctl enable kernelsentinel-watchdog.timer
+    echo "[5/5] watchdog timer 已启用 (每分钟巡检引擎心跳)"
+else
+    echo "[5/5] watchdog 已安装未启用 (KS_WITH_WATCHDOG=1 重新执行 install.sh 启用)"
+fi
+
 echo ""
 echo "✅ 安装完成（CLI-first 检测守护进程，单二进制自包含）"
 echo "   启动: systemctl start kernelsentinel"

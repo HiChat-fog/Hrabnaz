@@ -368,6 +368,7 @@ impl ForensicLogger {
         let mut prev_hash = GENESIS_HASH.to_string();
         let mut total_records = 0u64;
         let mut broken_at: Option<u64> = None;
+        let mut anchored = false;
         let hasher = Sha256Hash;
 
         for line in reader.lines().map_while(Result::ok) {
@@ -376,14 +377,35 @@ impl ForensicLogger {
             }
             total_records += 1;
 
-            let record: serde_json::Value = serde_json::from_str(&line)?;
+            // 解析失败的行（半行：引擎被 kill 于 write 中途，或 replay 读到正在写的活动文件
+            // 的写入瞬间）计入 broken_at 而非整体报错——取证工具的本分是"报告问题位置"，
+            // 让使用者能定位到行号，而不是一条 JSON 异常吞掉整份校验结论
+            let record: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => {
+                    if broken_at.is_none() {
+                        broken_at = Some(total_records);
+                    }
+                    prev_hash = String::new();
+                    continue;
+                }
+            };
             let stored_prev = record
                 .get("prev_hash")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let stored_hash = record.get("hash").and_then(|v| v.as_str()).unwrap_or("");
 
-            if stored_prev != prev_hash && broken_at.is_none() {
+            // 校验语义 = "文件内连续性 + 逐条自身哈希"（ROADMAP H-1.1）：
+            // 首条 prev_hash 不要求等于创世值——日志按天滚动/重启续链后首条锚指向前代
+            // 文件（常被轮转清理），非创世只说明"锚定于上一世代"，不是篡改；
+            // 第二条起 prev_hash 必须等于前一条 hash（文件内连续，删/插记录在此暴露），
+            // 每条自身哈希必须与重算一致（改内容在此暴露）。
+            if total_records == 1 {
+                if stored_prev != GENESIS_HASH {
+                    anchored = true;
+                }
+            } else if stored_prev != prev_hash && broken_at.is_none() {
                 broken_at = Some(total_records);
             }
 
@@ -416,6 +438,7 @@ impl ForensicLogger {
             total_records,
             is_valid: broken_at.is_none(),
             broken_at,
+            anchored,
         })
     }
 }
@@ -425,6 +448,9 @@ pub struct ChainVerification {
     pub total_records: u64,
     pub is_valid: bool,
     pub broken_at: Option<u64>,
+    /// 首条 prev_hash 非创世值：文件锚定于上一世代（按天滚动/重启续链的正常形态），
+    /// 不是篡改证据。真篡改由文件内连续性 + 逐条自身哈希两道检查兜住
+    pub anchored: bool,
 }
 
 impl Drop for ForensicLogger {
@@ -704,5 +730,165 @@ mod tests {
             logger.flush().unwrap();
         }
         assert!(path.exists());
+    }
+
+    /// 手工追加一条链记录：与 log_event 相同的规范化哈希
+    /// （clean 记录去 hash/prev_hash 后按 BTreeMap 序列化再 SHA-256）。
+    /// 返回该条 hash，供下一条续链
+    fn append_chained_record(path: &Path, mut record: serde_json::Value, prev_hash: &str) -> String {
+        use std::io::Write as _;
+        record["prev_hash"] = serde_json::Value::String(prev_hash.to_string());
+        let mut clean = record.clone();
+        if let Some(m) = clean.as_object_mut() {
+            m.remove("hash");
+            m.remove("prev_hash");
+        }
+        let btree: BTreeMap<String, serde_json::Value> = clean
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_string(&btree).unwrap().as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        record["hash"] = serde_json::Value::String(hash.clone());
+        let mut f = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&record).unwrap()).unwrap();
+        hash
+    }
+
+    /// 读文件最后一条记录的 hash（链尾），供跨文件续链测试用
+    fn chain_tail_of(path: &Path) -> String {
+        let f = File::open(path).unwrap();
+        let last = BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .expect("文件至少应有一条记录");
+        serde_json::from_str::<serde_json::Value>(&last)
+            .unwrap()
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    fn plain_record(seq: u64) -> serde_json::Value {
+        serde_json::json!({
+            "seq": seq, "timestamp_ns": seq * 1_000_000_000, "event_type": 2,
+            "pid": 100, "tid": 0, "uid": 0, "ppid": 1, "comm": "test",
+            "syscall_nr": 0, "retval": 0,
+        })
+    }
+
+    /// H-1.1 单测①：跨文件续链（首条 prev_hash 锚指上一世代）应通过且 anchored=true
+    #[test]
+    fn test_verify_anchored_cross_file_continuation_passes() {
+        let dir = TempDir::new().unwrap();
+        // 世代 1：正常创世链
+        let prev_file = dir.path().join("events_gen1.jsonl");
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=3 {
+            prev = append_chained_record(&prev_file, plain_record(i), &prev);
+        }
+        // 世代 2（按天滚动后的新文件）：首条锚指向 gen1 的链尾
+        let cur_file = dir.path().join("events_gen2.jsonl");
+        let mut prev = chain_tail_of(&prev_file);
+        for i in 4..=7 {
+            prev = append_chained_record(&cur_file, plain_record(i), &prev);
+        }
+        let v = ForensicLogger::verify_chain(&cur_file).unwrap();
+        assert!(v.is_valid, "锚定文件应通过校验, 却在第 {:?} 条断裂", v.broken_at);
+        assert!(v.anchored, "首条 prev_hash 非创世应标注 anchored");
+        assert_eq!(v.total_records, 4);
+    }
+
+    /// H-1.1 单测②：真篡改仍能精确定位（内容改动 → 自身哈希不匹配）
+    #[test]
+    fn test_verify_anchored_file_detects_content_tamper() {
+        let dir = TempDir::new().unwrap();
+        let cur_file = dir.path().join("events_gen2.jsonl");
+        let mut prev = String::from("aa11"); // 任意上一世代链尾
+        for i in 4..=6 {
+            prev = append_chained_record(&cur_file, plain_record(i), &prev);
+        }
+        // 篡改第 2 条内容（pid 100→999），hash 保持不变
+        let content = std::fs::read_to_string(&cur_file).unwrap();
+        let tampered: Vec<String> = content
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 1 {
+                    l.replace(r#""pid":100"#, r#""pid":999"#)
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        std::fs::write(&cur_file, tampered.join("\n") + "\n").unwrap();
+        let v = ForensicLogger::verify_chain(&cur_file).unwrap();
+        assert!(!v.is_valid);
+        assert_eq!(v.broken_at, Some(2), "内容篡改应在第 2 条被自身哈希检查定位");
+    }
+
+    /// H-1.1 单测③：文件内删/插记录仍被文件内连续性检查抓住
+    #[test]
+    fn test_verify_anchored_file_detects_record_deletion() {
+        let dir = TempDir::new().unwrap();
+        let cur_file = dir.path().join("events_gen2.jsonl");
+        let mut prev = String::from("bb22");
+        for i in 4..=6 {
+            prev = append_chained_record(&cur_file, plain_record(i), &prev);
+        }
+        // 删除第 2 条：第 3 条的 prev_hash 将对不上第 1 条的 hash
+        let content = std::fs::read_to_string(&cur_file).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let kept: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, l)| *l)
+            .collect();
+        std::fs::write(&cur_file, kept.join("\n") + "\n").unwrap();
+        let v = ForensicLogger::verify_chain(&cur_file).unwrap();
+        assert!(!v.is_valid);
+        assert_eq!(v.broken_at, Some(2), "删记录应在缺口后第一条被连续性检查定位");
+    }
+
+    /// H-1.1 单测④：创世链语义不变——正常单文件链通过且不标注 anchored
+    #[test]
+    fn test_verify_genesis_file_not_anchored() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=3 {
+            prev = append_chained_record(&path, plain_record(i), &prev);
+        }
+        let v = ForensicLogger::verify_chain(&path).unwrap();
+        assert!(v.is_valid);
+        assert!(!v.anchored, "创世链不应标注 anchored");
+    }
+
+    /// 半行（写入中途被 kill / 活动文件截断读）计入 broken_at 而非整体 Err，
+    /// replay 能定位到行号而不是"校验命令本身失败"
+    #[test]
+    fn test_verify_torn_line_reports_position_not_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=3 {
+            prev = append_chained_record(&path, plain_record(i), &prev);
+        }
+        // 追加半行（截断的 JSON）
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"{\"seq\":4,\"comm\":\"te").unwrap();
+        }
+        let v = ForensicLogger::verify_chain(&path).unwrap();
+        assert!(!v.is_valid);
+        assert_eq!(v.broken_at, Some(4), "半行应作为第 4 条记录断裂报告");
     }
 }

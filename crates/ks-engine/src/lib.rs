@@ -18,4 +18,5 @@ pub mod linux_map_reader;
 pub mod loader;
 pub mod ml_detector;
 pub mod process_tree;
+pub mod rules_integrity;
 pub mod tier_detect;

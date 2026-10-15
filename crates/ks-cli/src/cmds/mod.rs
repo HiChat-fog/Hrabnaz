@@ -7,6 +7,7 @@ pub mod singleton;
 pub mod start;
 pub mod status;
 pub mod stop;
+pub mod watchdog;
 pub mod watch;
 
 /// 运行时状态文件路径（start 写 / status 读 / stop 读后 kill）。
@@ -33,4 +34,12 @@ pub fn status_file_path() -> std::path::PathBuf {
     {
         std::path::PathBuf::from("./ks-status.json")
     }
+}
+
+/// 引擎心跳文件路径（H-1.6 watchdog）：与状态文件同目录（/run/kernelsentinel/ 或 /tmp）。
+/// start 主循环周期性原子更新，watchdog 子命令读它判断引擎消费循环是否停摆
+pub fn heartbeat_file_path() -> std::path::PathBuf {
+    let mut p = status_file_path();
+    p.set_file_name("ks-heartbeat.json");
+    p
 }

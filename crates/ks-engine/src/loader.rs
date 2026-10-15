@@ -477,6 +477,7 @@ impl EbpfLoader {
             "trace_sched_exit_tree",
             "kprobe_vfs_open",
             "kprobe_vfs_write",
+            "kprobe_do_splice_direct",
             "kprobe_vfs_unlink",
             "kprobe_tcp_connect",
             "kprobe_tcp_v6_connect",
@@ -631,6 +632,7 @@ impl EbpfLoader {
             }
             attach_kp!("kprobe_vfs_open", "vfs_open");
             attach_kp!("kprobe_vfs_write", "vfs_write");
+            attach_kp!("kprobe_do_splice_direct", "do_splice_direct");
             attach_kp!("kprobe_vfs_unlink", "vfs_unlink");
             attach_kp!("kprobe_tcp_connect", "tcp_v4_connect");
             attach_kp!("kprobe_tcp_v6_connect", "tcp_v6_connect");
@@ -926,11 +928,12 @@ garbage line
     }
 
     #[test]
-    fn test_probe_list_contains_all_16_programs() {
+    fn test_probe_list_contains_all_17_programs() {
         let loader = EbpfLoader::new();
-        assert_eq!(loader.probes.len(), 16);
+        assert_eq!(loader.probes.len(), 17);
         assert!(loader.probes.contains(&"trace_sys_enter".to_string()));
         assert!(loader.probes.contains(&"trace_sys_exit".to_string()));
+        assert!(loader.probes.contains(&"kprobe_do_splice_direct".to_string()));
         assert!(loader.probes.contains(&"kprobe_tcp_connect".to_string()));
         assert!(loader.probes.contains(&"kprobe_commit_creds".to_string()));
     }

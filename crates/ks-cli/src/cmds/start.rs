@@ -275,6 +275,51 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
     )?));
     let (forensic_tx, forensic_rx) = tokio::sync::mpsc::channel::<ForensicOp>(65536);
     let forensic_sink = ForensicSink { tx: forensic_tx };
+
+    // H-1.5 规则完整性：目录指纹与 KS_RULES_DIGEST 基线比对，快照落取证目录；
+    // MISMATCH 产生审计告警进哈希链留痕；STRICT 模式直接拒绝启动
+    match ks_engine::rules_integrity::check_and_record(Path::new(rules_dir), Path::new(&resolved_log_dir)) {
+        Ok((integrity, verdict)) => {
+            match &verdict {
+                ks_engine::rules_integrity::RulesIntegrityVerdict::NoBaseline => {
+                    println!(
+                        "      规则完整性: 未设 KS_RULES_DIGEST 基线 (指纹 {}…, 快照已记录)",
+                        &integrity.combined_digest[..16.min(integrity.combined_digest.len())]
+                    );
+                }
+                ks_engine::rules_integrity::RulesIntegrityVerdict::Match => {
+                    println!("      规则完整性: 与部署基线一致 ✓");
+                }
+                ks_engine::rules_integrity::RulesIntegrityVerdict::Mismatch { .. } => {
+                    log::warn!(
+                        "[rules-integrity] 规则集与 KS_RULES_DIGEST 基线不一致 — 审计告警将写入取证日志"
+                    );
+                }
+            }
+            if let Some(alert) = ks_engine::rules_integrity::mismatch_alert(&verdict) {
+                let title = alert.title.clone();
+                forensic_sink.log_alert(&alert).await;
+                println!(
+                    "  {} {} (规则集与部署基线不一致, 已写入取证链)",
+                    "完整性".red().bold(),
+                    title.bold()
+                );
+            }
+            if matches!(
+                verdict,
+                ks_engine::rules_integrity::RulesIntegrityVerdict::Mismatch { .. }
+            ) && std::env::var("KS_RULES_DIGEST_STRICT").as_deref() == Ok("1")
+            {
+                anyhow::bail!(
+                    "KS_RULES_DIGEST_STRICT=1 且规则集与部署基线不一致 — 拒绝启动。\
+                     正常变更请用 `ks rules-digest` 更新基线"
+                );
+            }
+        }
+        Err(e) => {
+            println!("      规则完整性: 无法计算指纹 ({}) — 跳过", e);
+        }
+    }
     let forensic_worker_handle = {
         let f = forensic.clone();
         tokio::spawn(async move { forensic_worker(f, forensic_rx).await; })
@@ -292,8 +337,9 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
     super::ui::step(6, 6, "启动规则热加载");
     let hot_reload_rules_dir = rules_dir.to_string();
     let hot_reload_detector = detector.clone();
+    let hot_reload_log_dir = resolved_log_dir.clone();
     tokio::spawn(async move {
-        rule_hot_loader(&hot_reload_detector, &hot_reload_rules_dir).await;
+        rule_hot_loader(&hot_reload_detector, &hot_reload_rules_dir, &hot_reload_log_dir).await;
     });
     println!("      监听规则目录变更: {}", rules_dir);
 
@@ -316,6 +362,31 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
     let mut stats = EventStats::new();
     let anomaly_threshold = config.detection.anomaly_threshold;
     let continue_on_empty = !source.is_mock();
+
+    // H-1.6 引擎心跳：主循环存活即周期性原子刷新心跳文件（含累计消费数），
+    // `ks watchdog` 靠它的年龄判断"消费循环停摆"——进程活着但事件泵死了的窗口
+    let heartbeat_path = super::heartbeat_file_path();
+    let heartbeat_stats = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let heartbeat_stats_writer = heartbeat_stats.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let payload = serde_json::json!({
+                "pid": std::process::id(),
+                "ts_epoch_ms": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                "consumed": heartbeat_stats_writer.load(std::sync::atomic::Ordering::Relaxed),
+            });
+            let tmp = heartbeat_path.with_extension(format!("hb.tmp{}", std::process::id()));
+            if std::fs::write(&tmp, payload.to_string()).is_ok() {
+                let _ = std::fs::rename(&tmp, &heartbeat_path);
+            }
+        }
+    });
 
     let mut sig = std::pin::pin!(tokio::signal::ctrl_c());
     // systemctl stop 发 SIGTERM：不接住的话进程直接死，kprobe 条目/取证 flush 全跳过
@@ -360,7 +431,9 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
                     }
                     Err(e) => return Err(e),
                 };
-                process_event_bytes(&bytes, &aggregator, &detector, &forensic_sink, &chain_reconstructor, &mut stats, anomaly_threshold, &baseline_mgr, &correlation_engine, &process_tree_mgr, &ml_detector, &block_mgr, block_ttl, &block_severity_threshold, &protected_pids).await
+                process_event_bytes(&bytes, &aggregator, &detector, &forensic_sink, &chain_reconstructor, &mut stats, anomaly_threshold, &baseline_mgr, &correlation_engine, &process_tree_mgr, &ml_detector, &block_mgr, block_ttl, &block_severity_threshold, &protected_pids).await?;
+                heartbeat_stats.store(stats.consumed, std::sync::atomic::Ordering::Relaxed);
+                Ok(true)
             } => {
                 match result {
                     Ok(true) => {}
@@ -381,6 +454,8 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
 
     println!();
     println!("{}", "── 安全关闭 ──".cyan().bold());
+    heartbeat_task.abort();
+    let _ = std::fs::remove_file(super::heartbeat_file_path());
     println!("      释放事件源（含 eBPF 探针 fd）...");
     drop(source);
     // 清理本次运行释放到 /tmp 的 ks_loader 与 .o 私有目录
@@ -558,7 +633,15 @@ async fn process_event_bytes(
         let need_heavy_scan = stats.consumed.is_multiple_of(500)
             || !matches.is_empty()
             || !corr_alerts.is_empty();
-        if !is_protected {
+        // H-1.4：天然高频白名单进程（wget/curl/python 等 + KS_BASELINE_HIGHFREQ 扩展）
+        // 跳过基线偏离与 ML 冷启动告警——这两类告警在训练期用固定阈值兜底，
+        // 批量下载/构建这类白名单进程的正常突刺是冷启动误报的主要来源
+        let is_high_freq_comm = !is_protected
+            && baseline_mgr
+                .lock()
+                .await
+                .is_inherently_high_freq(&event.comm);
+        if !is_protected && !is_high_freq_comm {
             if let Some(dev) = baseline_mgr.lock().await.detect_deviation(event.header.pid) {
             let dim = dev
                 .most_deviated_dimension
@@ -583,7 +666,7 @@ async fn process_event_bytes(
             }
         }
 
-        if !is_protected {
+        if !is_protected && !is_high_freq_comm {
             if let Some(ml_result) = ml_detector.lock().await.detect(event.header.pid) {
             let dim_str = ml_result
                 .dimensions
@@ -871,7 +954,7 @@ async fn load_rules(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str) -> 
     Ok(())
 }
 
-async fn rule_hot_loader(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str) {
+async fn rule_hot_loader(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str, log_dir: &str) {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
@@ -914,6 +997,20 @@ async fn rule_hot_loader(detector: &Arc<Mutex<DetectionEngine>>, rules_dir: &str
 
         if changed {
             log::info!("检测到规则文件变更，重新加载...");
+            // H-1.5：热加载前后规则集可能变化，同步落一次完整性快照。
+            // 未设 KS_RULES_DIGEST 时只记录（不比对），供事后回溯对照
+            match ks_engine::rules_integrity::check_and_record(Path::new(rules_dir), Path::new(log_dir)) {
+                Ok((i, v)) => log::info!(
+                    "[rules-integrity] 热加载快照: digest={}… verdict={}",
+                    &i.combined_digest[..16.min(i.combined_digest.len())],
+                    match v {
+                        ks_engine::rules_integrity::RulesIntegrityVerdict::NoBaseline => "no-baseline",
+                        ks_engine::rules_integrity::RulesIntegrityVerdict::Match => "match",
+                        ks_engine::rules_integrity::RulesIntegrityVerdict::Mismatch { .. } => "MISMATCH",
+                    }
+                ),
+                Err(e) => log::warn!("[rules-integrity] 热加载快照失败: {}", e),
+            }
             let mut new_detector = DetectionEngine::new();
             for entry in &entries {
                 let path = entry.path();

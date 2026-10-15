@@ -2,6 +2,7 @@ mod cmds;
 
 use clap::{Parser, Subcommand};
 use colored::control;
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "kernelsentinel")]
@@ -61,6 +62,16 @@ enum Commands {
     Watch {
         #[command(flatten)]
         args: cmds::watch::WatchArgs,
+    },
+    /// 引擎心跳 watchdog：消费循环停摆时 SIGTERM 交由 systemd 拉起
+    Watchdog {
+        #[command(flatten)]
+        args: cmds::watchdog::WatchdogArgs,
+    },
+    /// 生成规则集完整性基线指纹（配合 KS_RULES_DIGEST 部署守卫使用）
+    RulesDigest {
+        #[arg(short, long, default_value = "rules/")]
+        rules_dir: String,
     },
 }
 
@@ -130,6 +141,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Watch { args } => {
             cmds::watch::run(&args).await?;
+        }
+        Commands::Watchdog { args } => {
+            cmds::watchdog::run(&args).await?;
+        }
+        Commands::RulesDigest { rules_dir } => {
+            let integrity = ks_engine::rules_integrity::digest_rules_dir(Path::new(&rules_dir))?;
+            println!("KS_RULES_DIGEST={}", integrity.combined_digest);
+            for (name, hash) in &integrity.files {
+                println!("  {}  {}", hash, name);
+            }
+            println!();
+            println!(
+                "部署守卫: 把 KS_RULES_DIGEST 写入服务环境（或 unit Environment=），\
+                 引擎启动/热加载时自动比对；不一致产生审计告警，KS_RULES_DIGEST_STRICT=1 时拒绝启动"
+            );
         }
     }
     Ok(())

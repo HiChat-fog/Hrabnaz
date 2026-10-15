@@ -48,7 +48,7 @@
 │  检测语义: infer_* 风险映射 / KS_MAYBE_BLOCK 阻断决策                │
 │  裁决通道: block_decisions map / 保护名单                           │
 ├──────────────────────────────────────────────────────────────────┤
-│  内核探针层 (16 个挂载点)                                           │
+│  内核探针层 (17 个挂载点)                                           │
 │  raw_syscalls enter/exit │ sched fork/exec/exit                  │
 │  vfs open/write/unlink │ tcp_v4/v6_connect │ udp_sendmsg         │
 │  tcp_set_state │ tcp_sendmsg │ do_init_module │ ...              │
@@ -97,7 +97,7 @@ kernel-sentinel/
 
 ## 5. 内核探针层 (ks-ebpf)
 
-### 5.1 探针矩阵 — 16 个挂载点（从 SEC 段实测）
+### 5.1 探针矩阵 — 17 个挂载点（从 SEC 段实测）
 
 **tracepoint（5）**：
 
@@ -109,7 +109,7 @@ kernel-sentinel/
 | tracepoint/sched/sched_process_exec | ks_probes_process_tree.h | 更新 comm/exe、create_time 刷新、风险分重置 |
 | tracepoint/sched/sched_process_exit | ks_probes_process_tree.h | 节点退出标记 |
 
-**kprobe/kretprobe（11）**：
+**kprobe/kretprobe（12）**：
 
 | SEC | 文件 | 作用 |
 |---|---|---|
@@ -118,6 +118,7 @@ kernel-sentinel/
 | kprobe/tcp_set_state | ks_probes_net.h | 连接状态机里程碑（经 socket 反查绑定表） |
 | kprobe/tcp_sendmsg | ks_probes_netflow.h | 外传流量累计 |
 | kprobe/vfs_open / vfs_write / vfs_unlink | ks_probes_vfs.h | 文件打开/写/删（敏感文件与勒索行为） |
+| kprobe/do_splice_direct | ks_probes_vfs.h | cp/cat/sendfile 落盘写（绕过 vfs_write 的 splice 路径，H-1.3） |
 | kprobe/do_init_module | ks_probes_lkm.h | LKM 加载主路径（CO-RE 读 mod->name） |
 | kretprobe/load_module | ks_probes_lkm.h | 3.10 无 do_init_module 符号时的回退 |
 | kprobe/commit_creds | ks_probes_syscall.h | 提权（uid 变更）捕获 |

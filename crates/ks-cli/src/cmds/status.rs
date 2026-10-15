@@ -12,7 +12,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
 
     println!("{}", "── 1. eBPF 探针配置 ──".cyan().bold());
     println!();
-    println!("  内置探针（16 个: 5 tracepoint + 11 kprobe，与 loader.rs 实际加载列表一致）");
+    println!("  内置探针（17 个: 5 tracepoint + 12 kprobe，与 loader.rs 实际加载列表一致）");
     println!();
 
     let probes = [
@@ -23,6 +23,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
         ("trace_sched_exit_tree", "tracepoint", "sched/sched_process_exit", "是"),
         ("kprobe_vfs_open", "kprobe", "vfs_open", "是"),
         ("kprobe_vfs_write", "kprobe", "vfs_write", "是"),
+        ("kprobe_do_splice_direct", "kprobe", "do_splice_direct", "是"),
         ("kprobe_vfs_unlink", "kprobe", "vfs_unlink", "是"),
         ("kprobe_tcp_connect", "kprobe", "tcp_v4_connect", "是"),
         ("kprobe_tcp_v6_connect", "kprobe", "tcp_v6_connect", "是"),
@@ -47,7 +48,7 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     }
     println!("{t}");
     println!();
-    println!("  覆盖范围: 系统调用×2 + 进程调度×3 + VFS×3 + 网络栈×5 + 安全探针×3 (共 16 组)");
+    println!("  覆盖范围: 系统调用×2 + 进程调度×3 + VFS×4 + 网络栈×5 + 安全探针×3 (共 17 组)");
     println!("  采集深度: VFS 层 比 syscall 更底层 能捕获内核态操作");
 
     println!();

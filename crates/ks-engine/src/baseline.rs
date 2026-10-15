@@ -62,6 +62,8 @@ pub enum DeviationSeverity {
 }
 
 const WINDOW_DURATION_NS: u64 = 60_000_000_000;
+
+/// 编译期默认的天然高频进程 comm（`inherently_high_freq_comms()` 追加 KS_BASELINE_HIGHFREQ 扩展）
 const INHERENTLY_HIGH_FREQ: &[&str] = &[
     "wget",
     "curl",
@@ -83,6 +85,30 @@ const INHERENTLY_HIGH_FREQ: &[&str] = &[
     "cron",
 ];
 
+/// 天然高频进程 comm 白名单（H-1.4 配置化）：
+/// - 编译期默认覆盖 wget/curl/python/nginx 等常见服务进程；
+/// - `KS_BASELINE_HIGHFREQ` 环境变量按逗号扩展部署环境专属条目（如桌面环境的
+///   chrome 子进程、k8s 节点的 kubelet），引擎启动时读取一次；
+/// - 匹配大小写不敏感（Chrome_ChildIOT 之类子进程 comm 能命中 chrome 条目），
+///   命中后该 pid 不建立 z-score 基线、不报基线偏离（fixed_threshold 冷启动兜底仍在）。
+pub fn inherently_high_freq_comms() -> Vec<String> {
+    let mut comms: Vec<String> = INHERENTLY_HIGH_FREQ.iter().map(|s| s.to_string()).collect();
+    if let Ok(extra) = std::env::var("KS_BASELINE_HIGHFREQ") {
+        for c in extra.split(',') {
+            let c = c.trim();
+            if !c.is_empty() {
+                comms.push(c.to_string());
+            }
+        }
+    }
+    comms
+}
+
+fn is_inherently_high_freq_comm(comms: &[String], comm: &str) -> bool {
+    let lower = comm.to_lowercase();
+    comms.iter().any(|p| lower.contains(&p.to_lowercase()))
+}
+
 pub struct BaselineManager {
     baselines: HashMap<u32, BehaviorBaseline>,
     freq_history: HashMap<u32, Vec<FreqSnapshot>>,
@@ -92,6 +118,8 @@ pub struct BaselineManager {
     fixed_thresholds: FixedThresholds,
     established_pids: HashSet<u32>,
     max_pids: usize,
+    // 启动时解析一次的天然高频名单（默认 + KS_BASELINE_HIGHFREQ 扩展），匹配大小写不敏感
+    high_freq_comms: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,13 +167,14 @@ impl BaselineManager {
                 signal_60s: 10,
             },
             established_pids: HashSet::new(),
+            high_freq_comms: inherently_high_freq_comms(),
         }
     }
 
     pub fn update_from_event(&mut self, event: &DecodedEvent) {
         let pid = event.header.pid;
         let comm = event.comm.clone();
-        let is_high_freq = INHERENTLY_HIGH_FREQ.iter().any(|p| comm.contains(p));
+        let is_high_freq = is_inherently_high_freq_comm(&self.high_freq_comms, &comm);
 
         let history = self.freq_history.entry(pid).or_default();
 
@@ -374,6 +403,11 @@ impl BaselineManager {
     pub fn all_baselines(&self) -> &HashMap<u32, BehaviorBaseline> {
         &self.baselines
     }
+
+    /// comm 是否命中天然高频白名单（大小写不敏感，H-1.4 配置化入口的运行时查询）
+    pub fn is_inherently_high_freq(&self, comm: &str) -> bool {
+        is_inherently_high_freq_comm(&self.high_freq_comms, comm)
+    }
 }
 
 fn calc_baseline(values: impl Iterator<Item = f64>) -> StatBaseline {
@@ -499,5 +533,27 @@ mod tests {
     fn test_severity() {
         assert_eq!(classify_severity(2.5), DeviationSeverity::Low);
         assert_eq!(classify_severity(6.0), DeviationSeverity::Critical);
+    }
+
+    #[test]
+    fn test_high_freq_matching_case_insensitive() {
+        let comms = inherently_high_freq_comms();
+        assert!(is_inherently_high_freq_comm(&comms, "chrome"));
+        // H-1.4：Chrome_ChildIOT 这类子进程 comm 原实现大小写敏感未命中
+        assert!(is_inherently_high_freq_comm(&comms, "Chrome_ChildIOT"));
+        assert!(is_inherently_high_freq_comm(&comms, "NGINX"));
+        assert!(!is_inherently_high_freq_comm(&comms, "ransomware"));
+    }
+
+    #[test]
+    fn test_high_freq_env_extension() {
+        std::env::set_var("KS_BASELINE_HIGHFREQ", "kubelet, my-worker ,");
+        let comms = inherently_high_freq_comms();
+        std::env::remove_var("KS_BASELINE_HIGHFREQ");
+        // 默认条目保留 + 环境变量扩展（去空格、忽略空段）
+        assert!(comms.iter().any(|c| c == "wget"));
+        assert!(comms.iter().any(|c| c == "kubelet"));
+        assert!(comms.iter().any(|c| c == "my-worker"));
+        assert_eq!(comms.iter().filter(|c| c.is_empty()).count(), 0);
     }
 }

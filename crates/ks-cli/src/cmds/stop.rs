@@ -3,9 +3,22 @@ use colored::Colorize;
 use super::ui::{banner, step};
 
 /// kill 前校验目标进程身份：读 /proc/<pid>/ 的 comm 与 exe，
-/// 防 PID 复用或伪造的状态文件把 SIGTERM 发给无关进程
+/// 防 PID 复用或伪造的状态文件把 SIGTERM 发给无关进程。
+/// watchdog 子命令复用同一判定（非 Linux 平台恒 false）
+pub fn verify_ks_process(pid: u32) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+    #[cfg(target_os = "linux")]
+    {
+        verify_ks_process_linux(pid)
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn verify_ks_process(pid: u32) -> bool {
+fn verify_ks_process_linux(pid: u32) -> bool {
     use std::fs;
     let comm = fs::read_to_string(format!("/proc/{}/comm", pid))
         .map(|s| s.trim().to_string())

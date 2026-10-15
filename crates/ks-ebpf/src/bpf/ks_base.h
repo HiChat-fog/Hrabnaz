@@ -116,14 +116,26 @@ typedef __s64 i64;
     if ((pos) >= 0) { \
         u32 _p = (u32)(pos); \
         u32 _n = (u32)(nlen); \
-        u32 _need = (u32)sizeof(nbuf) + 24; \
         if (_n > (u32)sizeof(nbuf) - 1) _n = (u32)sizeof(nbuf) - 1; \
-        if (_p + _need <= (u32)(dst_len)) { \
-            __builtin_memcpy((dst) + _p, (nbuf), sizeof(nbuf)); \
-            (dst)[_p + _n] = '/'; \
-            (pos) = (int)(_p + _n + 1); \
+        if (_n == 0 || (nbuf)[0] == '/') { \
+            /* 根目录的 d_name 是 "/"（旧内核为空串）：只落一个 '/'，不加分隔符。\
+               旧实现照常追加名字+分隔符，路径头变成 "//etc/..."——真机实测\
+               kprobe 写事件 3223/3223 条全部双斜杠，starts_with("/boot")、\
+               "^/var/log/" 类锚定规则在写/删事件上全部失配 */ \
+            if (_p == 0 && _p + 2 <= (u32)(dst_len)) { \
+                (dst)[0] = '/'; \
+                (pos) = 1; \
+            } \
+            /* 中间层级出现根名（不应发生）：跳过该级，保持已有前缀 */ \
         } else { \
-            (pos) = -1; \
+            u32 _need = (u32)sizeof(nbuf) + 24; \
+            if (_p + _need <= (u32)(dst_len)) { \
+                __builtin_memcpy((dst) + _p, (nbuf), sizeof(nbuf)); \
+                (dst)[_p + _n] = '/'; \
+                (pos) = (int)(_p + _n + 1); \
+            } else { \
+                (pos) = -1; \
+            } \
         } \
     } \
 } while (0)
