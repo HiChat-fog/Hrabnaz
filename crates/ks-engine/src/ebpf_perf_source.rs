@@ -49,6 +49,17 @@ impl EventSource for EbpfPerfSource {
         Ok(r)
     }
 
+    async fn next_bytes_reuse(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+        let got = self.loader.try_next_event_into(out);
+        if got {
+            self.backoff = BACKOFF_STEP_START;
+        } else {
+            tokio::time::sleep(self.backoff).await;
+            self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        }
+        Ok(got)
+    }
+
     fn kind(&self) -> SourceKind {
         self.tier
     }

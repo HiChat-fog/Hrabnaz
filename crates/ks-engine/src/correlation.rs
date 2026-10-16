@@ -1,5 +1,7 @@
 use crate::aggregator::DecodedEvent;
 use crate::process_tree::ProcessTreeManager;
+use ks_core::alert::{Alert, MitreInfo, ProcessInfo};
+use ks_core::rule::Severity;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
@@ -56,6 +58,51 @@ pub struct CorrelationAlert {
 pub struct MitreMapping {
     pub tactic: String,
     pub technique: String,
+}
+
+impl CorrelationAlert {
+    /// 转成通用 Alert（入取证链/外部消费的统一形态，H-7 从 CLI 下沉）：
+    /// severity 字符串 → Severity 枚举、进程取首个关联事件、经 event_ids 保留关联事件序列，
+    /// MITRE 透传
+    pub fn to_alert(&self) -> Alert {
+        let proc = self
+            .events
+            .first()
+            .map(|e| ProcessInfo {
+                pid: e.header.pid,
+                ppid: e.header.ppid,
+                comm: e.comm.clone(),
+                uid: e.header.uid,
+                exe_path: e.filename.clone(),
+                cmdline: e.args.clone(),
+            })
+            .unwrap_or_else(|| ProcessInfo {
+                pid: 0,
+                ppid: 0,
+                comm: "unknown".to_string(),
+                uid: 0,
+                exe_path: None,
+                cmdline: None,
+            });
+
+        let severity = match self.severity.as_str() {
+            "critical" => Severity::Critical,
+            "high" => Severity::High,
+            "medium" => Severity::Medium,
+            _ => Severity::Low,
+        };
+
+        let ts = self.events.first().map(|e| e.header.timestamp_ns).unwrap_or(0);
+        let mut alert = Alert::new(severity, ts, self.rule_name.clone(), self.rule_name.clone(), proc);
+        alert.description = self.description.clone();
+        alert.event_ids = self.events.iter().map(|e| e.seq).collect();
+        alert.mitre = self.mitre.as_ref().map(|m| MitreInfo {
+            tactic: m.tactic.clone(),
+            technique: m.technique.clone(),
+            sub_technique: None,
+        });
+        alert
+    }
 }
 
 struct PartialAlert {
@@ -937,5 +984,76 @@ mod tests {
                 .any(|a| a.rule_name.contains("进程树异常")),
             "旧 API 不应触发进程树关联告警"
         );
+    }
+
+    fn make_correlation_alert_for_tests(severity: &str, with_mitre: bool) -> CorrelationAlert {
+        let mut event = make_event(1, 1234, 1, "bash", None, Some("bash -i"), None);
+        event.seq = 42;
+        event.header.uid = 1000;
+        event.header.ppid = 1;
+        event.filename = Some("/bin/test".to_string());
+        CorrelationAlert {
+            enforce: false,
+            rule_name: "测试关联规则".to_string(),
+            correlation_type: CorrelationType::Window {
+                window_secs: 30,
+                condition_a: CorrelationCondition::EventType(1),
+                condition_b: CorrelationCondition::EventType(20),
+            },
+            events: vec![event],
+            description: "测试描述".to_string(),
+            severity: severity.to_string(),
+            mitre: if with_mitre {
+                Some(MitreMapping {
+                    tactic: "TA0002".to_string(),
+                    technique: "T1059.004".to_string(),
+                })
+            } else {
+                None
+            },
+            confidence: 0.85,
+        }
+    }
+
+    /// to_alert（H-7 自 CLI 下沉）行为回归
+    #[test]
+    fn test_to_alert_basic_and_severity_mapping() {
+        let ca = make_correlation_alert_for_tests("critical", false);
+        let alert = ca.to_alert();
+        assert_eq!(alert.severity, ks_core::rule::Severity::Critical);
+        assert_eq!(alert.title, "测试关联规则");
+        assert_eq!(alert.rule_name, "测试关联规则");
+        assert_eq!(alert.description, "测试描述");
+        assert_eq!(alert.process.pid, 1234);
+        assert_eq!(alert.process.comm, "bash");
+        assert_eq!(alert.process.uid, 1000);
+        assert_eq!(alert.process.ppid, 1);
+        assert_eq!(alert.event_ids, vec![42]);
+
+        for (s, want) in [
+            ("critical", ks_core::rule::Severity::Critical),
+            ("high", ks_core::rule::Severity::High),
+            ("medium", ks_core::rule::Severity::Medium),
+            ("low", ks_core::rule::Severity::Low),
+            ("unknown", ks_core::rule::Severity::Low),
+        ] {
+            let ca = make_correlation_alert_for_tests(s, false);
+            assert_eq!(ca.to_alert().severity, want);
+        }
+    }
+
+    #[test]
+    fn test_to_alert_mitre_and_empty_events() {
+        let ca = make_correlation_alert_for_tests("high", true);
+        let mitre = ca.to_alert().mitre.expect("mitre should be present");
+        assert_eq!(mitre.tactic, "TA0002");
+        assert_eq!(mitre.technique, "T1059.004");
+
+        let mut ca = make_correlation_alert_for_tests("low", false);
+        ca.events.clear();
+        let alert = ca.to_alert();
+        assert_eq!(alert.process.pid, 0);
+        assert_eq!(alert.process.comm, "unknown");
+        assert_eq!(alert.timestamp_ns, 0);
     }
 }

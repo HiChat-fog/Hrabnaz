@@ -1,4 +1,5 @@
 use crate::aggregator::DecodedEvent;
+use std::sync::Arc;
 
 fn format_ns_timestamp(ns: u64) -> String {
     let secs = ns / 1_000_000_000;
@@ -54,7 +55,10 @@ impl ChainReconstructor {
         }
     }
 
-    pub fn reconstruct(&self, events: &[DecodedEvent]) -> Option<AttackChain> {
+    /// 接收 Arc 切片：聚合器缓冲本就以 Arc<DecodedEvent> 存储，热路径上
+    /// 若按值收集（clone 每事件的 6+ 个 String）是处理层 45% 开销（H-3）。
+    /// Arc 引用计数 +1 即可，检测端语义不变
+    pub fn reconstruct(&self, events: &[Arc<DecodedEvent>]) -> Option<AttackChain> {
         if events.is_empty() {
             return None;
         }
@@ -267,7 +271,8 @@ mod tests {
             make_event(1, 100, 1, "bash", None, Some("bash -i"), None),
             make_event(2, 100, 20, "bash", None, None, Some(4444)),
         ];
-        let chain = recon.reconstruct(&events).unwrap();
+        let arcs: Vec<std::sync::Arc<DecodedEvent>> = events.into_iter().map(std::sync::Arc::new).collect();
+        let chain = recon.reconstruct(&arcs).unwrap();
         assert_eq!(chain.steps[0].phase, AttackPhase::InitialAccess);
     }
 
@@ -280,7 +285,8 @@ mod tests {
             make_event(3, 100, 12, "bash", Some("/etc/crontab"), None, None),
             make_event(4, 100, 1, "chmod", None, Some("chmod +s"), None),
         ];
-        let chain = recon.reconstruct(&events).unwrap();
+        let arcs: Vec<std::sync::Arc<DecodedEvent>> = events.into_iter().map(std::sync::Arc::new).collect();
+        let chain = recon.reconstruct(&arcs).unwrap();
         assert!(chain.steps.len() >= 3);
         assert!(chain.confidence > 0.5);
     }
@@ -292,7 +298,8 @@ mod tests {
             make_event(1, 100, 12, "bash", Some("/etc/crontab"), None, None),
             make_event(2, 100, 12, "bash", Some("/etc/cron.d/backdoor"), None, None),
         ];
-        let chain = recon.reconstruct(&events).unwrap();
+        let arcs: Vec<std::sync::Arc<DecodedEvent>> = events.into_iter().map(std::sync::Arc::new).collect();
+        let chain = recon.reconstruct(&arcs).unwrap();
         assert_eq!(chain.steps.len(), 1);
         assert_eq!(chain.steps[0].events.len(), 2);
     }

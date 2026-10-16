@@ -6,7 +6,7 @@
 //! - open/read(10/11) 仅 /etc/shadow、/etc/gshadow、/etc/sudoers、/root/.ssh 前缀
 //!   或风险分>=40 的进程放行
 //! - vfs_write 只上报 >=1024 字节的写入，小文件编辑走 exec args 检测
-//! 禁止添加建立在不可能到达规则引擎的事件上的"装饰规则"。
+//! - 禁止添加建立在不可能到达规则引擎的事件上的"装饰规则"
 
 use ks_core::rule::DetectionRule;
 

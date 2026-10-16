@@ -11,6 +11,7 @@ pub mod detector;
 pub mod ebpf_perf_source;
 #[cfg(target_os = "linux")]
 pub mod ebpf_source;
+pub mod engine;
 pub mod event_source;
 pub mod forensic;
 #[cfg(target_os = "linux")]
@@ -19,4 +20,5 @@ pub mod loader;
 pub mod ml_detector;
 pub mod process_tree;
 pub mod rules_integrity;
+pub mod sys;
 pub mod tier_detect;

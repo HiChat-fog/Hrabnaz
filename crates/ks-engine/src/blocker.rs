@@ -35,25 +35,9 @@ impl KernelBlockWriter for MapWriterSink {
     }
 }
 
-/// 与 `bpf_ktime_get_ns()` 同源的 CLOCK_MONOTONIC 纳秒。
-/// /proc/uptime 是 boottime 口径（含 suspend），会话挂起后 TTL 会变长，故用 clock_gettime。
-#[cfg(target_os = "linux")]
+/// 与 `bpf_ktime_get_ns()` 同源的 CLOCK_MONOTONIC 纳秒（unsafe FFI 收拢在 `crate::sys`）
 pub fn monotonic_now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // clock_gettime 对合法 clockid 不返回错误
-    let ok = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0;
-    if !ok {
-        return 0;
-    }
-    (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
-}
-
-#[cfg(not(target_os = "linux"))]
-fn monotonic_now_ns() -> u64 {
-    0
+    crate::sys::monotonic_now_ns()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,17 +283,7 @@ pub fn user_kill_tick(
 }
 
 pub fn kill_pid_sigkill(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        // ESRCH（进程已死）视为成功：裁决已达成，等 LRU/TTL 清条目
-        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        rc == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
-    }
+    crate::sys::kill_sigkill(pid)
 }
 
 /// 系统进程 comm 保护（与内核 protected_comms 同一名单 + KS_PROTECTED_COMMS 扩展）：
@@ -405,12 +379,10 @@ impl PinnedBlockMap {
 
     pub fn entries(&self) -> Vec<(u32, u64, u8)> {
         let mut out = Vec::new();
-        for kv in self.inner.iter() {
-            if let Ok((key, value)) = kv {
-                let pid = u32::from_ne_bytes(key[..4].try_into().unwrap_or([0; 4]));
-                let expire = u64::from_ne_bytes(value[..8].try_into().unwrap_or([0; 8]));
-                out.push((pid, expire, value[8]));
-            }
+        for (key, value) in self.inner.iter().flatten() {
+            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap_or([0; 4]));
+            let expire = u64::from_ne_bytes(value[..8].try_into().unwrap_or([0; 8]));
+            out.push((pid, expire, value[8]));
         }
         out
     }

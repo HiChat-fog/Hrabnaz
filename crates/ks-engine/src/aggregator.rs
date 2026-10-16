@@ -54,18 +54,18 @@ impl EventAggregator {
 
     /// 返回 Arc：调用方拿到的事件与内部缓冲共享同一份，免一次深拷贝
     pub fn decode(&mut self, data: &[u8]) -> Result<Arc<DecodedEvent>> {
-        let raw = unsafe { RawEvent::from_bytes(data) }
+        let raw = RawEvent::from_bytes(data)
             .ok_or_else(|| anyhow::anyhow!("事件数据不足: {} 字节", data.len()))?;
 
         let event_type = raw.event_type();
-        let header = unsafe { raw.header };
+        let header = raw.header;
+        let payload = raw.payload;
         let comm = cstr_to_string(&header.comm);
 
         let decoded = match event_type {
             1 => {
-                let exec = unsafe { &raw.exec };
-                let fname = cstr_to_string(&exec.filename);
-                let args = exec_args_to_cmdline(&exec.args);
+                let fname = cstr_to_string(&payload.filename);
+                let args = exec_args_to_cmdline(&payload.args);
                 DecodedEvent {
                     seq: 0,
                     header,
@@ -89,8 +89,7 @@ impl EventAggregator {
                 }
             }
             10..=15 => {
-                let file = unsafe { &raw.file };
-                let fname = cstr_to_string(&file.filename);
+                let fname = cstr_to_string(&payload.filename);
                 DecodedEvent {
                     seq: 0,
                     header,
@@ -104,8 +103,8 @@ impl EventAggregator {
                     proto: None,
                     target_pid: None,
                     signal: None,
-                    file_bytes: if file.bytes > 0 {
-                        Some(file.bytes)
+                    file_bytes: if payload.bytes > 0 {
+                        Some(payload.bytes)
                     } else {
                         None
                     },
@@ -118,14 +117,13 @@ impl EventAggregator {
                 }
             }
             20..=24 => {
-                let net = unsafe { &raw.net };
-                let (saddr, daddr) = if net.family == af::AF_INET6 {
+                let (saddr, daddr) = if payload.family == af::AF_INET6 {
                     (
-                        Some(ipv6_to_string(&net.saddr6)),
-                        Some(ipv6_to_string(&net.daddr6)),
+                        Some(ipv6_to_string(&payload.saddr6)),
+                        Some(ipv6_to_string(&payload.daddr6)),
                     )
                 } else {
-                    (Some(ip_to_string(net.saddr)), Some(ip_to_string(net.daddr)))
+                    (Some(ip_to_string(payload.saddr)), Some(ip_to_string(payload.daddr)))
                 };
                 DecodedEvent {
                     seq: 0,
@@ -135,12 +133,12 @@ impl EventAggregator {
                     args: None,
                     saddr,
                     daddr,
-                    sport: Some(net.sport),
-                    dport: Some(net.dport),
+                    sport: Some(payload.sport),
+                    dport: Some(payload.dport),
                     proto: Some(
-                        if net.proto == 6 {
+                        if payload.proto == 6 {
                             "TCP"
-                        } else if net.proto == 17 {
+                        } else if payload.proto == 17 {
                             "UDP"
                         } else {
                             "OTHER"
@@ -159,7 +157,6 @@ impl EventAggregator {
                 }
             }
             30 | 31 => {
-                let sig = unsafe { &raw.signal };
                 DecodedEvent {
                     seq: 0,
                     header,
@@ -171,8 +168,8 @@ impl EventAggregator {
                     sport: None,
                     dport: None,
                     proto: None,
-                    target_pid: Some(sig.target_pid),
-                    signal: Some(sig.signal),
+                    target_pid: Some(payload.target_pid),
+                    signal: Some(payload.signal),
                     file_bytes: None,
                     module_name: None,
                     prog_name: None,
@@ -204,7 +201,6 @@ impl EventAggregator {
                 action: None,
             },
             80 => {
-                let ce = unsafe { &raw.container_escape };
                 DecodedEvent {
                     seq: 0,
                     header,
@@ -221,15 +217,14 @@ impl EventAggregator {
                     file_bytes: None,
                     module_name: None,
                     prog_name: None,
-                    source_ns_inum: Some(ce.source_ns_inum),
-                    target_ns_inum: Some(ce.target_ns_inum),
-                    cap_eff: Some(ce.cap_eff),
+                    source_ns_inum: Some(payload.source_ns_inum),
+                    target_ns_inum: Some(payload.target_ns_inum),
+                    cap_eff: Some(payload.cap_eff),
                     action: None,
                 }
             }
             81 => {
-                let lkm = unsafe { &raw.lkm_load };
-                let mname = cstr_to_string(&lkm.module_name);
+                let mname = cstr_to_string(&payload.module_name);
                 DecodedEvent {
                     seq: 0,
                     header,
@@ -253,9 +248,8 @@ impl EventAggregator {
                 }
             }
             82 => {
-                let et = unsafe { &raw.ebpf_tamper };
-                let pname = cstr_to_string(&et.prog_name);
-                let act = cstr_to_string(&et.action);
+                let pname = cstr_to_string(&payload.prog_name);
+                let act = cstr_to_string(&payload.action);
                 DecodedEvent {
                     seq: 0,
                     header,
@@ -376,6 +370,17 @@ impl EventAggregator {
             .iter()
             .filter(|e| e.header.pid == pid)
             .map(|e| e.as_ref())
+            .collect()
+    }
+
+    /// 零拷贝变体（H-3）：返回缓冲内 Arc 的克隆（引用计数 +1），供攻击链还原
+    /// 等只读消费方使用。旧路径 `by_pid().into_iter().cloned().collect()` 会把每
+    /// 事件的 6+ 个 String 深拷贝一遍，是处理层 45% 开销的来源
+    pub fn by_pid_arcs(&self, pid: u32) -> Vec<Arc<DecodedEvent>> {
+        self.buffer
+            .iter()
+            .filter(|e| e.header.pid == pid)
+            .cloned()
             .collect()
     }
 
@@ -516,6 +521,7 @@ fn ipv6_to_string(addr: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zerocopy::IntoBytes;
     use ks_core::event::EventHeader;
 
     fn make_header(event_type: u32, pid: u32, timestamp_ns: u64) -> EventHeader {
@@ -535,12 +541,7 @@ mod tests {
     }
 
     fn encode_header(header: &EventHeader) -> Vec<u8> {
-        let size = core::mem::size_of::<EventHeader>();
-        let mut data = vec![0u8; size];
-        unsafe {
-            core::ptr::write_unaligned(data.as_mut_ptr() as *mut EventHeader, *header);
-        }
-        data
+        header.as_bytes().to_vec()
     }
 
     #[test]
@@ -632,16 +633,7 @@ mod tests {
             fd: -1,
             flags: 0,
         };
-        let size = core::mem::size_of::<ks_core::event::FileEvent>();
-        let mut data = vec![0u8; size];
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                &fe as *const ks_core::event::FileEvent as *const u8,
-                data.as_mut_ptr(),
-                size,
-            );
-        }
-        data
+        fe.as_bytes().to_vec()
     }
 
     #[test]

@@ -771,6 +771,76 @@ impl EbpfLoader {
         &self.protected_pids
     }
 
+    /// H-3 复用缓冲：与 try_next_events 同一轮询逻辑，但把事件字节写进调用方
+    /// 复用的 `out`（clear + extend），省掉每事件一次堆分配。返回 false = 本轮无事件
+    #[cfg(target_os = "linux")]
+    pub fn try_next_event_into(&mut self, out: &mut Vec<u8>) -> bool {
+        use aya::maps::perf::PerfEvent;
+        use std::ops::ControlFlow;
+
+        out.clear();
+        match &mut self.backend {
+            EventBackend::Empty => false,
+
+            EventBackend::RingBuf { rings, idx } => {
+                let n = rings.len();
+                if n == 0 {
+                    return false;
+                }
+                for _ in 0..n {
+                    let i = *idx % n;
+                    *idx = idx.wrapping_add(1);
+                    let src = &mut rings[i];
+                    if let Some(item) = src.ring.next() {
+                        out.extend_from_slice(&item);
+                        return true;
+                    }
+                }
+                false
+            }
+
+            EventBackend::PerfEvent { buffers, idx } => {
+                let n = buffers.len();
+                if n == 0 {
+                    return false;
+                }
+                for _ in 0..n {
+                    let i = *idx % n;
+                    *idx = idx.wrapping_add(1);
+                    let pb = &mut buffers[i];
+                    if !pb.buf.readable() {
+                        continue;
+                    }
+                    let map_name = pb.map_name;
+                    let cpu_id = pb.cpu_id;
+                    let mut found = false;
+                    let fold_result = pb.buf.try_fold((), |_, evt| match evt {
+                        PerfEvent::Sample { head, tail } => {
+                            out.extend_from_slice(head);
+                            out.extend_from_slice(tail);
+                            found = true;
+                            ControlFlow::Break(())
+                        }
+                        PerfEvent::Lost { count } => {
+                            log::warn!(
+                                "[perfbuf] lost {} events on {} cpu {}",
+                                count,
+                                map_name,
+                                cpu_id
+                            );
+                            ControlFlow::Continue(())
+                        }
+                    });
+                    let _ = fold_result;
+                    if found {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub fn try_next_events(&mut self) -> Option<(&'static str, Vec<u8>)> {
         use aya::maps::perf::PerfEvent;

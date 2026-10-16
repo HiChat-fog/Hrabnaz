@@ -53,9 +53,7 @@ pub async fn run() -> Result<()> {
                     {
                         let pid = pid as u32;
                         if verify_ks_process(pid) {
-                            unsafe {
-                                libc::kill(pid as i32, libc::SIGTERM);
-                            }
+                            ks_engine::sys::kill_sigterm(pid);
                             println!("      已发送 SIGTERM 信号");
                             banner("内核哨兵正在安全关闭");
                         } else {

@@ -11,13 +11,8 @@ use ks_engine::event_source::{EventSource, MockEventSource, MockScenario};
 use ks_engine::forensic::{ForensicLogger, RotationConfig};
 use tempfile::TempDir;
 
-fn encode_struct<T: Copy>(s: &T) -> Vec<u8> {
-    let size = core::mem::size_of::<T>();
-    let mut data = vec![0u8; size];
-    unsafe {
-        core::ptr::copy_nonoverlapping(s as *const T as *const u8, data.as_mut_ptr(), size);
-    }
-    data
+fn encode_struct<T: zerocopy::IntoBytes + zerocopy::Immutable>(s: &T) -> Vec<u8> {
+    s.as_bytes().to_vec()
 }
 
 fn make_cstr_256(s: &str) -> [u8; 256] {
@@ -287,7 +282,7 @@ fn test_reverse_shell_full_pipeline() {
     let verification = ForensicLogger::verify_chain(&log_path).unwrap();
     assert!(verification.total_records >= 3);
 
-    let pid_events: Vec<_> = aggregator.by_pid(1234).into_iter().cloned().collect();
+    let pid_events: Vec<_> = aggregator.by_pid_arcs(1234);
     assert_eq!(pid_events.len(), 3, "PID 1234应有3条事件");
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
         assert!(!chain.steps.is_empty(), "攻击链应至少有1个步骤");
@@ -458,7 +453,7 @@ fn test_ransomware_full_pipeline() {
     let verification = ForensicLogger::verify_chain(&log_path).unwrap();
     assert!(verification.total_records >= 4);
 
-    let pid_events: Vec<_> = aggregator.by_pid(5000).into_iter().cloned().collect();
+    let pid_events: Vec<_> = aggregator.by_pid_arcs(5000);
     assert_eq!(pid_events.len(), 4, "PID 5000应有4条事件");
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
         assert!(!chain.steps.is_empty());
@@ -624,7 +619,7 @@ fn test_privilege_escalation_full_pipeline() {
     let verification = ForensicLogger::verify_chain(&log_path).unwrap();
     assert!(verification.total_records >= 3);
 
-    let pid_events: Vec<_> = aggregator.by_pid(3000).into_iter().cloned().collect();
+    let pid_events: Vec<_> = aggregator.by_pid_arcs(3000);
     assert_eq!(pid_events.len(), 3);
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
         assert!(!chain.steps.is_empty());
@@ -786,7 +781,7 @@ fn test_dns_tunnel_full_pipeline() {
     let verification = ForensicLogger::verify_chain(&log_path).unwrap();
     assert!(verification.total_records >= 3);
 
-    let pid_events: Vec<_> = aggregator.by_pid(7000).into_iter().cloned().collect();
+    let pid_events: Vec<_> = aggregator.by_pid_arcs(7000);
     assert_eq!(pid_events.len(), 3);
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
         assert!(!chain.steps.is_empty());
@@ -942,7 +937,7 @@ fn test_rootkit_full_pipeline() {
     let verification = ForensicLogger::verify_chain(&log_path).unwrap();
     assert!(verification.total_records >= 3);
 
-    let pid_events: Vec<_> = aggregator.by_pid(8000).into_iter().cloned().collect();
+    let pid_events: Vec<_> = aggregator.by_pid_arcs(8000);
     assert_eq!(pid_events.len(), 3);
     if let Some(chain) = chain_reconstructor.reconstruct(&pid_events) {
         assert!(!chain.steps.is_empty());
@@ -1368,6 +1363,7 @@ async fn test_lkm_load_rule_rootkit_critical() {
         _pad_lkm1: 0,
         module_name: make_cstr_64(module_name),
         comm: make_cstr_16("insmod"),
+        _pad_lkm2: [0; 4],
     };
     let bytes = encode_struct(&evt);
 
@@ -1488,6 +1484,7 @@ async fn test_lkm_load_rule_normal_info() {
         _pad_lkm1: 0,
         module_name: make_cstr_64(module_name),
         comm: make_cstr_16("modprobe"),
+        _pad_lkm2: [0; 4],
     };
     let bytes = encode_struct(&evt);
 
@@ -1580,6 +1577,7 @@ async fn test_ebpf_tamper_rule_critical() {
         pid: 4567,
         uid: 0,
         _pad_self1: 0,
+        _pad_self2: [0; 4],
         prog_name: make_cstr_64("kprobe_commit_creds"),
         comm: make_cstr_16("bpftool"),
         action: action_buf,

@@ -31,6 +31,20 @@ impl SourceKind {
 pub trait EventSource: Send {
     async fn next_bytes(&mut self) -> Result<Option<Vec<u8>>>;
 
+    /// 复用缓冲变体（H-3）：把事件写入调用方持有的 `out`（先 clear，容量跨事件
+    /// 复用），免去逐事件的堆分配。aya 路径覆写为 ringbuf/perfbuf 直读 extend；
+    /// 其余路径（CLoader/Mock）走默认实现——next_bytes 的所有权直接 move 进 out，
+    /// 无额外拷贝。返回 false = 源耗尽。
+    async fn next_bytes_reuse(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+        match self.next_bytes().await? {
+            Some(b) => {
+                *out = b;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn kind(&self) -> SourceKind;
 
     fn description(&self) -> &str;
@@ -426,13 +440,11 @@ fn ipv4_to_u32(addr: &str) -> u32 {
     }
 }
 
-fn encode_struct<T: Copy>(s: &T) -> Vec<u8> {
-    let size = core::mem::size_of::<T>();
-    let mut data = vec![0u8; size];
-    unsafe {
-        core::ptr::copy_nonoverlapping(s as *const T as *const u8, data.as_mut_ptr(), size);
-    }
-    data
+/// zerocopy::IntoBytes（原 Pod）：布局 = 字节序列的安全转换。
+/// 事件结构体都是 repr(C) 纯数据（含 u8 数组），满足无填充断言（见 ks-core）。
+/// 调用点全部是测试/回放编码，类型不变量由编译期 size 断言兜底
+fn encode_struct<T: zerocopy::IntoBytes + zerocopy::Immutable>(s: &T) -> Vec<u8> {
+    s.as_bytes().to_vec()
 }
 
 #[derive(Debug, Clone, Copy)]

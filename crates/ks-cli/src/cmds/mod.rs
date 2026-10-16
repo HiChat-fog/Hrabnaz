@@ -16,7 +16,7 @@ pub mod watch;
 pub fn status_file_path() -> std::path::PathBuf {
     #[cfg(target_os = "linux")]
     {
-        let is_root = unsafe { libc::geteuid() } == 0;
+        let is_root = ks_engine::sys::is_root();
         if is_root {
             let run_dir = std::path::Path::new("/run/kernelsentinel");
             if std::fs::create_dir_all(run_dir).is_ok() {

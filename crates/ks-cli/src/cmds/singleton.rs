@@ -1,6 +1,5 @@
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::io::AsRawFd;
 
 pub fn acquire() -> io::Result<File> {
     let candidates = ["/run/ks.lock", "/tmp/ks.lock"];
@@ -21,14 +20,7 @@ pub fn acquire() -> io::Result<File> {
                 continue;
             }
         };
-        let ret = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &libc::flock {
-            l_type: libc::F_WRLCK as i16,
-            l_whence: libc::SEEK_SET as i16,
-            l_start: 0,
-            l_len: 0,
-            l_pid: 0,
-        }) };
-        if ret == 0 {
+        if ks_engine::sys::try_lock_file(&f).is_ok() {
             use std::io::{Seek, Write};
             let mut f = f;
             let _ = f.seek(std::io::SeekFrom::Start(0));

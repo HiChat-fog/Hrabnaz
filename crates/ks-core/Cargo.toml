@@ -7,3 +7,5 @@ description = "内核哨兵 - 核心数据类型与公共结构"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# H-4 unsafe 收敛: repr(C) 事件结构体 ↔ 字节的安全双向转换（测试/回放编码与带校验解码）
+zerocopy = { version = "0.8", features = ["derive"] }

@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use aya::maps::{Array, HashMap};
-use aya::Pod;
+
 use serde_json::{Value, json};
 
 use crate::loader::{BpfMapReader, MapSnapshot, MapStat};
@@ -17,32 +17,33 @@ const SHARED_MAPS: &[&str] = &[
     "protected_comms",
 ];
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NetConnKey {
-    pid: u32,
-    daddr: u32,
-    dport: u16,
-    proto: u8,
-    _pad: u8,
-}
-unsafe impl Pod for NetConnKey {}
+// net_conn_history / freq_counters 的 key/value 用原始字节数组而非 repr(C)
+// 结构体：与 open_block_map 的 block_key/block_value 同一模式——布局契约在解码
+// 代码里逐字节可见，且 aya 对 [u8; N] 自带 Pod 实现，无需 unsafe impl。
+// 布局对齐 common.h 的 `struct net_conn_key`（12B）与 `struct freq_counter`（48B），
+// native endian（同架构读取）。
 
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct FreqCounter {
-    syscall_count_60s: u32,
-    file_op_count_60s: u32,
-    net_op_count_60s: u32,
-    dns_op_count_60s: u32,
-    ptrace_count_60s: u32,
-    signal_count_60s: u32,
-    last_update_ns: u64,
-    window_start_ns: u64,
-    anomaly_flags: u32,
-    _pad_freq1: u32,
+/// net_conn_key: u32 pid @0, u32 daddr @4, u16 dport @8, u8 proto @10
+fn decode_net_conn_key(k: &[u8; 12]) -> (u32, u32, u16, u8) {
+    let arr4 = |off: usize| u32::from_ne_bytes([k[off], k[off + 1], k[off + 2], k[off + 3]]);
+    (arr4(0), arr4(4), u16::from_ne_bytes([k[8], k[9]]), k[10])
 }
-unsafe impl Pod for FreqCounter {}
+
+/// freq_counter: 六个 u32 计数器 @0..24, 两个 u64 时间戳 @24/@32, u32 anomaly_flags @40
+fn decode_freq_counter(v: &[u8; 48]) -> [u32; 7] {
+    let u32at = |off: usize| {
+        u32::from_ne_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]])
+    };
+    [
+        u32at(0),  // syscall_count_60s
+        u32at(4),  // file_op_count_60s
+        u32at(8),  // net_op_count_60s
+        u32at(12), // dns_op_count_60s
+        u32at(16), // ptrace_count_60s
+        u32at(20), // signal_count_60s
+        u32at(40), // anomaly_flags
+    ]
+}
 
 pub struct LinuxBpfMapReader {
     bpf: Arc<Mutex<aya::Ebpf>>,
@@ -109,16 +110,14 @@ impl LinuxBpfMapReader {
             .bpf
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Ok(mut hm) = Self::open_block_map(&mut bpf) else {
+        let Ok(hm) = Self::open_block_map(&mut bpf) else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for kv in hm.iter() {
-            if let Ok((key, value)) = kv {
-                let pid = u32::from_ne_bytes(key[..4].try_into().unwrap_or([0; 4]));
-                let expire = u64::from_ne_bytes(value[..8].try_into().unwrap_or([0; 8]));
-                out.push((pid, expire, value[8]));
-            }
+        for (key, value) in hm.iter().flatten() {
+            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap_or([0; 4]));
+            let expire = u64::from_ne_bytes(value[..8].try_into().unwrap_or([0; 8]));
+            out.push((pid, expire, value[8]));
         }
         out
     }
@@ -228,10 +227,8 @@ impl LinuxBpfMapReader {
             "risk_scores" => {
                 if let Ok(hm) = HashMap::<_, u32, u32>::try_from(map) {
                     let mut entries = Vec::new();
-                    for kv in hm.iter() {
-                        if let Ok((pid, score)) = kv {
-                            entries.push(json!({"pid": pid, "risk_score": score}));
-                        }
+                    for (pid, score) in hm.iter().flatten() {
+                    entries.push(json!({"pid": pid, "risk_score": score}));
                     }
                     let n = entries.len();
                     return (n, entries);
@@ -240,51 +237,46 @@ impl LinuxBpfMapReader {
             "ip_whitelist" => {
                 if let Ok(hm) = HashMap::<_, u32, u8>::try_from(map) {
                     let mut entries = Vec::new();
-                    for kv in hm.iter() {
-                        if let Ok((ip, flag)) = kv {
-                            entries.push(json!({"ip": ip, "whitelisted": flag}));
-                        }
+                    for (ip, flag) in hm.iter().flatten() {
+                    entries.push(json!({"ip": ip, "whitelisted": flag}));
                     }
                     let n = entries.len();
                     return (n, entries);
                 }
             }
             "net_conn_history" => {
-                if let Ok(hm) = HashMap::<_, NetConnKey, u64>::try_from(map) {
+                if let Ok(hm) = HashMap::<_, [u8; 12], u64>::try_from(map) {
                     let mut entries = Vec::new();
-                    for kv in hm.iter() {
-                        if let Ok((k, ts)) = kv {
-                            let daddr = k.daddr;
-                            let [b0, b1, b2, b3] = daddr.to_le_bytes();
-                            entries.push(json!({
-                                "pid": k.pid,
-                                "daddr": format!("{}.{}.{}.{}", b0, b1, b2, b3),
-                                "dport": k.dport,
-                                "proto": k.proto,
-                                "last_ns": ts,
-                            }));
-                        }
+                    for (k, ts) in hm.iter().flatten() {
+                        let (pid, daddr, dport, proto) = decode_net_conn_key(&k);
+                        let [b0, b1, b2, b3] = daddr.to_le_bytes();
+                        entries.push(json!({
+                            "pid": pid,
+                            "daddr": format!("{}.{}.{}.{}", b0, b1, b2, b3),
+                            "dport": dport,
+                            "proto": proto,
+                            "last_ns": ts,
+                        }));
                     }
                     let n = entries.len();
                     return (n, entries);
                 }
             }
             "freq_counters" => {
-                if let Ok(hm) = HashMap::<_, u32, FreqCounter>::try_from(map) {
+                if let Ok(hm) = HashMap::<_, u32, [u8; 48]>::try_from(map) {
                     let mut entries = Vec::new();
-                    for kv in hm.iter() {
-                        if let Ok((pid, fc)) = kv {
-                            entries.push(json!({
-                                "pid": pid,
-                                "syscall_60s": fc.syscall_count_60s,
-                                "file_60s": fc.file_op_count_60s,
-                                "net_60s": fc.net_op_count_60s,
-                                "dns_60s": fc.dns_op_count_60s,
-                                "ptrace_60s": fc.ptrace_count_60s,
-                                "signal_60s": fc.signal_count_60s,
-                                "anomaly_flags": fc.anomaly_flags,
-                            }));
-                        }
+                    for (pid, v) in hm.iter().flatten() {
+                        let fc = decode_freq_counter(&v);
+                        entries.push(json!({
+                            "pid": pid,
+                            "syscall_60s": fc[0],
+                            "file_60s": fc[1],
+                            "net_60s": fc[2],
+                            "dns_60s": fc[3],
+                            "ptrace_60s": fc[4],
+                            "signal_60s": fc[5],
+                            "anomaly_flags": fc[6],
+                        }));
                     }
                     let n = entries.len();
                     return (n, entries);
@@ -308,12 +300,10 @@ impl LinuxBpfMapReader {
             "protected_comms" => {
                 if let Ok(hm) = HashMap::<_, [u8; 16], u8>::try_from(map) {
                     let mut entries = Vec::new();
-                    for kv in hm.iter() {
-                        if let Ok((key, flag)) = kv {
-                            let end = key.iter().position(|&b| b == 0).unwrap_or(16);
-                            let comm = String::from_utf8_lossy(&key[..end]).to_string();
-                            entries.push(json!({"comm": comm, "protected": flag}));
-                        }
+                    for (key, flag) in hm.iter().flatten() {
+                        let end = key.iter().position(|&b| b == 0).unwrap_or(16);
+                        let comm = String::from_utf8_lossy(&key[..end]).to_string();
+                        entries.push(json!({"comm": comm, "protected": flag}));
                     }
                     let n = entries.len();
                     return (n, entries);
@@ -410,5 +400,37 @@ mod tests {
         assert!(SHARED_MAPS.contains(&"risk_scores"));
         assert!(SHARED_MAPS.contains(&"infer_config"));
         assert!(SHARED_MAPS.contains(&"protected_comms"));
+    }
+
+    /// 解码等价性：字节数组手解必须与 repr(C) 结构体字段读法逐字段一致
+    /// （native endian 同架构）。旧 NetConnKey {pid,daddr,dport,proto,_pad}。
+    #[test]
+    fn net_conn_key_decode_matches_repr_c_layout() {
+        let k = (0u8..12).collect::<Vec<u8>>().try_into().unwrap();
+        let (pid, daddr, dport, proto) = decode_net_conn_key(&k);
+        assert_eq!(pid, u32::from_ne_bytes([0, 1, 2, 3]));
+        assert_eq!(daddr, u32::from_ne_bytes([4, 5, 6, 7]));
+        assert_eq!(dport, u16::from_ne_bytes([8, 9]));
+        assert_eq!(proto, 10);
+    }
+
+    /// 旧 FreqCounter 的逐字段偏移：六个 u32 @0/4/8/12/16/20，
+    /// 两个 u64 @24/32（不读），anomaly_flags @40。
+    #[test]
+    fn freq_counter_decode_matches_repr_c_layout() {
+        let mut v = [0u8; 48];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(3);
+        }
+        let fc = decode_freq_counter(&v);
+        let u32at = |off: usize| {
+            u32::from_ne_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]])
+        };
+        for (i, &expected) in fc.iter().enumerate().take(6) {
+            assert_eq!(expected, u32at(i * 4), "counter[{i}] 偏移不符");
+        }
+        // anomaly_flags 在两个 u64 时间戳之后（@40），不是 @24+4
+        assert_eq!(fc[6], u32at(40));
+        assert_ne!(fc[6], u32at(24));
     }
 }

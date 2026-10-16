@@ -88,17 +88,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     #[cfg(target_os = "linux")]
-    {
-        let rl = libc::rlimit {
-            rlim_cur: libc::RLIM_INFINITY,
-            rlim_max: libc::RLIM_INFINITY,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rl) } != 0 {
-            log::warn!(
-                "setrlimit(RLIMIT_MEMLOCK, ∞) 失败: {} - eBPF map创建可能EPERM(systemd下由LimitMEMLOCK=infinity覆盖)",
-                std::io::Error::last_os_error()
-            );
-        }
+    if let Err(e) = ks_engine::sys::set_memlock_unlimited() {
+        log::warn!(
+            "setrlimit(RLIMIT_MEMLOCK, ∞) 失败: {} - eBPF map创建可能EPERM(systemd下由LimitMEMLOCK=infinity覆盖)",
+            e
+        );
     }
 
     match cli.command {

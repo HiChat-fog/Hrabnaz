@@ -46,7 +46,7 @@ const POISON_IMM: i32 = 0x0BAD2310;
 
 fn poison_sites(obj: &aya_obj::Object) -> Vec<String> {
     let mut sites = Vec::new();
-    for (_, f) in obj.functions.iter() {
+    for f in obj.functions.values() {
         for (i, ins) in f.instructions.iter().enumerate() {
             if ins.imm == POISON_IMM {
                 let lo = i.saturating_sub(2);

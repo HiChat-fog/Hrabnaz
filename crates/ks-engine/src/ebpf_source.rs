@@ -73,6 +73,22 @@ impl EventSource for EbpfModernSource {
         Ok(r)
     }
 
+    async fn next_bytes_reuse(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+        // ringbuf.next() 借的是 mmap 区域，下一次 next() 会被覆盖——拷贝不可避免，
+        // 但 extend 进复用缓冲省掉逐事件的堆分配与释放
+        let got = self.loader.try_next_event_into(out);
+        if got {
+            self.some_count += 1;
+            self.backoff = BACKOFF_STEP_START;
+        } else {
+            self.none_count += 1;
+            tokio::time::sleep(self.backoff).await;
+            self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        }
+        self.poll_count = self.poll_count.wrapping_add(1);
+        Ok(got)
+    }
+
     fn kind(&self) -> SourceKind {
         SourceKind::EbpfModern
     }
