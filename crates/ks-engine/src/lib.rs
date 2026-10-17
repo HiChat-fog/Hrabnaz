@@ -22,6 +22,7 @@ pub mod linux_map_reader;
 #[cfg(target_os = "linux")]
 pub mod pinned_map_reader;
 pub mod loader;
+pub mod probe_registry;
 pub mod ml_detector;
 pub mod process_tree;
 pub mod rules_integrity;

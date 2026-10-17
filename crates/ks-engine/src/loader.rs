@@ -197,8 +197,30 @@ enum EventBackend {
     },
 }
 
+/// 探针类型（由 SEC 段前缀决定）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind {
+    Tracepoint,
+    Kprobe,
+    Kretprobe,
+}
+
+/// 一条探针的注册信息（构建期从 .o 的 SEC 段自动枚举，见 probe_registry.rs）
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeDef {
+    /// 程序名 = SEC 段内的函数符号名（aya program_mut 用）
+    pub name: &'static str,
+    pub kind: ProbeKind,
+    /// tracepoint 的 category；kprobe 为 None
+    pub category: Option<&'static str>,
+    /// tracepoint 的 event 名，或 kprobe/kretprobe 的目标内核符号
+    pub target: &'static str,
+}
+
+// 单一来源注册表：build.rs 解析编译产物 SEC 段生成，勿手写清单
+include!(concat!(env!("OUT_DIR"), "/probes_generated.rs"));
+
 pub struct EbpfLoader {
-    probes: Vec<String>,
     #[cfg(target_os = "linux")]
     backend: EventBackend,
     #[cfg(target_os = "linux")]
@@ -467,33 +489,21 @@ fn sweep_stale_probes() -> usize {
     n
 }
 
+#[cfg(target_os = "linux")]
+fn attach_kprobe(bpf: &mut aya::Ebpf, def: &ProbeDef) -> anyhow::Result<()> {
+    let prog: &mut aya::programs::KProbe = bpf
+        .program_mut(def.name)
+        .ok_or_else(|| anyhow::anyhow!("kprobe程序'{}'未找到", def.name))?
+        .try_into()?;
+    prog.load()?;
+    // kretprobe 的 ProbeKind 由 aya 从 SEC 段解析，attach 接口相同
+    prog.attach(def.target, 0)?;
+    Ok(())
+}
+
 impl EbpfLoader {
     pub fn new() -> Self {
-        let probes: Vec<String> = vec![
-            "trace_sys_enter",
-            "trace_sys_exit",
-            "trace_sched_fork",
-            "trace_sched_exec_tree",
-            "trace_sched_exit_tree",
-            "kprobe_vfs_open",
-            "kprobe_vfs_write",
-            "kprobe_do_splice_direct",
-            "kprobe_vfs_unlink",
-            "kprobe_tcp_connect",
-            "kprobe_tcp_v6_connect",
-            "kprobe_udp_sendmsg",
-            "kprobe_tcp_set_state_flow",
-            "kprobe_tcp_sendmsg_flow",
-            "kprobe_commit_creds",
-            "kprobe_do_init_module",
-            "kprobe_security_bpf_prog_free",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-
         Self {
-            probes,
             #[cfg(target_os = "linux")]
             backend: EventBackend::Empty,
             #[cfg(target_os = "linux")]
@@ -586,22 +596,19 @@ impl EbpfLoader {
             let mut n_attached = 0usize;
             let mut n_skipped = 0usize;
 
-            macro_rules! attach_tp {
-                ($name:expr, $cat:expr, $evt:expr) => {
-                    let prog: &mut aya::programs::TracePoint = bpf
-                        .program_mut($name)
-                        .ok_or_else(|| anyhow::anyhow!("tracepoint程序'{}'未找到", $name))?
-                        .try_into()?;
-                    prog.load()?;
-                    prog.attach($cat, $evt)?;
-                    n_attached += 1;
-                };
+            // ── tracepoint：注册表驱动（category/event 来自 SEC 段）──
+            for def in PROBE_REGISTRY
+                .iter()
+                .filter(|d| d.kind == ProbeKind::Tracepoint)
+            {
+                let prog: &mut aya::programs::TracePoint = bpf
+                    .program_mut(def.name)
+                    .ok_or_else(|| anyhow::anyhow!("tracepoint程序'{}'未找到", def.name))?
+                    .try_into()?;
+                prog.load()?;
+                prog.attach(def.category.unwrap_or(""), def.target)?;
+                n_attached += 1;
             }
-            attach_tp!("trace_sys_enter", "raw_syscalls", "sys_enter");
-            attach_tp!("trace_sys_exit", "raw_syscalls", "sys_exit");
-            attach_tp!("trace_sched_fork", "sched", "sched_process_fork");
-            attach_tp!("trace_sched_exec_tree", "sched", "sched_process_exec");
-            attach_tp!("trace_sched_exit_tree", "sched", "sched_process_exit");
 
             // 清掉上次被强杀时残留的 aya kprobe 条目（entry 生命周期随 PerfLink，
             // 但 SIGKILL 下没人 drop）
@@ -610,52 +617,58 @@ impl EbpfLoader {
                 n => log::warn!("[loader] 清理了 {} 条上次残留的 kprobe 条目", n),
             }
 
-            macro_rules! attach_kp {
-                ($name:expr, $func:expr) => {
-                    if !symbol_exists($func) {
-                        log::warn!(
-                            "[loader] 内核无符号 {}，跳过探针 {}（不影响其它探针）",
-                            $func,
-                            $name
-                        );
-                        n_skipped += 1;
-                    } else {
-                        let prog: &mut aya::programs::KProbe = bpf
-                            .program_mut($name)
-                            .ok_or_else(|| anyhow::anyhow!("kprobe程序'{}'未找到", $name))?
-                            .try_into()?;
-                        prog.load()?;
-                        prog.attach($func, 0)?;
+            // ── kprobe/kretprobe：注册表驱动 + 符号回退组 ──
+            // 回退组是"策略"而非"注册"：3.10 无 do_init_module，用
+            // kretprobe/load_module 兜底；一组只挂一个，避免同一事件双计。
+            // 新增普通探针不需要改这里。
+            const SYMBOL_FALLBACK_GROUPS: &[&[&str]] =
+                &[&["kprobe_do_init_module", "kretprobe_load_module"]];
+            // attach 失败可降级的探针（自保护类能力，内核不支持时不拖垮整个 tier）
+            const ATTACH_TOLERANT: &[&str] = &["kprobe_security_bpf_prog_free"];
+
+            let mut handled: Vec<&str> = Vec::new();
+            for group in SYMBOL_FALLBACK_GROUPS {
+                let chosen = group.iter().find_map(|name| {
+                    PROBE_REGISTRY
+                        .iter()
+                        .find(|d| d.name == *name && symbol_exists(d.target))
+                });
+                match chosen {
+                    Some(def) => {
+                        attach_kprobe(&mut bpf, def)?;
                         n_attached += 1;
                     }
-                };
+                    None => {
+                        log::warn!(
+                            "[loader] 回退组 {:?} 的目标符号均不存在，跳过（如模块加载检测缺失）",
+                            group
+                        );
+                        n_skipped += 1;
+                    }
+                }
+                handled.extend(group.iter().copied());
             }
-            attach_kp!("kprobe_vfs_open", "vfs_open");
-            attach_kp!("kprobe_vfs_write", "vfs_write");
-            attach_kp!("kprobe_do_splice_direct", "do_splice_direct");
-            attach_kp!("kprobe_vfs_unlink", "vfs_unlink");
-            attach_kp!("kprobe_tcp_connect", "tcp_v4_connect");
-            attach_kp!("kprobe_tcp_v6_connect", "tcp_v6_connect");
-            attach_kp!("kprobe_udp_sendmsg", "udp_sendmsg");
-            attach_kp!("kprobe_tcp_set_state_flow", "tcp_set_state");
-            attach_kp!("kprobe_tcp_sendmsg_flow", "tcp_sendmsg");
-            attach_kp!("kprobe_commit_creds", "commit_creds");
-            // 模块加载：3.10 没有 do_init_module，回退到 load_module 的 kretprobe
-            // （返回值即 struct module *），取的是同一份信息
-            if symbol_exists("do_init_module") {
-                attach_kp!("kprobe_do_init_module", "do_init_module");
-            } else if symbol_exists("load_module") {
-                attach_kp!("kretprobe_load_module", "load_module");
-            } else {
-                log::warn!("[loader] 内核既无 do_init_module 也无 load_module，无法检测模块加载");
-                n_skipped += 1;
-            }
-            match (|| -> anyhow::Result<()> {
-                attach_kp!("kprobe_security_bpf_prog_free", "security_bpf_prog_free");
-                Ok(())
-            })() {
-                Ok(()) => {}
-                Err(e) => log::warn!("[loader] security_bpf_prog_free attach失败(忽略): {}", e),
+
+            for def in PROBE_REGISTRY.iter().filter(|d| {
+                matches!(d.kind, ProbeKind::Kprobe | ProbeKind::Kretprobe)
+                    && !handled.contains(&d.name)
+            }) {
+                if !symbol_exists(def.target) {
+                    log::warn!(
+                        "[loader] 内核无符号 {}，跳过探针 {}（不影响其它探针）",
+                        def.target,
+                        def.name
+                    );
+                    n_skipped += 1;
+                    continue;
+                }
+                match attach_kprobe(&mut bpf, def) {
+                    Ok(()) => n_attached += 1,
+                    Err(e) if ATTACH_TOLERANT.contains(&def.name) => {
+                        log::warn!("[loader] {} attach失败(忽略): {}", def.name, e);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
 
             let use_ringbuf = matches!(tier, SourceKind::EbpfModern);
@@ -744,7 +757,7 @@ impl EbpfLoader {
                     obj_name,
                     n_attached,
                     n_skipped,
-                    self.probes.len()
+                    PROBE_REGISTRY.len()
                 );
             } else {
                 log::info!(
@@ -758,8 +771,9 @@ impl EbpfLoader {
         Ok(())
     }
 
-    pub fn loaded_probes(&self) -> &[String] {
-        &self.probes
+    /// 探针清单（构建期注册表，与 status 报表同源）
+    pub fn loaded_probes(&self) -> &'static [ProbeDef] {
+        PROBE_REGISTRY
     }
 
     /// 实际 attach 成功的探针数（`loaded_probes` 是配置清单，含因内核缺符号被跳过的）
@@ -997,15 +1011,69 @@ garbage line
         assert!(stale_probe_tags("", |_| false).is_empty());
     }
 
+    /// 注册表完整性：构建期自动枚举的探针必须覆盖已知关键项。
+    /// H-5 的"漏注册"由 build.rs 的 SEC 解析在编译期兜底，这里锚定清单形状。
     #[test]
-    fn test_probe_list_contains_all_17_programs() {
+    fn test_probe_registry_contains_all_programs() {
         let loader = EbpfLoader::new();
-        assert_eq!(loader.probes.len(), 17);
-        assert!(loader.probes.contains(&"trace_sys_enter".to_string()));
-        assert!(loader.probes.contains(&"trace_sys_exit".to_string()));
-        assert!(loader.probes.contains(&"kprobe_do_splice_direct".to_string()));
-        assert!(loader.probes.contains(&"kprobe_tcp_connect".to_string()));
-        assert!(loader.probes.contains(&"kprobe_commit_creds".to_string()));
+        let probes = loader.loaded_probes();
+        assert!(!probes.is_empty(), "注册表不应为空");
+        let find = |name: &str| {
+            probes
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("注册表缺少 {name}"))
+        };
+        assert_eq!(find("trace_sys_enter").kind, ProbeKind::Tracepoint);
+        assert_eq!(find("trace_sys_enter").category, Some("raw_syscalls"));
+        assert_eq!(find("trace_sys_enter").target, "sys_enter");
+        assert_eq!(find("kprobe_vfs_open").kind, ProbeKind::Kprobe);
+        assert_eq!(find("kprobe_vfs_open").target, "vfs_open");
+        assert_eq!(find("kretprobe_load_module").kind, ProbeKind::Kretprobe);
+        assert_eq!(find("kretprobe_load_module").target, "load_module");
+        // 程序名唯一
+        let mut names: Vec<&str> = probes.iter().map(|p| p.name).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), probes.len(), "探针程序名必须唯一");
+    }
+
+    /// CI 断言：嵌入的 .o 里每一个探针 SEC 段都必须出现在注册表中，反之亦然。
+    /// 注册表由 build.rs 生成，本测试用同一解析器复核产物与生成的常量没有漂移。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_registry_matches_embedded_object_sections() {
+        let obj = super::ebpf_objects::ebpf_object_for("modern")
+            .expect("modern tier .o 应内嵌进二进制");
+        let parsed = crate::probe_registry::parse_probe_sections(obj)
+            .expect("嵌入了无法解析的 .o");
+        let mut from_obj: Vec<(String, &'static str, Option<String>, String)> = parsed
+            .into_iter()
+            .map(|p| (p.name, p.kind, p.category, p.target))
+            .collect();
+        from_obj.sort();
+        let mut from_registry: Vec<(String, &'static str, Option<String>, String)> =
+            PROBE_REGISTRY
+                .iter()
+                .map(|p| {
+                    let kind = match p.kind {
+                        ProbeKind::Tracepoint => "tracepoint",
+                        ProbeKind::Kprobe => "kprobe",
+                        ProbeKind::Kretprobe => "kretprobe",
+                    };
+                    (
+                        p.name.to_string(),
+                        kind,
+                        p.category.map(|c| c.to_string()),
+                        p.target.to_string(),
+                    )
+                })
+                .collect();
+        from_registry.sort();
+        assert_eq!(
+            from_obj, from_registry,
+            ".o 的 SEC 段与生成的注册表不一致（构建期枚举漂移）"
+        );
     }
 
     #[test]

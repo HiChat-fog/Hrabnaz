@@ -45,11 +45,15 @@ pub async fn run(watch: bool, interval: u64) -> Result<()> {
     println!("{}", "── 2. eBPF 探针配置 ──".cyan().bold());
     println!();
 
-    // 探针清单从 loader 取（单一事实来源），不再手抄一份常量表
+    // 探针清单从 loader 的构建期注册表取（单一事实来源），不再手抄常量表
+    use ks_engine::loader::ProbeKind;
     let loader = ks_engine::loader::EbpfLoader::new();
     let probes = loader.loaded_probes();
-    let tp_count = probes.iter().filter(|p| p.starts_with("trace_")).count();
-    let kp_count = probes.iter().filter(|p| p.starts_with("kprobe_") || p.starts_with("kretprobe_")).count();
+    let tp_count = probes
+        .iter()
+        .filter(|p| p.kind == ProbeKind::Tracepoint)
+        .count();
+    let kp_count = probes.len() - tp_count;
     println!(
         "  内置探针 {} 个: {} tracepoint + {} kprobe/kretprobe（实际 attach 数随内核符号而定）",
         probes.len(),
