@@ -103,9 +103,37 @@ pub struct ForensicLogger {
     current_file_size: u64,
     rotation_config: RotationConfig,
     log_dir: PathBuf,
+    /// 上一次外落 chain_head 的 (event_count, hash, file)：同一链尾重复 flush 不重复写行。
+    /// 旧实现 Drop/显式 flush 各外落一次，chain_head.log 出现同秒同 seq 的重复行
+    last_exported: Option<(u64, String, String)>,
+    /// 当前活跃文件对应的日期（events_YYYYMMDD.jsonl 的日期），跨天滚动判定用
+    file_date: String,
+    /// 上次跨天检查的 epoch 秒（10s 节流，避免每事件都做 Local::now 时区换算）
+    last_date_check_secs: u64,
 }
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// 活跃日志文件名 events_YYYYMMDD.jsonl → 日期串；其他命名返回 None。
+/// 归档 events_YYYYMMDD_HHMMSS.jsonl 含下划线，不匹配，避免误判。
+fn parse_active_file_date(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("events_")?;
+    let date = rest.strip_suffix(".jsonl")?;
+    (date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit())).then_some(date)
+}
+
+/// 统一打开取证日志（支持 .jsonl 与 .jsonl.gz 归档）——回放与链校验共用。
+/// 归档默认 gzip 压缩，消费方不应被迫自己解压后才能校验。
+pub fn open_log_reader(path: &Path) -> Result<Box<dyn BufRead>> {
+    let file = File::open(path)?;
+    if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+        Ok(Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(
+            file,
+        ))))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
 
 impl ForensicLogger {
     pub fn new(path: PathBuf) -> Result<Self> {
@@ -137,6 +165,19 @@ impl ForensicLogger {
             log::warn!("清理过期归档失败: {}", e);
         }
 
+        // 活跃文件日期：从 events_YYYYMMDD.jsonl 解析；非该命名（单测临时文件）视为
+        // "就是今天"，避免测试用的任意文件名被跨天滚动误触发
+        let file_date = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(parse_active_file_date)
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| chrono::Local::now().format("%Y%m%d").to_string());
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         Ok(Self {
             writer: BufWriter::with_capacity(65536, file),
             path,
@@ -148,6 +189,9 @@ impl ForensicLogger {
             current_file_size,
             rotation_config: config,
             log_dir,
+            last_exported: None,
+            file_date,
+            last_date_check_secs: now_secs,
         })
     }
 
@@ -218,10 +262,71 @@ impl ForensicLogger {
             // 无并发上限，高频轮转会堆积线程；且 remove_file 失败被吞，留下 .jsonl/.gz 双份
             spawn_gzip_worker(src, gzip_path);
         }
+        // 每个归档边界外落一次链尾锚点（有界：一次/轮转，约 10 分钟级）
+        self.export_chain_head();
+        Ok(())
+    }
+
+    /// 跨天滚动检查（10s 节流）：文件名 events_YYYYMMDD.jsonl 的日期是写入口径，
+    /// 进程跨天继续写旧名文件会让"按天"语义失真（README/replay 都按天描述）。
+    fn maybe_rollover_day(&mut self) -> Result<()> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now_secs.saturating_sub(self.last_date_check_secs) < 10 {
+            return Ok(());
+        }
+        self.last_date_check_secs = now_secs;
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
+        if today != self.file_date {
+            self.rollover_to_date(&today)?;
+        }
+        Ok(())
+    }
+
+    /// 跨天滚动：昨天的活跃文件轮转为归档，新建 events_<today>.jsonl 继续写。
+    /// 链不重置：prev_hash 跨文件延续（新文件首条 anchored）；seq/event_count 也不
+    /// 重置（同一进程内计数），消费方在文件内看到的序号保持单调。
+    fn rollover_to_date(&mut self, today: &str) -> Result<()> {
+        self.writer.flush()?;
+        let now_tag = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let archive_path = self.log_dir.join(format!("events_{}.jsonl", now_tag));
+        std::fs::rename(&self.path, &archive_path)?;
+
+        let new_path = self.log_dir.join(format!("events_{}.jsonl", today));
+        // 防御：今天的同名文件已存在（异常场景）时先移走——两条不同的链混进同一
+        // 文件会让链校验必然断裂
+        if new_path.exists() && new_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            let aside = self.log_dir.join(format!("events_{}_pre.jsonl", now_tag));
+            if let Err(e) = std::fs::rename(&new_path, &aside) {
+                log::warn!(
+                    "跨天滚动: 移走同名旧文件失败: {} — {}",
+                    new_path.display(),
+                    e
+                );
+            }
+        }
+        let new_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&new_path)?;
+        self.writer = BufWriter::with_capacity(65536, new_file);
+        self.path = new_path;
+        self.file_date = today.to_string();
+        self.current_file_size = 0;
+        self.export_chain_head();
+        log::info!("跨天滚动: 归档至 {}", archive_path.display());
+
+        if self.rotation_config.compress_archives {
+            let gzip_path = archive_path.with_extension("jsonl.gz");
+            spawn_gzip_worker(archive_path, gzip_path);
+        }
         Ok(())
     }
 
     pub fn log_event(&mut self, event: &DecodedEvent) -> Result<()> {
+        self.maybe_rollover_day()?;
         self.event_count += 1;
 
         let mut record = serde_json::json!({
@@ -290,6 +395,7 @@ impl ForensicLogger {
     }
 
     pub fn log_alert(&mut self, alert: &Alert) -> Result<()> {
+        self.maybe_rollover_day()?;
         self.alert_count += 1;
         let mut record = serde_json::to_value(alert)?;
         record["type"] = serde_json::Value::String("alert".to_string());
@@ -312,7 +418,9 @@ impl ForensicLogger {
         self.prev_hash = current_hash;
         self.current_file_size += line.len() as u64 + 1;
         self.writer.flush()?;
-        self.last_flush_count = self.event_count;
+        // 不重置 last_flush_count：告警高频时若跟着重置，"每 1000 条事件 flush
+        // 并外落链尾"的条件会被永久推迟（真机实测 chain_head.log 冻结 90+ 分钟）。
+        // 告警只负责把数据 flush 到 OS 保证实时可见，链尾外落交给事件节奏 + 轮转边界。
         self.maybe_rotate()?;
         Ok(())
     }
@@ -324,18 +432,34 @@ impl ForensicLogger {
         Ok(())
     }
 
-    /// 链尾哈希外落（文档缺口 #6"无链尾外报"）：每次 flush 把链尾 hash 追加
+    /// 链尾哈希外落（文档缺口 #6"无链尾外报"）：flush 时把链尾 hash 追加
     /// 写到日志目录下的独立文件 chain_head.log。取证日志被整批删除/篡改时，
     /// 该文件仍保留可对照的哈希记录（replay 验证结果可与之外部比对）。
-    /// 追加式且带时间戳，攻击者无法在不留痕迹的情况下"回填"历史链尾
-    fn export_chain_head(&self) {
+    /// 追加式且带时间戳，攻击者无法在不留痕迹的情况下"回填"历史链尾。
+    /// 同一 (event_count, hash, file) 重复 flush 只写一次（旧实现 Drop+显式 flush
+    /// 各写一行，留下同秒同 seq 的重复行）。
+    fn export_chain_head(&mut self) {
         let head_path = self.log_dir.join("chain_head.log");
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let key = (
+            self.event_count,
+            self.prev_hash.clone(),
+            file_name.clone(),
+        );
+        if self.last_exported.as_ref() == Some(&key) {
+            return;
+        }
         let line = format!(
             "{} seq={} hash={} file={}\n",
             chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             self.event_count,
             self.prev_hash,
-            self.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            file_name,
         );
         let write_res = OpenOptions::new()
             .create(true)
@@ -345,6 +469,8 @@ impl ForensicLogger {
         if let Err(e) = write_res {
             // 外落失败不影响主取证链路
             log::debug!("chain_head 外落失败: {} — {}", head_path.display(), e);
+        } else {
+            self.last_exported = Some(key);
         }
     }
 
@@ -361,10 +487,10 @@ impl ForensicLogger {
         &self.prev_hash
     }
 
-    pub fn verify_chain(path: &PathBuf) -> Result<ChainVerification> {
-        // 流式逐行校验：旧实现 read_to_string 把 100MB+ 整个日志读进内存
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
+    pub fn verify_chain(path: &Path) -> Result<ChainVerification> {
+        // 流式逐行校验：旧实现 read_to_string 把 100MB+ 整个日志读进内存；
+        // .jsonl.gz 归档与活跃 .jsonl 共用同一读取入口
+        let reader = open_log_reader(path)?;
         let mut prev_hash = GENESIS_HASH.to_string();
         let mut total_records = 0u64;
         let mut broken_at: Option<u64> = None;
@@ -890,5 +1016,157 @@ mod tests {
         let v = ForensicLogger::verify_chain(&path).unwrap();
         assert!(!v.is_valid);
         assert_eq!(v.broken_at, Some(4), "半行应作为第 4 条记录断裂报告");
+    }
+
+    fn make_alert() -> ks_core::alert::Alert {
+        ks_core::alert::Alert {
+            id: uuid::Uuid::new_v4(),
+            timestamp_ns: 123456789,
+            severity: ks_core::rule::Severity::High,
+            title: "test alert".to_string(),
+            description: "desc".to_string(),
+            rule_name: "test_rule".to_string(),
+            process: ks_core::alert::ProcessInfo {
+                pid: 100,
+                ppid: 1,
+                comm: "test".to_string(),
+                uid: 0,
+                exe_path: None,
+                cmdline: None,
+            },
+            network: None,
+            file: None,
+            event_ids: vec![],
+            mitre: None,
+            status: ks_core::alert::AlertStatus::New,
+            feedback: None,
+        }
+    }
+
+    /// 链尾外落不能被高频告警饿死：告警只 flush 数据、不重置"每 1000 条事件外落
+    /// 一次"的计数（旧实现每次告警把计数归零且不外落，真机曾冻结 90+ 分钟）
+    #[test]
+    fn test_chain_head_not_starved_by_frequent_alerts() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().to_path_buf();
+        let path = log_dir.join("events_20200101.jsonl");
+        let config = RotationConfig {
+            max_file_size: u64::MAX,
+            retain_days: 30,
+            compress_archives: false,
+        };
+        let mut logger = ForensicLogger::with_rotation(path, config).unwrap();
+        for i in 1..=999u64 {
+            logger.log_event(&make_event(i, 100)).unwrap();
+        }
+        for _ in 0..20 {
+            logger.log_alert(&make_alert()).unwrap();
+        }
+        // 第 1000 条事件必须触发外落
+        logger.log_event(&make_event(1000, 100)).unwrap();
+        let head = std::fs::read_to_string(log_dir.join("chain_head.log")).unwrap();
+        assert!(
+            !head.trim().is_empty(),
+            "告警密集时 1000 条事件后 chain_head 必须已外落（旧实现被告警重置计数而永不外落）"
+        );
+    }
+
+    /// 同一链尾重复 flush（显式 flush + Drop）只外落一次
+    #[test]
+    fn test_chain_head_dedupes_repeated_flush() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().to_path_buf();
+        let path = log_dir.join("test.jsonl");
+        let mut logger = ForensicLogger::new(path).unwrap();
+        logger.log_event(&make_event(1, 100)).unwrap();
+        logger.flush().unwrap();
+        logger.flush().unwrap();
+        drop(logger); // Drop 再 flush 一次
+        let content = std::fs::read_to_string(log_dir.join("chain_head.log")).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "重复 flush 不应重复外落链尾: {:?}", lines);
+    }
+
+    /// 跨天滚动：旧文件归档、新文件按当天日期命名、链跨文件延续（anchored）、
+    /// 序号不重置
+    #[test]
+    fn test_daily_rollover_creates_dated_file_and_keeps_chain() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().to_path_buf();
+        let path = log_dir.join("events_20200101.jsonl");
+        let config = RotationConfig {
+            max_file_size: u64::MAX,
+            retain_days: 30,
+            compress_archives: false,
+        };
+        let mut logger = ForensicLogger::with_rotation(path.clone(), config).unwrap();
+        for i in 1..=5u64 {
+            logger.log_event(&make_event(i, 100)).unwrap();
+        }
+        let old_tail = logger.chain_tail_hash().to_string();
+
+        logger.rollover_to_date("20200102").unwrap();
+        assert!(!path.exists(), "旧活跃文件应已轮转为归档");
+        let new_path = log_dir.join("events_20200102.jsonl");
+        assert!(new_path.exists(), "应新建当天命名的活跃文件");
+
+        logger.log_event(&make_event(6, 100)).unwrap();
+        logger.flush().unwrap();
+
+        // 新文件首条 prev_hash 锚定旧文件链尾
+        let first = std::fs::read_to_string(&new_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let rec: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            rec["prev_hash"].as_str().unwrap(),
+            old_tail,
+            "新文件首条应锚定上一世代的链尾"
+        );
+        assert_eq!(rec["seq"].as_u64().unwrap(), 6, "序列号跨文件不重置");
+
+        let v = ForensicLogger::verify_chain(&new_path).unwrap();
+        assert!(v.is_valid, "跨天滚动后新文件链应连续: {:?}", v.broken_at);
+        assert!(v.anchored, "新文件首条应锚定上一世代");
+
+        // 旧内容已在归档文件中
+        let archives: Vec<std::ffi::OsString> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| {
+                let s = n.to_string_lossy();
+                s.starts_with("events_") && s != "events_20200102.jsonl"
+            })
+            .collect();
+        assert!(!archives.is_empty(), "旧文件应成为归档");
+    }
+
+    /// .jsonl.gz 归档必须能被链校验直接读取（归档默认 gzip 压缩）
+    #[test]
+    fn test_verify_chain_supports_gz_archive() {
+        use std::io::Write as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events_20200101.jsonl");
+        let mut logger = ForensicLogger::new(path.clone()).unwrap();
+        for i in 1..=5u64 {
+            logger.log_event(&make_event(i, 100)).unwrap();
+        }
+        logger.flush().unwrap();
+        drop(logger);
+
+        let raw = std::fs::read(&path).unwrap();
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let gz_path = dir.path().join("events_20200101_120000.jsonl.gz");
+        std::fs::write(&gz_path, encoder.finish().unwrap()).unwrap();
+
+        let v = ForensicLogger::verify_chain(&gz_path).unwrap();
+        assert!(v.is_valid, "gz 归档应可校验: {:?}", v.broken_at);
+        assert_eq!(v.total_records, 5);
     }
 }

@@ -3,6 +3,7 @@ use ks_core::alert::Alert;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,6 +14,16 @@ use colored::Colorize;
 const SEEN_CAP: usize = 10000;
 /// 启动时回显日志中已有的最近 N 条告警（对齐旧版轮询 limit=20 的首屏行为）
 const SEED_LIMIT: usize = 20;
+
+/// 跟踪中的日志文件：路径 + 已消费偏移 + 文件身份（dev/ino）。
+/// 轮转会 rename 旧文件并在**同一路径**新建文件——路径不变但 inode 变了，
+/// 只看路径会把旧 offset 用到新文件上（新文件更小 → 永远读不到新告警）。
+struct Tracked {
+    path: PathBuf,
+    offset: u64,
+    dev: u64,
+    ino: u64,
+}
 
 #[derive(clap::Args, Debug)]
 pub struct WatchArgs {
@@ -27,7 +38,21 @@ pub struct WatchArgs {
     pub json: bool,
 }
 
-/// 目录里最新的 events_*.jsonl（文件名带日期，排序即时间序，轮转/换日自动跟上）
+/// 活跃取证文件固定为 events_YYYYMMDD.jsonl。归档 events_YYYYMMDD_HHMMSS.jsonl
+/// 在 ASCII 上排在同日活跃文件之后（'_' 0x5F > '.' 0x2E），旧实现"按名字排序取
+/// 最大"会在轮转→压缩窗口（压缩被跳过/失败时甚至是永久）把归档当成最新文件，
+/// 导致 watch 停报。
+fn is_active_log_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("events_") else {
+        return false;
+    };
+    let Some(date) = rest.strip_suffix(".jsonl") else {
+        return false;
+    };
+    date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 目录里最新的活跃文件（文件名带日期，排序即时间序；归档与压缩文件不参与）
 fn latest_log(dir: &str) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
@@ -36,7 +61,7 @@ fn latest_log(dir: &str) -> Option<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("events_") && n.ends_with(".jsonl"))
+                .is_some_and(is_active_log_name)
         })
         .collect();
     candidates.sort();
@@ -113,7 +138,7 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
     let mut seen: HashSet<uuid::Uuid> = HashSet::new();
     let mut seen_order: VecDeque<uuid::Uuid> = VecDeque::new();
     let mut count: usize = 0;
-    let mut tracked: Option<(PathBuf, u64)> = None;
+    let mut tracked: Option<Tracked> = None;
 
     // 启动时流式扫描日志：只保留最近 N 条告警用于回显 + 全量 id 进 seen（防 tail 重复），
     // 不整文件驻留内存（长跑日志可达百 MB 级）
@@ -148,8 +173,15 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
                     }
                 }
             }
+            if let Ok(meta) = file.metadata() {
+                tracked = Some(Tracked {
+                    path: path.clone(),
+                    offset: end_offset,
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                });
+            }
         }
-        tracked = Some((path.clone(), end_offset));
         if total > 0 && !json_mode {
             println!("  已有 {} 条历史告警，回显最近 {} 条:", total, recent.len());
             for a in &recent {
@@ -174,27 +206,45 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
                 break;
             }
             _ = tokio::time::sleep(Duration::from_secs(args.interval)) => {
-                // 轮转/换日：最新文件变化则切过去从头读
+                // 换日/换文件：活跃文件路径变化则切过去从头读
                 if let Some(latest) = latest_log(&args.log_dir) {
                     let need_reset = match &tracked {
-                        Some((p, _)) => *p != latest,
+                        Some(t) => t.path != latest,
                         None => true,
                     };
                     if need_reset {
-                        tracked = Some((latest, 0));
+                        tracked = Some(Tracked {
+                            path: latest,
+                            offset: 0,
+                            dev: 0,
+                            ino: 0,
+                        });
                     }
                 }
-                let Some((path, offset)) = tracked.as_mut() else {
+                let Some(tr) = tracked.as_mut() else {
                     continue;
                 };
-                let Ok(mut file) = File::open(&*path) else {
+                let Ok(mut file) = File::open(&tr.path) else {
                     continue;
                 };
-                let (consumed, lines) = match read_new_lines(&mut file, *offset) {
+                // 同一路径下文件被轮转替换（inode 变化）或被截断时，旧 offset 无意义，
+                // 从头重读（告警按 id 去重，已显示过的不会重复）
+                if let Ok(meta) = file.metadata() {
+                    if tr.ino == 0
+                        || meta.dev() != tr.dev
+                        || meta.ino() != tr.ino
+                        || meta.len() < tr.offset
+                    {
+                        tr.offset = 0;
+                        tr.dev = meta.dev();
+                        tr.ino = meta.ino();
+                    }
+                }
+                let (consumed, lines) = match read_new_lines(&mut file, tr.offset) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-                *offset += consumed;
+                tr.offset += consumed;
                 for line in &lines {
                     let Some(a) = parse_alert_line(line) else {
                         continue;
@@ -228,4 +278,36 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 只有"当前世代"的活跃文件参与 tail：归档名带 _HHMMSS 后缀，不能匹配
+    #[test]
+    fn active_log_name_matches_only_current_generation() {
+        assert!(is_active_log_name("events_20261016.jsonl"));
+        assert!(!is_active_log_name("events_20261016_172533.jsonl"));
+        assert!(!is_active_log_name("events_20261016_172533.jsonl.gz"));
+        assert!(!is_active_log_name("chain_head.log"));
+        assert!(!is_active_log_name("events_short.jsonl"));
+        assert!(!is_active_log_name("events_20261016.jsonl.bak"));
+    }
+
+    /// 未压缩归档（轮转→压缩窗口内，或压缩被跳过/失败后长期存在）不能顶替活跃文件
+    #[test]
+    fn latest_log_prefers_active_over_uncompressed_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("events_20261015.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("events_20261016.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("events_20261016_172533.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("events_20261016_172533.jsonl.gz"), "").unwrap();
+        let latest = latest_log(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            latest.file_name().unwrap().to_str().unwrap(),
+            "events_20261016.jsonl",
+            "同日未压缩归档排序在活跃文件之后，旧实现会误选归档导致 watch 停报"
+        );
+    }
 }

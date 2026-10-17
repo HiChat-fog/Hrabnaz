@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::Path;
 
 use colored::*;
@@ -103,8 +102,8 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
         println!();
     }
 
-    let file_handle = File::open(path)?;
-    let reader = BufReader::new(file_handle);
+    // 归档默认 gzip 压缩（.jsonl.gz）：回放必须能直接读它，而不是让使用者先手工解压
+    let reader = ks_engine::forensic::open_log_reader(path)?;
 
     let mut event_count: u64 = 0;
     let mut alert_count: u64 = 0;
@@ -534,11 +533,20 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// timestamp_ns 来自内核 bpf_ktime_get_ns()（CLOCK_MONOTONIC，开机起算），不是
+/// epoch。旧实现按 epoch 渲染，回放里出现 1970 年的假日期。这里按"开机后"格式
+/// 如实显示；文件内的相对时间线（跨度/时间线分布）不受影响。
 fn format_timestamp(ns: u64) -> String {
     let secs = ns / 1_000_000_000;
-    chrono::DateTime::from_timestamp(secs as i64, 0)
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .unwrap_or_else(|| format!("ts={}", ns))
+    let days = secs / 86_400;
+    let h = (secs % 86_400) / 3_600;
+    let m = (secs % 3_600) / 60;
+    let s = secs % 60;
+    if days > 0 {
+        format!("开机后 {}d {:02}:{:02}:{:02}", days, h, m, s)
+    } else {
+        format!("开机后 {:02}:{:02}:{:02}", h, m, s)
+    }
 }
 
 #[derive(Clone)]

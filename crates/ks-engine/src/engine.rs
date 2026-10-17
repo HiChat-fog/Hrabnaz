@@ -465,7 +465,7 @@ impl Engine {
         let rules_total: usize = rules_files.iter().map(|(_, c)| *c).sum();
 
         // 3. 组件组装
-        let aggregator = EventAggregator::new(config.engine.buffer_size);
+        let mut aggregator = EventAggregator::new(config.engine.buffer_size);
         let baseline_mgr = BaselineManager::new();
         let correlation_engine = CorrelationEngine::new(300);
         let process_tree_mgr = ProcessTreeManager::new();
@@ -564,6 +564,13 @@ impl Engine {
             log_path.clone(),
             rotation_config,
         )?));
+        // 重启后续号：用取证链恢复出的链尾 seq 播种 aggregator。旧实现 aggregator
+        // 每次进程启动从 0 开始，在同一日志文件内造成 seq 回退（真机实测 2468541→1），
+        // alert.event_ids 的定位会因此歧义。
+        {
+            let recovered_seq = forensic.lock().await.event_count();
+            aggregator.set_seq(recovered_seq);
+        }
         let (forensic_tx, forensic_rx) = tokio::sync::mpsc::channel::<ForensicOp>(65536);
         let forensic_sink = ForensicSink { tx: forensic_tx };
         let forensic_worker = {
@@ -1112,6 +1119,65 @@ mod tests {
         let v = ForensicLogger::verify_chain(&forensic_path).unwrap();
         assert!(v.is_valid, "引擎产出的取证链应完整: {:?}", v.broken_at);
         assert_eq!(v.total_records, summary.events_logged + summary.alerts_logged);
+    }
+
+    fn event_seqs(path: &std::path::Path) -> Vec<u64> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get("seq").and_then(|s| s.as_u64()))
+            .collect()
+    }
+
+    /// 重启续号：同一日志文件内 seq 不能因进程重启而回退（旧实现从 1 重新开始，
+    /// alert.event_ids 的定位会指向错误事件；真机实测回退 2468541→1）
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_engine_seq_continues_across_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules");
+        let mk_options = || EngineOptions {
+            config: Config::default(),
+            rules_dir: rules.to_string_lossy().to_string(),
+            log_dir: dir.path().to_string_lossy().to_string(),
+            source: EventSourceSpec::Provided(
+                Box::new(MockEventSource::new_with_scenario(MockScenario::All)),
+                None,
+            ),
+            heartbeat_path: None,
+            ml_observe_sec: None,
+        };
+
+        // 第一次运行：跑完整 mock 场景
+        let mut e1 = Engine::start(mk_options()).await.unwrap();
+        let forensic_path = e1.info().forensic_path.clone();
+        let mut consumed1 = 0usize;
+        loop {
+            let out = e1.tick().await.unwrap();
+            consumed1 += out.consumed;
+            if out.exhausted {
+                break;
+            }
+        }
+        e1.shutdown().await.unwrap();
+        let seqs1 = event_seqs(&forensic_path);
+        assert_eq!(seqs1.len(), consumed1, "mock 事件应全部入链");
+        let last = *seqs1.last().unwrap();
+
+        // 第二次运行：同一日志目录重启，seq 应从链尾续号
+        let mut e2 = Engine::start(mk_options()).await.unwrap();
+        let out = e2.tick().await.unwrap();
+        assert!(out.consumed > 0);
+        e2.shutdown().await.unwrap();
+
+        let seqs2 = event_seqs(&forensic_path);
+        assert!(seqs2.len() > seqs1.len(), "第二次运行应追加事件");
+        let run2_first = seqs2[seqs1.len()];
+        assert_eq!(
+            run2_first,
+            last + 1,
+            "重启后 seq 应从链尾续号，而不是从 1 重新开始"
+        );
     }
 
     /// 反向 Shell 场景单事件流：tick→effects 顺序应包含规则告警

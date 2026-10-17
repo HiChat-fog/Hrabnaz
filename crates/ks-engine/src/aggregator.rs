@@ -421,6 +421,12 @@ impl EventAggregator {
             .collect()
     }
 
+    /// 重启后续号：用取证链恢复出的链尾 seq 播种，避免同一日志文件内 seq
+    /// 因进程重启而回退/重复（alert.event_ids 的定位依赖文件内唯一序号）
+    pub fn set_seq(&mut self, seq: u64) {
+        self.seq = seq;
+    }
+
     pub fn seq(&self) -> u64 {
         self.seq
     }

@@ -816,6 +816,7 @@ dependencies = [
  "sd-notify",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
