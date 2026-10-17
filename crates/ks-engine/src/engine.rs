@@ -692,7 +692,26 @@ impl Engine {
                         "consumed": stats.load(std::sync::atomic::Ordering::Relaxed),
                     });
                     let tmp = path.with_extension(format!("hb.tmp{}", std::process::id()));
-                    if std::fs::write(&tmp, payload.to_string()).is_ok() {
+                    // 心跳含 pid/消费数，权限契约与状态文件一致（0600）
+                    let write_res = (|| -> std::io::Result<()> {
+                        #[cfg(unix)]
+                        {
+                            use std::io::Write;
+                            use std::os::unix::fs::OpenOptionsExt;
+                            let mut f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .truncate(true)
+                                .mode(0o600)
+                                .open(&tmp)?;
+                            f.write_all(payload.to_string().as_bytes())
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            std::fs::write(&tmp, payload.to_string())
+                        }
+                    })();
+                    if write_res.is_ok() {
                         let _ = std::fs::rename(&tmp, &path);
                     }
                 }

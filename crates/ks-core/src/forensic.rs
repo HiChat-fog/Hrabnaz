@@ -114,6 +114,60 @@ pub struct ForensicLogger {
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// 取证记录 schema 版本（事件与告警记录都带 `schema_version`）。
+/// 破坏性字段变更时递增；新增可选字段不递增（消费方必须容忍未知字段）。
+pub const SCHEMA_VERSION: u64 = 1;
+
+/// 取证目录/文件的权限契约：目录 0700、文件 0600（敏感数据不可被本地普通用户读取）。
+/// root 引擎不受影响；前端（Hliðskjálf）需以 root 或受权身份读取。
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        log::warn!("创建取证目录失败 {}: {}", dir.display(), e);
+        return;
+    }
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+        log::warn!("收紧取证目录权限失败 {}: {}", dir.display(), e);
+    }
+}
+
+/// 把升级前遗留的宽权限文件收紧到 0600（只动 events_* 与 chain_head.log）
+#[cfg(unix)]
+fn tighten_existing_files(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("events_") || name == "chain_head.log") {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(md) = entry.metadata() {
+            if md.is_file() && md.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// 私有打开（0600）——活跃日志/归档/链尾统一入口
+fn open_private(path: &Path, append: bool) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    if append {
+        opts.create(true).append(true);
+    } else {
+        opts.create(true).truncate(true).write(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 /// 活跃日志文件名 events_YYYYMMDD.jsonl → 日期串；其他命名返回 None。
 /// 归档 events_YYYYMMDD_HHMMSS.jsonl 含下划线，不匹配，避免误判。
 fn parse_active_file_date(name: &str) -> Option<&str> {
@@ -145,6 +199,11 @@ impl ForensicLogger {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("无法获取日志目录"))?
             .to_path_buf();
+        #[cfg(unix)]
+        {
+            ensure_private_dir(&log_dir);
+            tighten_existing_files(&log_dir);
+        }
 
         let file_exists = path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false);
         let current_file_size = if file_exists {
@@ -153,7 +212,12 @@ impl ForensicLogger {
             0
         };
 
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_private(&path, true)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
 
         let (prev_hash, event_count) = if file_exists {
             Self::recover_chain_state(&path)?
@@ -307,10 +371,7 @@ impl ForensicLogger {
                 );
             }
         }
-        let new_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&new_path)?;
+        let new_file = open_private(&new_path, true)?;
         self.writer = BufWriter::with_capacity(65536, new_file);
         self.path = new_path;
         self.file_date = today.to_string();
@@ -330,8 +391,12 @@ impl ForensicLogger {
         self.event_count += 1;
 
         let mut record = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "type": "event",
             "seq": event.seq, "timestamp_ns": event.header.timestamp_ns,
-            "event_type": event.header.event_type, "pid": event.header.pid,
+            "event_type": event.header.event_type,
+            "event_type_name": crate::event::event_type_name(event.header.event_type),
+            "pid": event.header.pid,
             "tid": event.header.tid, "uid": event.header.uid, "ppid": event.header.ppid,
             "comm": event.comm, "syscall_nr": event.header.syscall_nr, "retval": event.header.retval,
         });
@@ -405,6 +470,7 @@ impl ForensicLogger {
         self.maybe_rollover_day()?;
         self.alert_count += 1;
         let mut record = serde_json::to_value(alert)?;
+        record["schema_version"] = serde_json::json!(SCHEMA_VERSION);
         record["type"] = serde_json::Value::String("alert".to_string());
         if let Some(epoch_ms) = crate::time::epoch_ms_from_monotonic_ns(alert.timestamp_ns) {
             record["epoch_ms"] = serde_json::json!(epoch_ms);
@@ -471,10 +537,7 @@ impl ForensicLogger {
             self.prev_hash,
             file_name,
         );
-        let write_res = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&head_path)
+        let write_res = open_private(&head_path, true)
             .and_then(|mut f| f.write_all(line.as_bytes()));
         if let Err(e) = write_res {
             // 外落失败不影响主取证链路
@@ -599,7 +662,7 @@ impl Drop for ForensicLogger {
 
 fn compress_gzip(src: &Path, dst: &Path) -> Result<()> {
     let input = File::open(src)?;
-    let output = File::create(dst)?;
+    let output = open_private(dst, false)?;
     let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
     let mut reader = BufReader::new(input);
     std::io::copy(&mut reader, &mut encoder)?;
@@ -1191,6 +1254,73 @@ mod tests {
         // 双字段并存：单调钟仍是取证序权威
         assert!(ev.get("timestamp_ns").is_some());
         assert!(al.get("timestamp_ns").is_some());
+    }
+
+    /// 契约 v1：事件与告警记录都带 schema_version/type；事件带可读 event_type_name，
+    /// 数值 event_type 保留。
+    #[test]
+    fn test_records_carry_contract_v1_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events_20200101.jsonl");
+        let mut logger = ForensicLogger::new(path.clone()).unwrap();
+        let ev = make_event(1, 100);
+        logger.log_event(&ev).unwrap();
+        logger.log_alert(&make_alert()).unwrap();
+        logger.flush().unwrap();
+        drop(logger);
+
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let event = &lines[0];
+        let alert = &lines[1];
+
+        assert_eq!(event["schema_version"].as_u64(), Some(SCHEMA_VERSION));
+        assert_eq!(event["type"].as_str(), Some("event"));
+        assert_eq!(
+            event["event_type_name"].as_str(),
+            Some(crate::event::event_type_name(ev.header.event_type)),
+            "event_type_name 必须与数值同源"
+        );
+        assert_eq!(
+            event["event_type"].as_u64(),
+            Some(u64::from(ev.header.event_type)),
+            "数值 event_type 保留（内核/调试用）"
+        );
+
+        assert_eq!(alert["schema_version"].as_u64(), Some(SCHEMA_VERSION));
+        assert_eq!(alert["type"].as_str(), Some("alert"));
+
+        // 新字段参与哈希前内容：链仍然自洽
+        let v = ForensicLogger::verify_chain(&path).unwrap();
+        assert!(v.is_valid, "契约字段加入后链应仍可校验: {:?}", v.broken_at);
+    }
+
+    /// 权限契约：目录 0700、活跃日志/链尾 0600（敏感数据不可被本地普通用户读取）
+    #[cfg(unix)]
+    #[test]
+    fn test_forensic_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let log_dir = dir.path().join("logs");
+        let path = log_dir.join("events_20200101.jsonl");
+        let mut logger = ForensicLogger::new(path.clone()).unwrap();
+        logger.log_event(&make_event(1, 100)).unwrap();
+        logger.flush().unwrap();
+        drop(logger);
+
+        let dir_mode = std::fs::metadata(&log_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let head_mode = std::fs::metadata(log_dir.join("chain_head.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "取证目录应为 0700");
+        assert_eq!(file_mode, 0o600, "活跃日志应为 0600");
+        assert_eq!(head_mode, 0o600, "chain_head.log 应为 0600");
     }
 
     /// .jsonl.gz 归档必须能被链校验直接读取（归档默认 gzip 压缩）

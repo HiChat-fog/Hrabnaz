@@ -176,6 +176,32 @@ impl Default for RawPayload {
     }
 }
 
+/// 事件类型数值 → 契约字符串名（forensic JSONL 的 `event_type_name` 字段）。
+///
+/// 对外契约只暴露稳定的 snake_case 名；数值 `event_type` 保留供内核/调试使用。
+/// 新增事件类型必须同时更新本映射（契约先行，见 ROADMAP H-5）。
+pub fn event_type_name(event_type: u32) -> &'static str {
+    match event_type {
+        1 => "process_exec",
+        2 => "process_exit",
+        3 => "process_clone",
+        10 => "file_open",
+        11 => "file_read",
+        12 => "file_write",
+        13 => "file_delete",
+        14 => "file_rename",
+        15 => "file_chmod",
+        20 => "net_connect",
+        21 => "net_accept",
+        22 => "net_send",
+        23 => "net_recv",
+        24 => "net_dns",
+        30 => "proc_ptrace",
+        31 => "proc_signal",
+        _ => "unknown",
+    }
+}
+
 pub fn min_event_size(event_type: u32) -> usize {
     match event_type {
         v if v == ET::ProcessExec as u32 => core::mem::size_of::<ExecEvent>(),
