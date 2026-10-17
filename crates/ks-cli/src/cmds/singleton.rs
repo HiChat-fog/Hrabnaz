@@ -20,7 +20,7 @@ pub fn acquire() -> io::Result<File> {
                 continue;
             }
         };
-        if ks_engine::sys::try_lock_file(&f).is_ok() {
+        if ks_core::sys::try_lock_file(&f).is_ok() {
             use std::io::{Seek, Write};
             let mut f = f;
             let _ = f.seek(std::io::SeekFrom::Start(0));

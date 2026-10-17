@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     #[cfg(target_os = "linux")]
-    if let Err(e) = ks_engine::sys::set_memlock_unlimited() {
+    if let Err(e) = ks_core::sys::set_memlock_unlimited() {
         log::warn!(
             "setrlimit(RLIMIT_MEMLOCK, ∞) 失败: {} - eBPF map创建可能EPERM(systemd下由LimitMEMLOCK=infinity覆盖)",
             e

@@ -1,6 +1,8 @@
 pub mod alert;
 pub mod event;
+pub mod forensic;
 pub mod rule;
+pub mod sys;
 pub mod time;
 
 use serde::{Deserialize, Serialize};

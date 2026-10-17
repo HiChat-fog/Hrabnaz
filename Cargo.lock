@@ -825,7 +825,16 @@ dependencies = [
 name = "ks-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
+ "flate2",
+ "log",
+ "nix",
+ "regex",
  "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "uuid",
  "zerocopy",
 ]
@@ -846,7 +855,6 @@ dependencies = [
  "ks-core",
  "libc",
  "log",
- "nix",
  "regex",
  "serde",
  "serde_json",

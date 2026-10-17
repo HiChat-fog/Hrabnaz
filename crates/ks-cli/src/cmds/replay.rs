@@ -63,7 +63,7 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
     }
 
     let path_buf = path.to_path_buf();
-    let verification = ks_engine::forensic::ForensicLogger::verify_chain(&path_buf)?;
+    let verification = ks_core::forensic::ForensicLogger::verify_chain(&path_buf)?;
 
     if !json {
         banner("内核哨兵 — 取证日志回放");
@@ -103,7 +103,7 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
     }
 
     // 归档默认 gzip 压缩（.jsonl.gz）：回放必须能直接读它，而不是让使用者先手工解压
-    let reader = ks_engine::forensic::open_log_reader(path)?;
+    let reader = ks_core::forensic::open_log_reader(path)?;
 
     let mut event_count: u64 = 0;
     let mut alert_count: u64 = 0;

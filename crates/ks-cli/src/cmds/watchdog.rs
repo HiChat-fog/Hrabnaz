@@ -115,7 +115,7 @@ pub async fn run(args: &WatchdogArgs) -> Result<()> {
             println!("      {} dry-run: 不发送 SIGTERM", "[跳过]".yellow());
             return Ok(());
         }
-        ks_engine::sys::kill_sigterm(hb.pid);
+        ks_core::sys::kill_sigterm(hb.pid);
         println!(
             "      {} 已向 PID {} 发送 SIGTERM (优雅退出 → systemd 自动拉起)",
             "动作".red().bold(),

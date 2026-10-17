@@ -4,8 +4,8 @@
 //! FFI 的 unsafe 收敛进 nix 库内部（其承诺封装层安全），仓库内审计面只剩
 //! "这里调了哪个系统调用"。签名全部使用安全类型，错误以 Result/bool 表达。
 //!
-//! 注：ks-cli 依赖 ks-engine，故 CLI 侧（setrlimit/geteuid/fcntl/kill）也走
-//! 本模块，全仓库运行时 unsafe 为 0。
+//! 注：本模块居于 ks-core，CLI 与引擎两侧的进程工具（setrlimit/geteuid/
+//! fcntl 锁/kill/单调钟）共用同一实现，全仓库运行时 unsafe 为 0。
 //!
 //! 单调时钟不用 /proc/uptime 口径（boottime 含 suspend，会话挂起后 TTL 会
 //! 变长），与内核 `bpf_ktime_get_ns()` 同为 CLOCK_MONOTONIC。

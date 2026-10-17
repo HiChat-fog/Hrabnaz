@@ -28,8 +28,6 @@ async-trait = "0.1"
 which = "7"
 # blocker: block_decisions 下发的 expire 需与内核 bpf_ktime_get_ns 同源（CLOCK_MONOTONIC）
 libc = "0.2"
-# H-4: sys.rs 的 libc FFI 收敛为 nix 安全封装（仓库内零 unsafe）；仅开用到的 feature
-nix = { version = "0.31", default-features = false, features = ["fs", "resource", "signal", "time", "user"] }
 # H-4 unsafe 收敛: 测试/回放编码走 IntoBytes 安全字节转换（版本对齐依赖树中 aya 传递依赖）
 zerocopy = { version = "0.8", features = ["derive"] }
 

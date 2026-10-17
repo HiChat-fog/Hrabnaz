@@ -1,6 +1,6 @@
-use ks_core::event::DecodedEvent;
+use crate::event::DecodedEvent;
 use anyhow::Result;
-use ks_core::alert::Alert;
+use crate::alert::Alert;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{read_dir, remove_file, File, OpenOptions};
@@ -338,7 +338,7 @@ impl ForensicLogger {
         // 墙钟侧车：btime+monotonic 换算（btime 在 OnceLock 缓存，热路径零 IO）。
         // 换算不出来（无 /proc/stat）时省略字段，消费方退回 timestamp_ns 单调钟
         if let Some(epoch_ms) =
-            ks_core::time::epoch_ms_from_monotonic_ns(event.header.timestamp_ns)
+            crate::time::epoch_ms_from_monotonic_ns(event.header.timestamp_ns)
         {
             record["epoch_ms"] = serde_json::json!(epoch_ms);
         }
@@ -406,7 +406,7 @@ impl ForensicLogger {
         self.alert_count += 1;
         let mut record = serde_json::to_value(alert)?;
         record["type"] = serde_json::Value::String("alert".to_string());
-        if let Some(epoch_ms) = ks_core::time::epoch_ms_from_monotonic_ns(alert.timestamp_ns) {
+        if let Some(epoch_ms) = crate::time::epoch_ms_from_monotonic_ns(alert.timestamp_ns) {
             record["epoch_ms"] = serde_json::json!(epoch_ms);
         }
 
@@ -674,7 +674,7 @@ fn cleanup_old_archives(log_dir: &Path, retain_days: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ks_core::event::EventHeader;
+    use crate::event::EventHeader;
     use tempfile::TempDir;
 
     #[test]
@@ -805,14 +805,14 @@ mod tests {
             for i in 1..=5 {
                 logger.log_event(&make_event(i, 100)).unwrap();
             }
-            let alert = ks_core::alert::Alert {
+            let alert = crate::alert::Alert {
                 id: uuid::Uuid::new_v4(),
                 timestamp_ns: 123456789,
-                severity: ks_core::rule::Severity::High,
+                severity: crate::rule::Severity::High,
                 title: "test alert".to_string(),
                 description: "desc".to_string(),
                 rule_name: "test_rule".to_string(),
-                process: ks_core::alert::ProcessInfo {
+                process: crate::alert::ProcessInfo {
                     pid: 100,
                     ppid: 1,
                     comm: "test".to_string(),
@@ -823,12 +823,12 @@ mod tests {
                 network: None,
                 file: None,
                 event_ids: vec![1, 2],
-                mitre: Some(ks_core::alert::MitreInfo {
+                mitre: Some(crate::alert::MitreInfo {
                     tactic: "TA0002".to_string(),
                     technique: "T1059".to_string(),
                     sub_technique: None,
                 }),
-                status: ks_core::alert::AlertStatus::New,
+                status: crate::alert::AlertStatus::New,
                 feedback: None,
             };
             logger.log_alert(&alert).unwrap();
@@ -1028,15 +1028,15 @@ mod tests {
         assert_eq!(v.broken_at, Some(4), "半行应作为第 4 条记录断裂报告");
     }
 
-    fn make_alert() -> ks_core::alert::Alert {
-        ks_core::alert::Alert {
+    fn make_alert() -> crate::alert::Alert {
+        crate::alert::Alert {
             id: uuid::Uuid::new_v4(),
             timestamp_ns: 123456789,
-            severity: ks_core::rule::Severity::High,
+            severity: crate::rule::Severity::High,
             title: "test alert".to_string(),
             description: "desc".to_string(),
             rule_name: "test_rule".to_string(),
-            process: ks_core::alert::ProcessInfo {
+            process: crate::alert::ProcessInfo {
                 pid: 100,
                 ppid: 1,
                 comm: "test".to_string(),
@@ -1048,7 +1048,7 @@ mod tests {
             file: None,
             event_ids: vec![],
             mitre: None,
-            status: ks_core::alert::AlertStatus::New,
+            status: crate::alert::AlertStatus::New,
             feedback: None,
         }
     }
@@ -1177,7 +1177,7 @@ mod tests {
         let al = &lines[1];
 
         // 侧车换算与 ks_core 公式一致：epoch = btime*1000 + mono_ms
-        let expected_event_ms = ks_core::time::epoch_ms_from_monotonic_ns(1_000_000_000).unwrap();
+        let expected_event_ms = crate::time::epoch_ms_from_monotonic_ns(1_000_000_000).unwrap();
         assert_eq!(
             ev["epoch_ms"].as_i64().unwrap(),
             expected_event_ms,
@@ -1185,7 +1185,7 @@ mod tests {
         );
         assert_eq!(
             al["epoch_ms"].as_i64().unwrap(),
-            ks_core::time::epoch_ms_from_monotonic_ns(alert.timestamp_ns).unwrap(),
+            crate::time::epoch_ms_from_monotonic_ns(alert.timestamp_ns).unwrap(),
             "告警 epoch_ms 应与其 timestamp_ns 同源"
         );
         // 双字段并存：单调钟仍是取证序权威
