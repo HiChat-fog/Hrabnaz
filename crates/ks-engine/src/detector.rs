@@ -588,6 +588,60 @@ mod tests {
         }
     }
 
+    /// 规则层进程豁免：日志采集器读敏感日志不应命中；其他进程仍命中
+    #[test]
+    fn test_rule_comm_exclusion() {
+        let yaml = r#"
+- name: log_access
+  description: "log access"
+  severity: medium
+  conditions:
+    - field: filename
+      operator: regex
+      value: "^/var/log/(auth|secure)"
+    - field: comm
+      operator: not_regex
+      value: "^(rsyslogd|AliYunDunMonito)$"
+  alert_message: "log access detected"
+"#;
+        let mut engine = DetectionEngine::new();
+        engine.load_rules_from_yaml(yaml).unwrap();
+        let mk = |comm: &str| DecodedEvent {
+            seq: 1,
+            header: make_header(10, 100),
+            comm: comm.to_string(),
+            filename: Some("/var/log/secure".to_string()),
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
+        };
+        assert!(
+            engine.match_event(&mk("rsyslogd")).is_empty(),
+            "日志守护进程读取属于本职行为，应被豁免"
+        );
+        assert!(
+            engine.match_event(&mk("AliYunDunMonito")).is_empty(),
+            "云监控代理（comm 截断名）应被豁免"
+        );
+        assert_eq!(
+            engine.match_event(&mk("evil")).len(),
+            1,
+            "非豁免进程读取敏感日志仍应告警"
+        );
+    }
+
     #[test]
     fn test_regex_operator() {
         let yaml = r#"

@@ -6,6 +6,11 @@
     - field: filename
       operator: regex
       value: "^/var/log/(auth|secure|syslog|audit)"
+    # 日志采集/审计守护进程读日志是本职行为：按 comm 豁免，避免常态刷屏。
+    # comm 来自内核 task->comm，16 字节截断，故按截断后的名字匹配。
+    - field: comm
+      operator: not_regex
+      value: "^(rsyslogd|systemd-journal|journald|imjournal|in:imjournal|auditd|AliYunDunMonito|AliYunDun)$"
   alert_message: "检测到对安全相关日志文件的访问，可能为数据窃取做准备"
   mitre_tactic: "TA0010"
   mitre_technique: "T1005"

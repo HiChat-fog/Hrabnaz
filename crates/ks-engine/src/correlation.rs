@@ -176,13 +176,16 @@ impl CorrelationEngine {
                 name: "数据窃取: 读取SSH密钥后建立外部连接".to_string(),
                 correlation_type: CorrelationType::Window {
                     window_secs: 60,
+                    // 只认私钥文件：authorized_keys/known_hosts 是公钥材料，
+                    // sshd 认证期读取属正常行为；旧条件 ".ssh" 子串还误伤
+                    // /etc/ssh/ssh_host_*，真机实测单窗口 61 条误报
                     condition_a: CorrelationCondition::And(vec![
                         CorrelationCondition::EventType(10),
-                        CorrelationCondition::FilenameContains(".ssh".to_string()),
+                        CorrelationCondition::FilenameContains("/.ssh/id_".to_string()),
                     ]),
                     condition_b: CorrelationCondition::EventType(20),
                 },
-                description: "60秒内读SSH密钥后外连".to_string(),
+                description: "60秒内读SSH私钥后外连".to_string(),
                 severity: "high".to_string(),
                 mitre: Some(MitreMapping {
                     tactic: "TA0010".to_string(),
@@ -709,6 +712,45 @@ mod tests {
             engine.detect_correlations(&make_event(2, 1234, 20, "cat", None, None, Some(4444)));
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].confidence > 0.6);
+    }
+
+    /// SSH 密钥外泄关联只认私钥：authorized_keys（sshd 认证期正常读取）不告警，
+    /// /home/*/.ssh/id_* 读后外连才告警。真机曾因 ".ssh" 子串误伤导致 61 条/窗口
+    #[test]
+    fn test_ssh_exfil_ignores_authorized_keys() {
+        let mut engine = CorrelationEngine::new(60);
+        engine.detect_correlations(&make_event(
+            1,
+            100,
+            10,
+            "sshd",
+            Some("/root/.ssh/authorized_keys"),
+            None,
+            None,
+        ));
+        let alerts =
+            engine.detect_correlations(&make_event(2, 100, 20, "sshd", None, None, Some(22)));
+        assert!(
+            !alerts.iter().any(|a| a.rule_name.contains("SSH")),
+            "authorized_keys 是公钥材料，不应触发 SSH 私钥外泄关联"
+        );
+
+        let mut engine = CorrelationEngine::new(60);
+        engine.detect_correlations(&make_event(
+            1,
+            100,
+            10,
+            "cat",
+            Some("/home/u/.ssh/id_rsa"),
+            None,
+            None,
+        ));
+        let alerts =
+            engine.detect_correlations(&make_event(2, 100, 20, "curl", None, None, Some(443)));
+        assert!(
+            alerts.iter().any(|a| a.rule_name.contains("SSH")),
+            "读取私钥后外连应告警"
+        );
     }
 
     #[test]

@@ -159,6 +159,8 @@ pub struct EngineStats {
     pub consumed: u64,
     pub rule_alerts: u64,
     pub anomaly_alerts: u64,
+    /// 被去重窗口压掉的告警数（仅观测用；压制策略见 AlertThrottle）
+    pub suppressed_alerts: u64,
 }
 
 pub struct ShutdownSummary {
@@ -401,6 +403,65 @@ fn severity_meets_threshold(severity: &Severity, threshold: &str) -> bool {
 
 // ─────────────────────────── 引擎 ───────────────────────────
 
+/// 告警去重窗口（H-4 误报压制）。
+///
+/// 同一 (规则名, pid) 在窗口内只发一条告警：
+/// - 事件型（普通规则/关联规则）窗口 60s——避免同一攻击行为逐事件刷屏；
+/// - 状态型（ml_anomaly / baseline_deviation / process_tree_anomaly）窗口
+///   1800s——它们描述"这个进程当前状态异常"，常驻代理会持续命中，
+///   进入异常态告警一次即可，不应按事件重复。
+///
+/// `KS_ALERT_COOLDOWN_SEC` 覆盖两类窗口（0 = 关闭去重）。
+struct AlertThrottle {
+    last: std::collections::HashMap<(String, u32), Instant>,
+    override_secs: Option<u64>,
+}
+
+impl AlertThrottle {
+    fn new() -> Self {
+        Self {
+            last: std::collections::HashMap::new(),
+            override_secs: std::env::var("KS_ALERT_COOLDOWN_SEC")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok()),
+        }
+    }
+
+    fn ttl_secs(rule_name: &str, override_secs: Option<u64>) -> u64 {
+        if let Some(v) = override_secs {
+            return v;
+        }
+        match rule_name {
+            "ml_anomaly" | "baseline_deviation" | "process_tree_anomaly" => 1800,
+            _ => 60,
+        }
+    }
+
+    /// `now` 显式传入便于单测；窗口从"上次放行"起算，不随被压制事件续期
+    fn allow_at(&mut self, rule_name: &str, pid: u32, now: Instant) -> bool {
+        let ttl = Self::ttl_secs(rule_name, self.override_secs);
+        if ttl == 0 {
+            return true;
+        }
+        let key = (rule_name.to_string(), pid);
+        if let Some(last) = self.last.get(&key) {
+            if now.saturating_duration_since(*last).as_secs() < ttl {
+                return false;
+            }
+        }
+        if self.last.len() > 8192 {
+            // 长跑兜底：重置窗口状态（最多多放行一轮，不会无限膨胀）
+            self.last.clear();
+        }
+        self.last.insert(key, now);
+        true
+    }
+
+    fn allow(&mut self, rule_name: &str, pid: u32) -> bool {
+        self.allow_at(rule_name, pid, Instant::now())
+    }
+}
+
 pub struct Engine {
     config: Config,
     source: Box<dyn EventSource>,
@@ -418,6 +479,7 @@ pub struct Engine {
     forensic_worker: tokio::task::JoinHandle<()>,
     chain_reconstructor: ChainReconstructor,
     stats: EngineStats,
+    alert_throttle: AlertThrottle,
     anomaly_threshold: f64,
     block_ttl: u64,
     block_severity_threshold: String,
@@ -676,6 +738,7 @@ impl Engine {
             forensic_worker,
             chain_reconstructor: ChainReconstructor::new(),
             stats: EngineStats::default(),
+            alert_throttle: AlertThrottle::new(),
             anomaly_threshold,
             block_ttl,
             block_severity_threshold,
@@ -808,6 +871,10 @@ impl Engine {
         prof_add(4, t.elapsed().as_nanos() as u64);
 
         for ca in &corr_alerts {
+            if !self.alert_throttle.allow(&ca.rule_name, event.header.pid) {
+                self.stats.suppressed_alerts += 1;
+                continue;
+            }
             let alert = ca.to_alert();
             self.forensic_sink.log_alert(&alert).await;
             self.stats.rule_alerts += 1;
@@ -840,6 +907,10 @@ impl Engine {
         let matches = self.detector.lock().await.match_event(&event);
         prof_add(5, t.elapsed().as_nanos() as u64);
         for m in &matches {
+            if !self.alert_throttle.allow(&m.rule_name, event.header.pid) {
+                self.stats.suppressed_alerts += 1;
+                continue;
+            }
             let alert = self.detector.lock().await.generate_alert(m, &event);
             self.forensic_sink.log_alert(&alert).await;
             self.stats.rule_alerts += 1;
@@ -898,6 +969,10 @@ impl Engine {
                 && self.baseline_mgr.is_inherently_high_freq(&event.comm);
             if !is_protected && !is_high_freq_comm {
                 if let Some(dev) = self.baseline_mgr.detect_deviation(event.header.pid) {
+                    if self
+                        .alert_throttle
+                        .allow("baseline_deviation", event.header.pid)
+                    {
                     let dim = dev
                         .most_deviated_dimension
                         .map(|d| format!("{:?}", d))
@@ -922,11 +997,15 @@ impl Engine {
                         alert,
                         source: AlertSource::BaselineDeviation,
                     })));
+                    } else {
+                        self.stats.suppressed_alerts += 1;
+                    }
                 }
             }
 
             if !is_protected && !is_high_freq_comm {
                 if let Some(ml_result) = self.ml_detector.detect(event.header.pid) {
+                    if self.alert_throttle.allow("ml_anomaly", event.header.pid) {
                     let dim_str = ml_result
                         .dimensions
                         .first()
@@ -959,12 +1038,22 @@ impl Engine {
                         alert,
                         source: AlertSource::MlAnomaly,
                     })));
+                    } else {
+                        self.stats.suppressed_alerts += 1;
+                    }
                 }
             }
 
             if need_heavy_scan {
                 for family in self.process_tree_mgr.anomalous_families() {
                     for rel in &family.anomaly_relations {
+                        if !self
+                            .alert_throttle
+                            .allow("process_tree_anomaly", rel.child_pid)
+                        {
+                            self.stats.suppressed_alerts += 1;
+                            continue;
+                        }
                         let alert = Alert::new(
                             Severity::High,
                             event.header.timestamp_ns,
@@ -1059,6 +1148,47 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::event_source::{MockEventSource, MockScenario};
+
+    /// 告警去重：事件型窗口 60s、状态型 1800s；窗口从上次放行起算不续期；
+    /// KS_ALERT_COOLDOWN_SEC=0 时完全关闭（排障/取证场景）
+    #[test]
+    fn test_alert_throttle_windows() {
+        let mut t = AlertThrottle {
+            last: std::collections::HashMap::new(),
+            override_secs: None,
+        };
+        let t0 = Instant::now();
+        assert!(t.allow_at("rule_a", 100, t0));
+        assert!(!t.allow_at("rule_a", 100, t0 + std::time::Duration::from_secs(59)));
+        assert!(
+            t.allow_at("rule_a", 100, t0 + std::time::Duration::from_secs(61)),
+            "事件型窗口 60s 后应重新放行"
+        );
+        assert!(
+            t.allow_at("rule_a", 200, t0 + std::time::Duration::from_secs(1)),
+            "不同 pid 互不影响"
+        );
+
+        let t1 = t0 + std::time::Duration::from_secs(100);
+        assert!(t.allow_at("ml_anomaly", 300, t1));
+        assert!(
+            !t.allow_at("ml_anomaly", 300, t1 + std::time::Duration::from_secs(1799)),
+            "状态型告警窗口应为 1800s"
+        );
+        assert!(t.allow_at("ml_anomaly", 300, t1 + std::time::Duration::from_secs(1801)));
+    }
+
+    #[test]
+    fn test_alert_throttle_override_zero_disables() {
+        let mut t = AlertThrottle {
+            last: std::collections::HashMap::new(),
+            override_secs: Some(0),
+        };
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert!(t.allow_at("ml_anomaly", 1, t0));
+        }
+    }
 
     #[test]
     fn test_severity_threshold() {
