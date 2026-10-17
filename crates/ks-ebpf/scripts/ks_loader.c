@@ -235,6 +235,54 @@ static int find_maps(Elf *e) {
     return 0;
 }
 
+/* ─── 契约 map 的 bpffs pin ────────────────────────────────────────────────
+ * 引擎（Rust 进程）无法持有本进程创建的 map fd，跨进程访问的唯一通道是
+ * bpffs pin：/sys/fs/bpf/kernelsentinel_<map>。只 pin 契约面（阻断裁决 +
+ * 引擎共享读面），perf 数组等进程内资源不对外暴露。
+ * 引擎侧 PinnedBpfMapReader 通过同一路径打开，BpfMapReader 契约在
+ * aya 与 C loader 两个实现上一致。 */
+static const char *pinned_map_names[] = {
+    "block_decisions",
+    "risk_scores",
+    "ip_whitelist",
+    "net_conn_history",
+    "freq_counters",
+    "infer_config",
+    "protected_comms",
+    NULL
+};
+
+static int should_pin_map(const char *name) {
+    for (const char **p = pinned_map_names; *p; p++) {
+        if (strcmp(name, *p) == 0) return 1;
+    }
+    return 0;
+}
+
+static int pin_contract_maps(void) {
+    int pinned = 0;
+    for (int i = 0; i < nmaps; i++) {
+        if (!should_pin_map(maps[i].name)) continue;
+        char path[160];
+        snprintf(path, sizeof(path), "/sys/fs/bpf/kernelsentinel_%s", maps[i].name);
+        /* 上次实例崩溃遗留的 pin 指向已死的 map：先摘除再重 pin */
+        unlink(path);
+
+        union bpf_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.pathname = (uint64_t)(uintptr_t)path;
+        attr.bpf_fd = maps[i].fd;
+        if (bpf_syscall(BPF_OBJ_PIN, &attr, sizeof(attr)) < 0) {
+            fprintf(stderr, "  [!] pin '%s' failed: %s （/sys/fs/bpf 未挂载? 阻断与跨进程读取不可用）\n",
+                    path, strerror(errno));
+        } else {
+            fprintf(stderr, "  [+] pinned %s\n", path);
+            pinned++;
+        }
+    }
+    return pinned;
+}
+
 static int find_map_fd(const char *name) {
     for (int i = 0; i < nmaps; i++) {
         if (strcmp(maps[i].name, name) == 0) return maps[i].fd;
@@ -834,6 +882,11 @@ int main(int argc, char **argv) {
         elf_end(e);
         close(fd);
         return 1;
+    }
+
+    fprintf(stderr, "\n=== Step 1.5: Pin contract maps (bpffs) ===\n");
+    if (pin_contract_maps() == 0) {
+        fprintf(stderr, "  [!] 无 map 被 pin — 引擎侧阻断/killer/跨进程读取不可用\n");
     }
 
     fprintf(stderr, "\n=== Step 2: Load programs ===\n");

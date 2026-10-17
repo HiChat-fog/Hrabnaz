@@ -660,7 +660,22 @@ mod linux_impl {
             object_path.to_str().expect("object_path非UTF-8"),
         )?;
 
-        Ok((source, None))
+        // C loader 在 Step 1.5 把契约 map pin 到 bpffs；等它出现再返回，
+        // 之后的阻断下发 / killer / ks block 都走同一 pin 路径（map 是契约）
+        match crate::pinned_map_reader::PinnedBpfMapReader::wait_ready(
+            std::time::Duration::from_secs(5),
+        ) {
+            Some(reader) => {
+                log::info!("[cloader] 契约 map pin 就绪，阻断/跨进程读取可用");
+                Ok((source, Some(Arc::new(reader))))
+            }
+            None => {
+                log::warn!(
+                    "[cloader] 契约 map pin 未就绪（/sys/fs/bpf 不可用?）— 降级仅检测，阻断不可用"
+                );
+                Ok((source, None))
+            }
+        }
     }
 
     /// 本进程释放过的私有目录登记：优雅退出时统一删除

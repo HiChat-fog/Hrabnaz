@@ -19,6 +19,8 @@ pub use ks_core::forensic;
 pub use ks_core::sys;
 #[cfg(target_os = "linux")]
 pub mod linux_map_reader;
+#[cfg(target_os = "linux")]
+pub mod pinned_map_reader;
 pub mod loader;
 pub mod ml_detector;
 pub mod process_tree;

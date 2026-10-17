@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::loader::{BpfMapReader, MapSnapshot, MapStat};
 
-const SHARED_MAPS: &[&str] = &[
+pub(crate) const SHARED_MAPS: &[&str] = &[
     "risk_scores",
     "ip_whitelist",
     "net_conn_history",
@@ -54,22 +54,6 @@ impl LinuxBpfMapReader {
         Self { bpf }
     }
 
-    /// 打开内核 `block_decisions` map（阻断裁决下发通道）。
-    ///
-    /// key/value 用原始字节数组而非 repr(C) 结构体：布局必须逐字节对齐
-    /// common.h 的 `struct block_key {u32 pid; u32 _pad;}` /
-    /// `struct block_value {u64 expire_ns; u8 reason; u8 _pad[7];}`（native endian，同架构），
-    /// 字节数组写法让对齐契约在拷贝代码里可见，也免去补 Pod 派生。
-    fn open_block_map(
-        bpf: &mut aya::Ebpf,
-    ) -> anyhow::Result<aya::maps::HashMap<&mut aya::maps::MapData, [u8; 8], [u8; 16]>> {
-        let map = bpf
-            .map_mut("block_decisions")
-            .ok_or_else(|| anyhow::anyhow!("block_decisions map 不存在（该 tier 未加载或已被 take）"))?;
-        let hm = aya::maps::HashMap::<_, [u8; 8], [u8; 16]>::try_from(map)?;
-        Ok(hm)
-    }
-
     pub fn write_block_decision(
         &self,
         pid: u32,
@@ -80,15 +64,10 @@ impl LinuxBpfMapReader {
             .bpf
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut hm = Self::open_block_map(&mut bpf)?;
-        let mut key = [0u8; 8];
-        key[..4].copy_from_slice(&pid.to_ne_bytes());
-        let mut value = [0u8; 16];
-        value[..8].copy_from_slice(&expire_monotonic_ns.to_ne_bytes());
-        value[8] = reason;
-        hm.insert(key, value, 0)
-            .map_err(|e| anyhow::anyhow!("写入 block_decisions[pid={}] 失败: {}", pid, e))?;
-        Ok(())
+        let map = bpf
+            .map_mut("block_decisions")
+            .ok_or_else(|| anyhow::anyhow!("block_decisions map 不存在（该 tier 未加载或已被 take）"))?;
+        write_block_decision_map(map, pid, expire_monotonic_ns, reason)
     }
 
     pub fn remove_block_decision(&self, pid: u32) -> anyhow::Result<()> {
@@ -96,35 +75,26 @@ impl LinuxBpfMapReader {
             .bpf
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut hm = Self::open_block_map(&mut bpf)?;
-        let mut key = [0u8; 8];
-        key[..4].copy_from_slice(&pid.to_ne_bytes());
-        hm.remove(&key)
-            .map_err(|e| anyhow::anyhow!("删除 block_decisions[pid={}] 失败: {}", pid, e))?;
-        Ok(())
+        let map = bpf
+            .map_mut("block_decisions")
+            .ok_or_else(|| anyhow::anyhow!("block_decisions map 不存在"))?;
+        remove_block_decision_map(map, pid)
     }
 
     /// 读全表：killer 与列表命令共用。(pid, expire_mono, reason)
     pub fn read_block_decisions(&self) -> Vec<(u32, u64, u8)> {
-        let mut bpf = self
+        let bpf = self
             .bpf
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Ok(hm) = Self::open_block_map(&mut bpf) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for (key, value) in hm.iter().flatten() {
-            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap_or([0; 4]));
-            let expire = u64::from_ne_bytes(value[..8].try_into().unwrap_or([0; 8]));
-            out.push((pid, expire, value[8]));
+        match bpf.map("block_decisions") {
+            Some(map) => read_block_decisions_from(map),
+            None => Vec::new(),
         }
-        out
     }
 
     /// pin 到 bpffs。先删同路径残留（上次崩溃遗留的 pin 指向已死的 map）。
     pub fn pin_block_map(&self, path: &str) -> anyhow::Result<()> {
-        let _ = std::fs::remove_file(path);
         let mut bpf = self
             .bpf
             .lock()
@@ -132,84 +102,7 @@ impl LinuxBpfMapReader {
         let map = bpf
             .map_mut("block_decisions")
             .ok_or_else(|| anyhow::anyhow!("block_decisions map 不存在"))?;
-        map.pin(path)
-            .map_err(|e| anyhow::anyhow!("pin {} 失败: {}（/sys/fs/bpf 未挂载?）", path, e))?;
-        Ok(())
-    }
-
-    fn map_data_ref(map: &aya::maps::Map) -> &aya::maps::MapData {
-        match map {
-            aya::maps::Map::Array(md)
-            | aya::maps::Map::ArrayOfMaps(md)
-            | aya::maps::Map::BloomFilter(md)
-            | aya::maps::Map::CgroupArray(md)
-            | aya::maps::Map::CgroupStorage(md)
-            | aya::maps::Map::CgrpStorage(md)
-            | aya::maps::Map::CpuMap(md)
-            | aya::maps::Map::DevMap(md)
-            | aya::maps::Map::DevMapHash(md)
-            | aya::maps::Map::HashMap(md)
-            | aya::maps::Map::HashOfMaps(md)
-            | aya::maps::Map::InodeStorage(md)
-            | aya::maps::Map::LpmTrie(md)
-            | aya::maps::Map::LruHashMap(md)
-            | aya::maps::Map::PerCpuArray(md)
-            | aya::maps::Map::PerCpuCgroupStorage(md)
-            | aya::maps::Map::PerCpuHashMap(md)
-            | aya::maps::Map::PerCpuLruHashMap(md)
-            | aya::maps::Map::PerfEventArray(md)
-            | aya::maps::Map::ProgramArray(md)
-            | aya::maps::Map::Queue(md)
-            | aya::maps::Map::ReusePortSockArray(md)
-            | aya::maps::Map::RingBuf(md)
-            | aya::maps::Map::SockHash(md)
-            | aya::maps::Map::SockMap(md)
-            | aya::maps::Map::SkStorage(md)
-            | aya::maps::Map::Stack(md)
-            | aya::maps::Map::StackTraceMap(md)
-            | aya::maps::Map::Unsupported(md)
-            | aya::maps::Map::XskMap(md) => md,
-        }
-    }
-
-    fn map_type_str(t: aya::maps::MapType) -> &'static str {
-        match t {
-            aya::maps::MapType::Hash => "HASH",
-            aya::maps::MapType::Array => "ARRAY",
-            aya::maps::MapType::LruHash => "LRU_HASH",
-            aya::maps::MapType::PerCpuArray => "PERCPU_ARRAY",
-            aya::maps::MapType::PerCpuHash => "PERCPU_HASH",
-            aya::maps::MapType::LruPerCpuHash => "LRU_PERCPU_HASH",
-            aya::maps::MapType::LpmTrie => "LPM_TRIE",
-            aya::maps::MapType::RingBuf => "RINGBUF",
-            aya::maps::MapType::PerfEventArray => "PERF_EVENT_ARRAY",
-            aya::maps::MapType::ProgramArray => "PROG_ARRAY",
-            aya::maps::MapType::SockMap => "SOCKMAP",
-            aya::maps::MapType::SockHash => "SOCKHASH",
-            aya::maps::MapType::Queue => "QUEUE",
-            aya::maps::MapType::Stack => "STACK",
-            aya::maps::MapType::BloomFilter => "BLOOM_FILTER",
-            aya::maps::MapType::CpuMap => "CPUMAP",
-            aya::maps::MapType::DevMap => "DEVMAP",
-            aya::maps::MapType::DevMapHash => "DEVMAP_HASH",
-            aya::maps::MapType::XskMap => "XSKMAP",
-            aya::maps::MapType::StackTrace => "STACK_TRACE",
-            aya::maps::MapType::CgroupArray => "CGROUP_ARRAY",
-            aya::maps::MapType::CgroupStorage => "CGROUP_STORAGE",
-            aya::maps::MapType::PerCpuCgroupStorage => "PERCPU_CGROUP_STORAGE",
-            aya::maps::MapType::ReuseportSockArray => "REUSEPORT_SOCKARRAY",
-            aya::maps::MapType::SkStorage => "SK_STORAGE",
-            aya::maps::MapType::InodeStorage => "INODE_STORAGE",
-            aya::maps::MapType::CgrpStorage => "CGRP_STORAGE",
-            aya::maps::MapType::TaskStorage => "TASK_STORAGE",
-            aya::maps::MapType::ArrayOfMaps => "ARRAY_OF_MAPS",
-            aya::maps::MapType::HashOfMaps => "HASH_OF_MAPS",
-            aya::maps::MapType::UserRingBuf => "USER_RINGBUF",
-            aya::maps::MapType::StructOps => "STRUCT_OPS",
-            aya::maps::MapType::Arena => "ARENA",
-            aya::maps::MapType::Unspecified => "UNSPEC",
-            _ => "OTHER",
-        }
+        pin_block_map_to(map, path)
     }
 
     fn read_entries(&self, map_name: &str) -> (usize, Vec<Value>) {
@@ -218,12 +111,17 @@ impl LinuxBpfMapReader {
             .bpf
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let map = match bpf.map(map_name) {
-            Some(m) => m,
-            None => return (0, Vec::new()),
-        };
+        match bpf.map(map_name) {
+            Some(m) => read_entries(map_name, m),
+            None => (0, Vec::new()),
+        }
+    }
+}
 
-        match map_name {
+/// 按 map 名解码条目（aya 加载路径与 pinned（C loader）路径共用）。
+/// `map` 必须已确认存在；未知 map 返回空。
+pub(crate) fn read_entries(map_name: &str, map: &aya::maps::Map) -> (usize, Vec<Value>) {
+    match map_name {
             "risk_scores" => {
                 if let Ok(hm) = HashMap::<_, u32, u32>::try_from(map) {
                     let mut entries = Vec::new();
@@ -283,7 +181,7 @@ impl LinuxBpfMapReader {
                 }
             }
             "infer_config" => {
-                let md = Self::map_data_ref(map);
+                let md = map_data_ref(map);
                 if let Ok(info) = md.info() {
                     let max = info.max_entries() as usize;
                     if let Ok(arr) = Array::<_, u32>::try_from(map) {
@@ -312,6 +210,132 @@ impl LinuxBpfMapReader {
             _ => {}
         }
         (0, Vec::new())
+}
+
+/// block_decisions 布局与 common.h 逐字节对齐：
+/// key [u8;8] = u32 pid + 4B pad；value [u8;16] = u64 expire_mono + u8 reason + 7B pad。
+/// aya 加载路径与 pinned（C loader）路径共用这套读写。
+pub(crate) fn write_block_decision_map(
+    map: &mut aya::maps::Map,
+    pid: u32,
+    expire_monotonic_ns: u64,
+    reason: u8,
+) -> anyhow::Result<()> {
+    let mut hm = HashMap::<_, [u8; 8], [u8; 16]>::try_from(map)?;
+    let mut key = [0u8; 8];
+    key[..4].copy_from_slice(&pid.to_ne_bytes());
+    let mut value = [0u8; 16];
+    value[..8].copy_from_slice(&expire_monotonic_ns.to_ne_bytes());
+    value[8] = reason;
+    hm.insert(key, value, 0)
+        .map_err(|e| anyhow::anyhow!("写入 block_decisions[pid={}] 失败: {}", pid, e))?;
+    Ok(())
+}
+
+pub(crate) fn remove_block_decision_map(
+    map: &mut aya::maps::Map,
+    pid: u32,
+) -> anyhow::Result<()> {
+    let mut hm = HashMap::<_, [u8; 8], [u8; 16]>::try_from(map)?;
+    let mut key = [0u8; 8];
+    key[..4].copy_from_slice(&pid.to_ne_bytes());
+    hm.remove(&key)
+        .map_err(|e| anyhow::anyhow!("删除 block_decisions[pid={}] 失败: {}", pid, e))?;
+    Ok(())
+}
+
+pub(crate) fn read_block_decisions_from(map: &aya::maps::Map) -> Vec<(u32, u64, u8)> {
+    let Ok(hm) = HashMap::<_, [u8; 8], [u8; 16]>::try_from(map) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, value) in hm.iter().flatten() {
+        let pid = u32::from_ne_bytes(key[..4].try_into().unwrap_or([0; 4]));
+        let expire = u64::from_ne_bytes(value[..8].try_into().unwrap_or([0; 8]));
+        out.push((pid, expire, value[8]));
+    }
+    out
+}
+
+pub(crate) fn pin_block_map_to(map: &aya::maps::Map, path: &str) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(path);
+    map.pin(path)
+        .map_err(|e| anyhow::anyhow!("pin {} 失败: {}（/sys/fs/bpf 未挂载?）", path, e))?;
+    Ok(())
+}
+
+pub(crate) fn map_data_ref(map: &aya::maps::Map) -> &aya::maps::MapData {
+    match map {
+        aya::maps::Map::Array(md)
+        | aya::maps::Map::ArrayOfMaps(md)
+        | aya::maps::Map::BloomFilter(md)
+        | aya::maps::Map::CgroupArray(md)
+        | aya::maps::Map::CgroupStorage(md)
+        | aya::maps::Map::CgrpStorage(md)
+        | aya::maps::Map::CpuMap(md)
+        | aya::maps::Map::DevMap(md)
+        | aya::maps::Map::DevMapHash(md)
+        | aya::maps::Map::HashMap(md)
+        | aya::maps::Map::HashOfMaps(md)
+        | aya::maps::Map::InodeStorage(md)
+        | aya::maps::Map::LpmTrie(md)
+        | aya::maps::Map::LruHashMap(md)
+        | aya::maps::Map::PerCpuArray(md)
+        | aya::maps::Map::PerCpuCgroupStorage(md)
+        | aya::maps::Map::PerCpuHashMap(md)
+        | aya::maps::Map::PerCpuLruHashMap(md)
+        | aya::maps::Map::PerfEventArray(md)
+        | aya::maps::Map::ProgramArray(md)
+        | aya::maps::Map::Queue(md)
+        | aya::maps::Map::ReusePortSockArray(md)
+        | aya::maps::Map::RingBuf(md)
+        | aya::maps::Map::SockHash(md)
+        | aya::maps::Map::SockMap(md)
+        | aya::maps::Map::SkStorage(md)
+        | aya::maps::Map::Stack(md)
+        | aya::maps::Map::StackTraceMap(md)
+        | aya::maps::Map::Unsupported(md)
+        | aya::maps::Map::XskMap(md) => md,
+    }
+}
+
+pub(crate) fn map_type_str(t: aya::maps::MapType) -> &'static str {
+    match t {
+        aya::maps::MapType::Hash => "HASH",
+        aya::maps::MapType::Array => "ARRAY",
+        aya::maps::MapType::LruHash => "LRU_HASH",
+        aya::maps::MapType::PerCpuArray => "PERCPU_ARRAY",
+        aya::maps::MapType::PerCpuHash => "PERCPU_HASH",
+        aya::maps::MapType::LruPerCpuHash => "LRU_PERCPU_HASH",
+        aya::maps::MapType::LpmTrie => "LPM_TRIE",
+        aya::maps::MapType::RingBuf => "RINGBUF",
+        aya::maps::MapType::PerfEventArray => "PERF_EVENT_ARRAY",
+        aya::maps::MapType::ProgramArray => "PROG_ARRAY",
+        aya::maps::MapType::SockMap => "SOCKMAP",
+        aya::maps::MapType::SockHash => "SOCKHASH",
+        aya::maps::MapType::Queue => "QUEUE",
+        aya::maps::MapType::Stack => "STACK",
+        aya::maps::MapType::BloomFilter => "BLOOM_FILTER",
+        aya::maps::MapType::CpuMap => "CPUMAP",
+        aya::maps::MapType::DevMap => "DEVMAP",
+        aya::maps::MapType::DevMapHash => "DEVMAP_HASH",
+        aya::maps::MapType::XskMap => "XSKMAP",
+        aya::maps::MapType::StackTrace => "STACK_TRACE",
+        aya::maps::MapType::CgroupArray => "CGROUP_ARRAY",
+        aya::maps::MapType::CgroupStorage => "CGROUP_STORAGE",
+        aya::maps::MapType::PerCpuCgroupStorage => "PERCPU_CGROUP_STORAGE",
+        aya::maps::MapType::ReuseportSockArray => "REUSEPORT_SOCKARRAY",
+        aya::maps::MapType::SkStorage => "SK_STORAGE",
+        aya::maps::MapType::InodeStorage => "INODE_STORAGE",
+        aya::maps::MapType::CgrpStorage => "CGRP_STORAGE",
+        aya::maps::MapType::TaskStorage => "TASK_STORAGE",
+        aya::maps::MapType::ArrayOfMaps => "ARRAY_OF_MAPS",
+        aya::maps::MapType::HashOfMaps => "HASH_OF_MAPS",
+        aya::maps::MapType::UserRingBuf => "USER_RINGBUF",
+        aya::maps::MapType::StructOps => "STRUCT_OPS",
+        aya::maps::MapType::Arena => "ARENA",
+        aya::maps::MapType::Unspecified => "UNSPEC",
+        _ => "OTHER",
     }
 }
 
@@ -324,10 +348,10 @@ impl BpfMapReader for LinuxBpfMapReader {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let map_type_str = bpf
             .map(map_name)
-            .map(Self::map_data_ref)
+            .map(map_data_ref)
             .and_then(|md| md.info().ok())
             .and_then(|info| info.map_type().ok())
-            .map(Self::map_type_str)
+            .map(map_type_str)
             .unwrap_or("unknown");
         drop(bpf);
 
