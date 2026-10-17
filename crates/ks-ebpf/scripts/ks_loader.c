@@ -1,3 +1,10 @@
+/*
+ * ⚠ 已退役（2026-10-17）：NOBTF tier 的 C loader 路由已停用，本程序保留
+ * 仅作参考（构建仍会编译/嵌入，但产品路径不再启动它）。
+ * 参考价值：把契约 map pin 到 bpffs（Step 1.5），使进程外加载器与用户态
+ * 共用同一张内核 map——该契约结论适用于未来内核下沉 runtime。
+ * 恢复方式见 event_source.rs 中注释掉的路由（历史提交 820a9cb）。
+ */
 
 #define _GNU_SOURCE
 

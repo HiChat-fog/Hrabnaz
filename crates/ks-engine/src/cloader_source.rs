@@ -1,3 +1,15 @@
+//! ⚠ 已退役（2026-10-17）：C loader（ks_loader）的 NOBTF 路由已停用，
+//! 本模块保留**仅作参考**，当前无激活调用（见 event_source.rs 中的退役分支）。
+//!
+//! 为什么保留：它倒逼出的契约结论没有退役——
+//!   进程外加载器满足 map 契约的正确方式 = bpffs pin
+//!   （`/sys/fs/bpf/kernelsentinel_<map>`）+ 与 common.h 逐字节对齐的 key/value；
+//!   进程不参与契约。该模式直接适用于未来的内核下沉 runtime（同为加载方持有
+//!   fd、用户态跨进程访问），已记录于 ARCHITECTURE 7.1。
+//!
+//! 恢复方式：取消 event_source.rs 中 LegacyNoBtf / Ancient(无BTF) 分支里
+//! 注释掉的路由代码即可（历史提交 820a9cb）。
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::process::Stdio;

@@ -539,21 +539,29 @@ mod linux_impl {
                 )
             }
             Some(SourceKind::EbpfLegacyNoBtf) => {
-                log::info!(
-                    "[tier-detect] Legacy tier无BTF,尝试CLoaderSource (ks_loader --stream ks_main_legacy_nobtf.o)"
+                // ── 已退役（2026-10-17）：C loader 的 NOBTF 路由停用 ──
+                // C loader（ks_loader）不再作为产品路径维护；实现与契约结论保留为
+                // 参考（cloader_source.rs / pinned_map_reader.rs / ks_loader.c 顶部说明，
+                // 历史见 820a9cb）。旧路由原样注释如下，恢复时取消注释即可：
+                //
+                // log::info!(
+                //     "[tier-detect] Legacy tier无BTF,尝试CLoaderSource (ks_loader --stream ks_main_legacy_nobtf.o)"
+                // );
+                // match try_cloader_source_legacy().await {
+                //     Ok((source, map_reader)) => {
+                //         log::info!("[tier-detect] CLoaderSource (legacy_nobtf)启动成功");
+                //         return (Box::new(source), map_reader);
+                //     }
+                //     Err(e) => {
+                //         log::warn!(
+                //             "[tier-detect] CLoaderSource (legacy_nobtf)启动失败: {} - fallback mock",
+                //             e
+                //         );
+                //     }
+                // }
+                log::warn!(
+                    "[tier-detect] Legacy tier 无 BTF：C loader 已退役，该内核不再支持（fallback mock）"
                 );
-                match try_cloader_source_legacy().await {
-                    Ok((source, map_reader)) => {
-                        log::info!("[tier-detect] CLoaderSource (legacy_nobtf)启动成功");
-                        return (Box::new(source), map_reader);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "[tier-detect] CLoaderSource (legacy_nobtf)启动失败: {} - fallback mock",
-                            e
-                        );
-                    }
-                }
                 (
                     Box::new(MockEventSource::new_with_all_scenarios().with_loop(true)),
                     Some(Arc::new(MockBpfMapReader)),
@@ -561,19 +569,33 @@ mod linux_impl {
             }
             Some(SourceKind::EbpfAncient) => {
                 if !crate::tier_detect::btf_available() {
-                    log::info!("[tier-detect] Ancient tier无BTF,尝试CLoaderSource (ks_loader --stream)");
-                    match try_cloader_source().await {
-                        Ok((source, map_reader)) => {
-                            log::info!("[tier-detect] CLoaderSource启动成功");
-                            return (Box::new(source), map_reader);
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[tier-detect] CLoaderSource启动失败: {} - fallback aya + mock",
-                                e
-                            );
-                        }
-                    }
+                    // ── 已退役（2026-10-17）：C loader 的 NOBTF 路由停用 ──
+                    // 无 BTF 的老内核不再走 C loader（实现保留为参考，见
+                    // cloader_source.rs 顶部说明）。旧路由注释如下：
+                    //
+                    // log::info!("[tier-detect] Ancient tier无BTF,尝试CLoaderSource (ks_loader --stream)");
+                    // match try_cloader_source().await {
+                    //     Ok((source, map_reader)) => {
+                    //         log::info!("[tier-detect] CLoaderSource启动成功");
+                    //         return (Box::new(source), map_reader);
+                    //     }
+                    //     Err(e) => {
+                    //         log::warn!(
+                    //             "[tier-detect] CLoaderSource启动失败: {} - fallback aya + mock",
+                    //             e
+                    //         );
+                    //     }
+                    // }
+                    //
+                    // 也不尝试 aya：无 BTF 时 aya 会带着编译期偏移静默读错字段，
+                    // 所以直接回退 mock，并在日志里说明
+                    log::warn!(
+                        "[tier-detect] Ancient tier 无 BTF：C loader 已退役，该内核不再支持（fallback mock）"
+                    );
+                    return (
+                        Box::new(MockEventSource::new_with_all_scenarios().with_loop(true)),
+                        Some(Arc::new(MockBpfMapReader)),
+                    );
                 }
                 log::info!("[tier-detect] 当前内核走Ancient tier (3.10+ BTF backport)");
                 let mut loader = EbpfLoader::new();
@@ -608,6 +630,9 @@ mod linux_impl {
         }
     }
 
+    /// 已退役（2026-10-17）：NOBTF tier 的 C loader 路由。
+    /// 保留为参考实现（见调用点注释），当前无激活调用。
+    #[allow(dead_code)]
     async fn try_cloader_source() -> anyhow::Result<(
         crate::cloader_source::CLoaderSource,
         Option<Arc<dyn BpfMapReader>>,
@@ -615,6 +640,8 @@ mod linux_impl {
         try_cloader_source_for("ancient_nobtf").await
     }
 
+    /// 已退役（2026-10-17）：legacy NOBTF 的 C loader 路由（参考实现）。
+    #[allow(dead_code)]
     async fn try_cloader_source_legacy() -> anyhow::Result<(
         crate::cloader_source::CLoaderSource,
         Option<Arc<dyn BpfMapReader>>,
@@ -622,6 +649,8 @@ mod linux_impl {
         try_cloader_source_for("legacy_nobtf").await
     }
 
+    /// 已退役（2026-10-17）：C loader 的 spawn + 契约 map pin 等待（参考实现）。
+    #[allow(dead_code)]
     async fn try_cloader_source_for(
         tier_suffix: &str,
     ) -> anyhow::Result<(

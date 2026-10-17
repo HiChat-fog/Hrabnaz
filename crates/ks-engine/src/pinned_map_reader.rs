@@ -1,5 +1,11 @@
 #![cfg(target_os = "linux")]
 
+//! ⚠ 已退役消费者（2026-10-17）：本实现是为 C loader（NOBTF tier）接入
+//! `BpfMapReader` 契约而做的第二实现，随 C loader 退役已无激活调用。
+//! **保留为参考**，因为它是"进程外加载器如何满足 map 契约"的可运行样本：
+//! bpffs pin + 字节级布局，进程不参与契约。未来的内核下沉 runtime 属于同一
+//! 形态（加载方持有 fd、用户态跨进程访问），可直接复用本模式与单元测试。
+//!
 //! 经 bpffs pin 访问契约 map 的读取器——`BpfMapReader` 的第二个实现。
 //!
 //! aya 路径持有加载后的 map 句柄直接读写；C loader（ks_loader，NOBTF tier）
