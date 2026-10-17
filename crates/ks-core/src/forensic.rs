@@ -262,37 +262,30 @@ impl ForensicLogger {
     fn recover_chain_state(path: &PathBuf) -> Result<(String, u64)> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let mut last_event_line = String::new();
+        let mut last_hash: Option<String> = None;
+        let mut last_event_seq: Option<u64> = None;
         for line in reader.lines().map_while(Result::ok) {
             if line.trim().is_empty() {
                 continue;
             }
-            // 严格按"可解析 JSON 且含顶层 seq 数字字段"识别事件行。
-            // 旧实现 line.contains("\"seq\"") 子串匹配：description 含 "sequence"
-            // 的告警行会被误认成链尾，恢复出错误 prev_hash，哈希链从此静默断裂
-            let is_event_line = serde_json::from_str::<serde_json::Value>(&line)
-                .ok()
-                .filter(|v| v.get("seq").and_then(|s| s.as_u64()).is_some())
-                .is_some();
-            if is_event_line {
-                last_event_line = line;
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            // 链尾 = 文件里最后一条带 hash 的记录，**事件或告警都算**。
+            // 告警同样参与哈希链；旧实现只认带 seq 的事件行，最后一条是告警时
+            // 恢复出过期 prev_hash，重启后首条记录锚错位置（真机实测断链两次）
+            if let Some(hash) = record.get("hash").and_then(|v| v.as_str()) {
+                last_hash = Some(hash.to_string());
+            }
+            // 事件计数/seq 播种只看事件行（告警没有 seq）
+            if let Some(seq) = record.get("seq").and_then(|v| v.as_u64()) {
+                last_event_seq = Some(seq);
             }
         }
-        if last_event_line.is_empty() {
-            return Ok((GENESIS_HASH.to_string(), 0));
+        match last_hash {
+            None => Ok((GENESIS_HASH.to_string(), 0)),
+            Some(hash) => Ok((hash, last_event_seq.unwrap_or(0))),
         }
-        let record: serde_json::Value = serde_json::from_str(&last_event_line)
-            .map_err(|e| anyhow::anyhow!("最后记录 JSON 解析失败 — {}", e))?;
-        let hash = record
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("最后记录缺少 hash 字段"))?
-            .to_string();
-        let seq = record
-            .get("seq")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("最后记录缺少 seq 字段"))?;
-        Ok((hash, seq))
     }
 
     fn maybe_rotate(&mut self) -> Result<()> {
@@ -1254,6 +1247,49 @@ mod tests {
         // 双字段并存：单调钟仍是取证序权威
         assert!(ev.get("timestamp_ns").is_some());
         assert!(al.get("timestamp_ns").is_some());
+    }
+
+    /// 重启恢复：文件最后一条是告警时，新会话首条记录必须锚定到该告警的 hash。
+    /// 旧实现恢复时跳过告警行，重启后首条事件锚到更早的事件 hash —— 链在此断裂
+    /// （真机 2026-10-17 两次重启均命中：断点前最后一条恰为告警）。
+    #[test]
+    fn test_restart_after_alert_keeps_chain_continuous() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events_20200101.jsonl");
+        {
+            let mut logger = ForensicLogger::new(path.clone()).unwrap();
+            logger.log_event(&make_event(1, 100)).unwrap();
+            logger.log_alert(&make_alert()).unwrap(); // 链尾是告警
+            logger.flush().unwrap();
+        }
+
+        let alert_hash = {
+            let content = std::fs::read_to_string(&path).unwrap();
+            let last: serde_json::Value =
+                serde_json::from_str(content.lines().last().unwrap()).unwrap();
+            assert_eq!(last["type"].as_str(), Some("alert"));
+            last["hash"].as_str().unwrap().to_string()
+        };
+
+        // 模拟重启：重开同一文件并写一条事件
+        {
+            let mut logger = ForensicLogger::new(path.clone()).unwrap();
+            logger.log_event(&make_event(2, 100)).unwrap();
+            logger.flush().unwrap();
+        }
+
+        let v = ForensicLogger::verify_chain(&path).unwrap();
+        assert!(v.is_valid, "重启后链应连续: {:?}", v.broken_at);
+        assert_eq!(v.total_records, 3);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            last["prev_hash"].as_str(),
+            Some(alert_hash.as_str()),
+            "新会话首条必须锚定链尾告警的 hash，而不是更早的事件"
+        );
     }
 
     /// 契约 v1：事件与告警记录都带 schema_version/type；事件带可读 event_type_name，
