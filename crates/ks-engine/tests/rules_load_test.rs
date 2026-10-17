@@ -15,12 +15,12 @@ fn rules_dir() -> std::path::PathBuf {
 }
 
 /// 构造一个最小 DecodedEvent（只填规则会用到的字段）
-fn make_event(event_type: u32, comm: &str, filename: Option<&str>, args: Option<&str>, daddr: Option<&str>, dport: Option<u16>) -> ks_engine::aggregator::DecodedEvent {
+fn make_event(event_type: u32, comm: &str, filename: Option<&str>, args: Option<&str>, daddr: Option<&str>, dport: Option<u16>) -> ks_core::event::DecodedEvent {
     use ks_core::event::EventHeader;
     let mut cb = [0u8; 16];
     let len = comm.len().min(16);
     cb[..len].copy_from_slice(&comm.as_bytes()[..len]);
-    ks_engine::aggregator::DecodedEvent {
+    ks_core::event::DecodedEvent {
         seq: 1,
         comm: comm.to_string(),
         header: EventHeader {
@@ -74,7 +74,7 @@ fn load_engine() -> ks_engine::detector::DetectionEngine {
     engine
 }
 
-fn rule_names(engine: &ks_engine::detector::DetectionEngine, event: &ks_engine::aggregator::DecodedEvent) -> Vec<String> {
+fn rule_names(engine: &ks_engine::detector::DetectionEngine, event: &ks_core::event::DecodedEvent) -> Vec<String> {
     engine.match_event(event).into_iter().map(|m| m.rule_name).collect()
 }
 

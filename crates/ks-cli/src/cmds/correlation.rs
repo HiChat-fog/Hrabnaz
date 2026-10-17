@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ks_engine::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use ks_engine::correlation::{CorrelationAlert, CorrelationEngine};
 use ks_engine::process_tree::ProcessTreeManager;
 use std::collections::VecDeque;

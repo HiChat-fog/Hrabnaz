@@ -119,6 +119,9 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
     let mut attack_chains_truncated = false;
     let mut first_ts: Option<u64> = None;
     let mut last_ts: Option<u64> = None;
+    // 记录带 epoch_ms（墙钟侧车）时一并汇总；老归档没有该字段则保持 None
+    let mut first_epoch_ms: Option<i64> = None;
+    let mut last_epoch_ms: Option<i64> = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -211,6 +214,11 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
                 .unwrap_or("");
 
             let ts = record.get("timestamp_ns").and_then(|v| v.as_u64());
+            let epoch_ms = record.get("epoch_ms").and_then(|v| v.as_i64());
+            if let Some(e) = epoch_ms {
+                first_epoch_ms = Some(first_epoch_ms.map_or(e, |f: i64| f.min(e)));
+                last_epoch_ms = Some(last_epoch_ms.map_or(e, |l: i64| l.max(e)));
+            }
 
             if attack_chains.len() >= MAX_ATTACK_CHAINS {
                 attack_chains_truncated = true;
@@ -258,6 +266,10 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
             if let Some(ts) = record.get("timestamp_ns").and_then(|v| v.as_u64()) {
                 first_ts = Some(first_ts.map_or(ts, |f| f.min(ts)));
                 last_ts = Some(last_ts.map_or(ts, |f| f.max(ts)));
+                if let Some(e) = record.get("epoch_ms").and_then(|v| v.as_i64()) {
+                    first_epoch_ms = Some(first_epoch_ms.map_or(e, |f: i64| f.min(e)));
+                    last_epoch_ms = Some(last_epoch_ms.map_or(e, |l: i64| l.max(e)));
+                }
             }
         }
     }
@@ -280,6 +292,8 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
             "attack_chains_truncated": attack_chains_truncated,
             "first_ts": first_ts,
             "last_ts": last_ts,
+            "first_epoch_ms": first_epoch_ms,
+            "last_epoch_ms": last_epoch_ms,
         });
         println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
@@ -311,6 +325,13 @@ pub async fn run(file: &str, json: bool) -> Result<()> {
             format_timestamp(first),
             format_timestamp(last)
         );
+        if let (Some(fe), Some(le)) = (first_epoch_ms, last_epoch_ms) {
+            println!(
+                "  墙钟时间: {} → {}",
+                format_epoch_ms(fe),
+                format_epoch_ms(le)
+            );
+        }
     }
 
     if !event_types.is_empty() {
@@ -547,6 +568,14 @@ fn format_timestamp(ns: u64) -> String {
     } else {
         format!("开机后 {:02}:{:02}:{:02}", h, m, s)
     }
+}
+
+/// 记录带 epoch_ms（墙钟侧车，新版本引擎产出）时的墙钟渲染。
+/// 单调钟 + 墙钟双列：单调钟是取证序权威，墙钟便于跨主机对表。
+fn format_epoch_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| format!("epoch_ms 异常值 {ms}"))
 }
 
 #[derive(Clone)]

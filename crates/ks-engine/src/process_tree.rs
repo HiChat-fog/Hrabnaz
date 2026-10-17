@@ -1,4 +1,4 @@
-use crate::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone)]

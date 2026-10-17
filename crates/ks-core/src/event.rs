@@ -397,3 +397,32 @@ mod tests {
         assert!(result.is_some());
     }
 }
+
+/// 解码后的统一事件视图——事件契约的 Rust 侧权威镜像。
+///
+/// eBPF 侧（common.h 双重定义 + 编译期布局断言）产出 `RawEvent` 字节流，
+/// 各事件源把它解码为本类型后进入引擎检测管线；forensic 落盘、规则匹配、
+/// 关联分析、回放还原（record_to_event）都以它为准。第二个前端/加载器实现
+/// 应依赖本类型而不是引擎内部状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodedEvent {
+    pub seq: u64,
+    pub header: EventHeader,
+    pub comm: String,
+    pub filename: Option<String>,
+    pub args: Option<String>,
+    pub saddr: Option<String>,
+    pub daddr: Option<String>,
+    pub sport: Option<u16>,
+    pub dport: Option<u16>,
+    pub proto: Option<String>,
+    pub target_pid: Option<u32>,
+    pub signal: Option<i32>,
+    pub file_bytes: Option<u64>,
+    pub module_name: Option<String>,
+    pub prog_name: Option<String>,
+    pub source_ns_inum: Option<u32>,
+    pub target_ns_inum: Option<u32>,
+    pub cap_eff: Option<u32>,
+    pub action: Option<String>,
+}

@@ -1,4 +1,4 @@
-use crate::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use std::sync::Arc;
 
 fn format_ns_timestamp(ns: u64) -> String {

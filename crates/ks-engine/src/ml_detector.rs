@@ -1,4 +1,4 @@
-use crate::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

@@ -1,4 +1,4 @@
-use crate::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use anyhow::Result;
 use ks_core::alert::Alert;
 use sha2::{Digest, Sha256};
@@ -335,6 +335,13 @@ impl ForensicLogger {
             "tid": event.header.tid, "uid": event.header.uid, "ppid": event.header.ppid,
             "comm": event.comm, "syscall_nr": event.header.syscall_nr, "retval": event.header.retval,
         });
+        // 墙钟侧车：btime+monotonic 换算（btime 在 OnceLock 缓存，热路径零 IO）。
+        // 换算不出来（无 /proc/stat）时省略字段，消费方退回 timestamp_ns 单调钟
+        if let Some(epoch_ms) =
+            ks_core::time::epoch_ms_from_monotonic_ns(event.header.timestamp_ns)
+        {
+            record["epoch_ms"] = serde_json::json!(epoch_ms);
+        }
 
         if let Some(ref f) = event.filename {
             record["filename"] = serde_json::Value::String(f.clone());
@@ -399,6 +406,9 @@ impl ForensicLogger {
         self.alert_count += 1;
         let mut record = serde_json::to_value(alert)?;
         record["type"] = serde_json::Value::String("alert".to_string());
+        if let Some(epoch_ms) = ks_core::time::epoch_ms_from_monotonic_ns(alert.timestamp_ns) {
+            record["epoch_ms"] = serde_json::json!(epoch_ms);
+        }
 
         // 告警的 process.cmdline 同样可能携带 argv 里的明文密码
         scrub_sensitive(&mut record);
@@ -1143,6 +1153,44 @@ mod tests {
             })
             .collect();
         assert!(!archives.is_empty(), "旧文件应成为归档");
+    }
+
+    /// 墙钟侧车：事件与告警记录都带 epoch_ms，且换算值参与哈希前内容一致
+    /// （Linux 上 /proc/stat 必有 btime；make_event 的 timestamp_ns=seq 秒）
+    #[test]
+    fn test_records_carry_epoch_ms_wallclock() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events_20200101.jsonl");
+        let mut logger = ForensicLogger::new(path.clone()).unwrap();
+        logger.log_event(&make_event(1, 100)).unwrap();
+        let alert = make_alert();
+        logger.log_alert(&alert).unwrap();
+        logger.flush().unwrap();
+        drop(logger);
+
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let ev = &lines[0];
+        let al = &lines[1];
+
+        // 侧车换算与 ks_core 公式一致：epoch = btime*1000 + mono_ms
+        let expected_event_ms = ks_core::time::epoch_ms_from_monotonic_ns(1_000_000_000).unwrap();
+        assert_eq!(
+            ev["epoch_ms"].as_i64().unwrap(),
+            expected_event_ms,
+            "事件 epoch_ms 应等于 btime+monotonic 换算值"
+        );
+        assert_eq!(
+            al["epoch_ms"].as_i64().unwrap(),
+            ks_core::time::epoch_ms_from_monotonic_ns(alert.timestamp_ns).unwrap(),
+            "告警 epoch_ms 应与其 timestamp_ns 同源"
+        );
+        // 双字段并存：单调钟仍是取证序权威
+        assert!(ev.get("timestamp_ns").is_some());
+        assert!(al.get("timestamp_ns").is_some());
     }
 
     /// .jsonl.gz 归档必须能被链校验直接读取（归档默认 gzip 压缩）

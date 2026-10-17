@@ -1,7 +1,6 @@
 use anyhow::Result;
-use ks_core::event::{af, EventHeader, RawEvent};
+use ks_core::event::{af, RawEvent};
 use log::debug;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -17,28 +16,9 @@ pub struct EventAggregator {
     evict_queue: VecDeque<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DecodedEvent {
-    pub seq: u64,
-    pub header: EventHeader,
-    pub comm: String,
-    pub filename: Option<String>,
-    pub args: Option<String>,
-    pub saddr: Option<String>,
-    pub daddr: Option<String>,
-    pub sport: Option<u16>,
-    pub dport: Option<u16>,
-    pub proto: Option<String>,
-    pub target_pid: Option<u32>,
-    pub signal: Option<i32>,
-    pub file_bytes: Option<u64>,
-    pub module_name: Option<String>,
-    pub prog_name: Option<String>,
-    pub source_ns_inum: Option<u32>,
-    pub target_ns_inum: Option<u32>,
-    pub cap_eff: Option<u32>,
-    pub action: Option<String>,
-}
+// DecodedEvent 契约本体在 ks_core::event（与 EventHeader 同居一处，见该处注释）；
+// 这里 re-export 维持 `ks_engine::aggregator::DecodedEvent` 旧路径可用
+pub use ks_core::event::DecodedEvent;
 
 impl EventAggregator {
     pub fn new(max_buffer: usize) -> Self {

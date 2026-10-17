@@ -1,4 +1,4 @@
-use crate::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use anyhow::Result;
 use ks_core::alert::{
     AddressFamily, Alert, AlertStatus, FileInfo, FileOperation, MitreInfo, NetworkInfo,

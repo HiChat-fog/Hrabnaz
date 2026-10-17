@@ -34,11 +34,21 @@ enum Commands {
         /// TTL 秒数，0 = 永久
         #[arg(long, default_value_t = 600)]
         ttl: u64,
+        /// 机器可读输出（单行 JSON 对象）
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// 解除手动/自动的阻断裁决
-    Unblock { pid: u32 },
+    Unblock {
+        pid: u32,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// 列出生效中的阻断裁决
-    Blocked,
+    Blocked {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Status {
         #[arg(long, default_value_t = false)]
         watch: bool,
@@ -114,14 +124,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop => {
             cmds::stop::run().await?;
         }
-        Commands::Block { pid, ttl } => {
-            cmds::block::run_block(pid, ttl).await?;
+        Commands::Block { pid, ttl, json } => {
+            cmds::block::run_block(pid, ttl, json).await?;
         }
-        Commands::Unblock { pid } => {
-            cmds::block::run_unblock(pid).await?;
+        Commands::Unblock { pid, json } => {
+            cmds::block::run_unblock(pid, json).await?;
         }
-        Commands::Blocked => {
-            cmds::block::run_blocked().await?;
+        Commands::Blocked { json } => {
+            cmds::block::run_blocked(json).await?;
         }
         Commands::Status { watch, interval } => cmds::status::run(watch, interval).await?,
         Commands::Replay { file, json } => {

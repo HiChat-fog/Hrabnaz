@@ -1,5 +1,5 @@
 use ks_core::event::EventHeader;
-use ks_engine::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use ks_engine::baseline::BaselineManager;
 use ks_engine::blocker::{BlockManager, BlockReason};
 use ks_engine::correlation::CorrelationEngine;

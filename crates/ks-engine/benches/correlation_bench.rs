@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ks_core::event::EventHeader;
-use ks_engine::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use ks_engine::correlation::CorrelationEngine;
 use ks_engine::process_tree::ProcessTreeManager;
 

@@ -1,4 +1,4 @@
-use crate::aggregator::DecodedEvent;
+use ks_core::event::DecodedEvent;
 use crate::process_tree::ProcessTreeManager;
 use ks_core::alert::{Alert, MitreInfo, ProcessInfo};
 use ks_core::rule::Severity;
