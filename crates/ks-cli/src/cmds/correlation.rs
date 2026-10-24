@@ -19,8 +19,10 @@ pub struct CorrelationArgs {
     /// 取证日志目录（events_*.jsonl 所在处）
     #[arg(short = 'L', long, default_value = "/var/log/ks")]
     pub log_dir: String,
+    /// 最多输出 N 条关联告警
     #[arg(short, long, default_value_t = 50)]
     pub limit: usize,
+    /// 机器可读输出（单行 JSON 对象）
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }

@@ -4,7 +4,7 @@
 # 前提: rustup target add x86_64-unknown-linux-musl  （host还要有gcc/clang编ring与eBPF）
 # CC/AR由.cargo/config.toml自动注入（gcc编ring的C/asm，rust-lld self-contained musl crt链接）。
 #
-# 验收: ldd应报 "statically linked"；scp到CentOS 7能./kernelsentinel --version / serve。
+# 验收: ldd应报 "statically linked"；scp到CentOS 7能./kernelsentinel --version / status。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -19,4 +19,4 @@ echo "   ldd: $(ldd "$BIN" 2>&1 | head -1)"
 echo ""
 echo "部署到 CentOS 7:"
 echo "   scp -i <key> $BIN root@<centos7>:/usr/local/bin/kernelsentinel"
-echo "   ssh root@<centos7> 'kernelsentinel --version && kernelsentinel serve'"
+echo "   ssh root@<centos7> 'kernelsentinel --version && kernelsentinel status'"

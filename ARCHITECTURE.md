@@ -34,7 +34,8 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │  CLI 交互层 (ks-cli)                                              │
 │  start / stop / status / replay / watch / baseline / correlation │
-│  block / unblock / blocked     单实例锁 + SIGTERM 优雅退出          │
+│  block / unblock / blocked / watchdog / rules-digest             │
+│  单实例锁 + SIGTERM 优雅退出；start 为薄壳(UI渲染+信号)            │
 ├──────────────────────────────────────────────────────────────────┤
 │  用户态引擎层 (ks-engine)                                          │
 │  事件源(tier路由) → 聚合解码(两阶段越界保护)                           │
@@ -66,7 +67,7 @@
 |---|---|---|
 | 内核态 | C（libbpf 风格头文件） | 2179 行，`SEC(...)` 显式挂载，CO-RE |
 | 加载器 | aya（vendor 2.3 万行 + 4 处补丁） | 纯 Rust 加载器 |
-| 用户态 | Rust stable | 引擎 + CLI，unsafe 共 20 处（收敛计划 ≤6） |
+| 用户态 | Rust stable | 引擎 + CLI，运行期 unsafe 0 处 |
 | 规则 | YAML | 14 个文件 40 条规则，加载期枚举校验 |
 | 取证 | JSONL + SHA-256 哈希链 | 链尾外置，BTreeMap 规范化序列化 |
 | 构建 | build.rs + clang/llvm-18 | 五档编译产物，CI 断言数量 |
@@ -278,11 +279,41 @@ KS_USER_KILL、KS_LOG_LEVEL 等。
 
 ---
 
-## 7. 核心类型层 (ks-core)
+## 7. 核心类型层 (ks-core) — 契约层
 
 - **event.rs / lib.rs**：四类事件结构体 + EventType 枚举 + 编译期布局断言（见 5.3）。
+  `DecodedEvent`（事件契约的 Rust 侧权威镜像）也在此：eBPF 侧 common.h 双重定义产出
+  RawEvent 字节流，各事件源解码为本类型后进入检测管线；forensic 落盘、规则匹配、
+  关联分析、回放还原均以它为准。**第二个前端/加载器实现应依赖本类型，而非引擎内部状态。**
+- **time.rs**：单调钟 → 墙钟换算（`epoch_ms_from_monotonic_ns`，/proc/stat btime，
+  换算式是记录内容的纯函数，回放可离线重算）。时钟双轨见 7.1。
 - **rule.rs**：DetectionRule（含 `#[serde(default)] enforce: bool`）、18 个 Field 枚举、9 操作符、MatchResult。
 - **alert.rs**：Alert 结构（severity 分级、MITRE 映射字段）。
+
+### 7.1 公共接口面（对外契约清单，Hliðskjálf/Web 接入只依赖这些）
+
+| 接口 | 形态 | 稳定字段/语义 |
+|---|---|---|
+| 事件流 | JSONL `events_YYYYMMDD.jsonl`（按天+按大小滚动，归档 `events_YYYYMMDD_HHMMSS.jsonl.gz`） | `schema_version=1`、`type="event"`、`seq`（引擎级单调，跨重启/滚动不重置）、`timestamp_ns`（单调钟）、`epoch_ms`（墙钟侧车，btime+monotonic 换算；老归档可能缺省）、`event_type`（数值）+ `event_type_name`（契约 snake_case 名）、DecodedEvent 字段、`prev_hash`/`hash` |
+| 告警流 | 同一 JSONL 内 `type="alert"` 记录 | `schema_version=1`、Alert 结构（id/severity/mitre/process/network/file/event_ids）+ `timestamp_ns`/`epoch_ms` |
+| 取证文件权限 | 目录 0700 / 文件 0600 | 活跃日志、归档、chain_head.log 一律私有（升级时自动收紧历史文件）；前端需以 root 或受权身份读取 |
+| 链锚 | `chain_head.log`（日志目录外） | 每约 1000 事件外落 (seq, prev_hash, file)，跨文件锚定 |
+| status 文件 | `/run/kernelsentinel/ks-status.json`（0700） | pid/start_time/version/status；heartbeat `ks-heartbeat.json` 10s 更新（存活=liveness 事实源） |
+| block CLI | `block/unblock/blocked --json` | 单行 JSON 对象到 stdout：command/pid/expire_monotonic_ns/permanent/remain_secs/reason；pin 路径 `/sys/fs/bpf/kernelsentinel_block_decisions`（跨进程 map 契约） |
+| replay/watch | `--json` 模式 | replay 摘要含 chain{valid,anchored,total_records} 与 first/last_epoch_ms；watch 逐行输出 Alert JSON |
+| 进程外加载器接入 | map ABI | bpffs pin（`/sys/fs/bpf/kernelsentinel_<map>`）+ 与 common.h 逐字节对齐的 key/value；**进程不参与契约**。该结论由已退役的 C loader 倒逼得出（见下），直接适用于未来的内核下沉 runtime（同为加载方持 fd、用户态跨进程访问） |
+
+`schema_version` 语义：破坏性字段变更递增；新增可选字段不递增，消费方必须容忍未知字段。
+`event_type_name` 是稳定契约名（如 `file_write`/`net_connect`），数值仅在内核/调试侧使用。
+
+时钟双轨约定：`timestamp_ns`（bpf_ktime_get_ns，CLOCK_MONOTONIC）是取证序权威——不可回拨；
+`epoch_ms` 仅为跨主机关联的侧车换算（休眠期不计入，服务器场景可忽略）。外部消费方排序、
+去重、链校验一律以单调钟为准。
+
+C loader 状态（2026-10-17）：NOBTF tier 的 C loader 路由已退役，实现（cloader_source.rs /
+pinned_map_reader.rs / ks_loader.c）保留为参考、不再激活；无 BTF 的老内核回退 mock 并明确告警。
+退役原因是它属于兼容补丁而非未来加载器方向；但它倒逼出的"进程外加载器 = pin + 字节布局"
+契约结论保留，见上表最后一行。
 
 ---
 
@@ -394,8 +425,8 @@ ShellCheck、cargo audit。
 
 ## 14. 已知限制
 
-- **引擎被 kill**：用户态检测与 killer 失效，内核探针仍挂载但无人消费；systemd 自动拉起 + 回放补偿，
-  watchdog 互守未实现。
+- **引擎被 kill**：用户态检测与 killer 失效，内核探针仍挂载但无人消费；systemd 自动拉起 + 回放补偿；
+  watchdog 目前是单向巡检，watchdog 自身故障无人互守。
 - **4.19 无常驻真机**：功能验证在 VM，长稳 soak 待补。
 - **pid 重用**：裁决表 key 仅 pid，靠 TTL 300s 稀释误杀窗口；key 加 start_time 列入接口改造。
 - **内核过滤静态**：敏感路径等过滤表编译期固化，动态下发未实现。
@@ -403,7 +434,6 @@ ShellCheck、cargo audit。
 - **io_uring 部分覆盖**：实现函数 kprobe（vfs_write/tcp_connect）可见，tracepoint 级全覆盖需 5.1+。
 - **检测盲区**："合法进程内低频、陌生目标、小流量"外传是真实盲区（需威胁情报信誉，未实现）。
 - **取证链防篡改不防全删**：链尾外置到日志目录之外是部署要求，纯本地方案无法防御 root 全删。
-- **unsafe 20 处**：聚合器 11 / libc 6 / Pod 2 / rlimit 1，收敛至 ≤6 并集中单模块列入计划。
 - **基线正态假设**：z-score 在长尾分布下偏保守（漏报偏向）；分位数基线（中位数+MAD）列入改进。
 - **吞吐未达标**：处理层 61μs/事件（理论 16K/s）vs 端到端 1200-1977/s，瓶颈在 aya 逐条 next() 的
   取事件结构；优化方向（批量 drain、缓冲复用、增量计数）全部保持在单消费者架构内。

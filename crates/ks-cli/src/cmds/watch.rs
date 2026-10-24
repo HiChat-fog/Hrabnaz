@@ -1,5 +1,7 @@
 use anyhow::Result;
+use chrono::TimeZone;
 use ks_core::alert::Alert;
+use ks_core::rule::Severity;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -25,17 +27,175 @@ struct Tracked {
     ino: u64,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum MinSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl MinSeverity {
+    fn rank(self) -> u8 {
+        match self {
+            MinSeverity::Low => 0,
+            MinSeverity::Medium => 1,
+            MinSeverity::High => 2,
+            MinSeverity::Critical => 3,
+        }
+    }
+
+    fn accepts(self, sev: &Severity) -> bool {
+        severity_rank(sev) >= self.rank()
+    }
+}
+
+fn severity_rank(sev: &Severity) -> u8 {
+    match sev {
+        Severity::Low => 0,
+        Severity::Medium => 1,
+        Severity::High => 2,
+        Severity::Critical => 3,
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct WatchArgs {
     /// 取证日志目录（start --log-dir 的值，events_*.jsonl 所在处）
     #[arg(short, long, default_value = "/var/log/ks")]
     pub log_dir: String,
-    #[arg(short, long, default_value_t = 1)]
+    /// 轮询间隔（秒，≥1）
+    #[arg(short, long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     pub interval: u64,
+    /// follow 下新告警累计 N 条后停止；--no-follow 下最多输出 N 条（0 = 不限）
     #[arg(long, default_value_t = 0)]
     pub max: usize,
+    /// 输出 JSONL（一行一个告警对象；follow 时不回显历史）
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// 显式跟随（默认行为；保留该 flag 便于脚本自描述）
+    #[arg(long, default_value_t = false)]
+    pub follow: bool,
+    /// 读取当前已有告警后退出，不进入 tail
+    #[arg(long = "no-follow", default_value_t = false, conflicts_with = "follow")]
+    pub no_follow: bool,
+    /// 只显示规则名匹配的告警（glob，可重复，多次为 OR）
+    #[arg(long = "rule", value_name = "GLOB")]
+    pub rules: Vec<String>,
+    /// 只显示进程名匹配的告警（glob，可重复，多次为 OR）
+    #[arg(long = "comm", value_name = "GLOB")]
+    pub comms: Vec<String>,
+    /// 最低严重级别
+    #[arg(long, value_enum)]
+    pub severity: Option<MinSeverity>,
+    /// 只显示指定 PID 的告警（可重复，多次为 OR）
+    #[arg(long = "pid", value_name = "PID")]
+    pub pids: Vec<u32>,
+    /// 只显示文件路径包含该子串的告警（可重复，多次为 OR）
+    #[arg(long = "file", value_name = "SUBSTR")]
+    pub files: Vec<String>,
+}
+
+/// 告警过滤：同一 flag 多次出现为 OR，不同 flag 之间为 AND。
+struct WatchFilter {
+    rules: Vec<String>,
+    comms: Vec<String>,
+    severity: Option<MinSeverity>,
+    pids: HashSet<u32>,
+    files: Vec<String>,
+}
+
+impl WatchFilter {
+    fn new(args: &WatchArgs) -> Self {
+        Self {
+            rules: args.rules.clone(),
+            comms: args.comms.clone(),
+            severity: args.severity,
+            pids: args.pids.iter().copied().collect(),
+            files: args.files.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+            && self.comms.is_empty()
+            && self.severity.is_none()
+            && self.pids.is_empty()
+            && self.files.is_empty()
+    }
+
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.rules.is_empty() {
+            parts.push(format!("rule={}", self.rules.join("|")));
+        }
+        if !self.comms.is_empty() {
+            parts.push(format!("comm={}", self.comms.join("|")));
+        }
+        if let Some(s) = self.severity {
+            parts.push(format!("severity>={s:?}").to_lowercase());
+        }
+        if !self.pids.is_empty() {
+            let mut pids: Vec<u32> = self.pids.iter().copied().collect();
+            pids.sort_unstable();
+            let pids: Vec<String> = pids.iter().map(ToString::to_string).collect();
+            parts.push(format!("pid={}", pids.join("|")));
+        }
+        if !self.files.is_empty() {
+            parts.push(format!("file={}", self.files.join("|")));
+        }
+        parts.join(" ")
+    }
+
+    fn matches(&self, a: &Alert) -> bool {
+        let rule_ok = self.rules.is_empty()
+            || self
+                .rules
+                .iter()
+                .any(|p| glob_match(p, a.rule_name.as_str()));
+        let comm_ok = self.comms.is_empty()
+            || self
+                .comms
+                .iter()
+                .any(|p| glob_match(p, a.process.comm.as_str()));
+        let sev_ok = self.severity.is_none_or(|min| min.accepts(&a.severity));
+        let pid_ok = self.pids.is_empty() || self.pids.contains(&a.process.pid);
+        let file_ok = self.files.is_empty()
+            || a.file
+                .as_ref()
+                .is_some_and(|f| self.files.iter().any(|s| f.path.contains(s.as_str())));
+        rule_ok && comm_ok && sev_ok && pid_ok && file_ok
+    }
+}
+
+/// 只支持 `*`（任意串）和 `?`（任意单字符），大小写敏感。
+/// 用回溯法，避免为两个通配符引入 glob 依赖。
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            mark = ti;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// 活跃取证文件固定为 events_YYYYMMDD.jsonl。归档 events_YYYYMMDD_HHMMSS.jsonl
@@ -74,10 +234,15 @@ fn print_alert(a: &Alert) {
         .as_ref()
         .map(|m| format!(" | MITRE {}/{}", m.tactic, m.technique))
         .unwrap_or_default();
-    let ts = chrono::Local::now().format("%H:%M:%S");
+    // 告警 timestamp_ns 是单调时钟；有 btime 时换回墙钟，避免历史告警显示成当前时间
+    let ts = ks_core::time::epoch_ms_from_monotonic_ns(a.timestamp_ns)
+        .and_then(|ms| chrono::Local.timestamp_millis_opt(ms).single())
+        .unwrap_or_else(chrono::Local::now)
+        .format("%H:%M:%S")
+        .to_string();
     println!(
         "  {} {} {} — PID {}{}",
-        ts.to_string().dimmed(),
+        ts.dimmed(),
         severity_badge(&a.severity),
         a.title.bold(),
         a.process.pid,
@@ -125,13 +290,25 @@ fn read_new_lines(file: &mut File, offset: u64) -> Result<(u64, Vec<String>)> {
 
 pub async fn run(args: &WatchArgs) -> Result<()> {
     let json_mode = args.json;
+    let filter = WatchFilter::new(args);
+    let follow = !args.no_follow;
     if !json_mode {
         banner(&format!(
             "实时告警监控 — 每 {}s 轮询取证日志",
             args.interval
         ));
         println!("  日志目录: {}", args.log_dir.dimmed());
-        println!("  按 Ctrl+C 停止");
+        if !filter.is_empty() {
+            println!("  过滤:     {}", filter.describe());
+        }
+        println!(
+            "  模式:     {}",
+            if follow {
+                "follow（Ctrl+C 退出）"
+            } else {
+                "一次性读取"
+            }
+        );
         println!();
     }
 
@@ -142,6 +319,7 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
 
     // 启动时流式扫描日志：只保留最近 N 条告警用于回显 + 全量 id 进 seen（防 tail 重复），
     // 不整文件驻留内存（长跑日志可达百 MB 级）
+    let mut matched_seed = 0usize;
     if let Some(path) = latest_log(&args.log_dir) {
         let mut total = 0usize;
         let mut recent: VecDeque<Alert> = VecDeque::new();
@@ -149,7 +327,7 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
         if let Ok(mut file) = File::open(&path) {
             let mut reader = BufReader::new(&mut file);
             let mut line = String::new();
-            loop {
+            'seed: loop {
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
@@ -165,10 +343,26 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
                                     }
                                 }
                             }
-                            if recent.len() == SEED_LIMIT {
-                                recent.pop_front();
+                            if filter.matches(&a) {
+                                if !follow {
+                                    if json_mode {
+                                        if let Ok(s) = serde_json::to_string(&a) {
+                                            println!("{s}");
+                                        }
+                                    } else {
+                                        print_alert(&a);
+                                    }
+                                    matched_seed += 1;
+                                    if args.max > 0 && matched_seed >= args.max {
+                                        break 'seed;
+                                    }
+                                } else if !json_mode {
+                                    if recent.len() == SEED_LIMIT {
+                                        recent.pop_front();
+                                    }
+                                    recent.push_back(a);
+                                }
                             }
-                            recent.push_back(a);
                         }
                     }
                 }
@@ -182,18 +376,34 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
                 });
             }
         }
+        if !follow {
+            if !json_mode {
+                println!();
+                println!("共输出 {} 条匹配告警（未进入 follow）", matched_seed);
+            }
+            return Ok(());
+        }
         if total > 0 && !json_mode {
-            println!("  已有 {} 条历史告警，回显最近 {} 条:", total, recent.len());
+            println!(
+                "  已有 {} 条历史告警，过滤后回显最近 {} 条:",
+                total,
+                recent.len()
+            );
             for a in &recent {
                 print_alert(a);
             }
             println!();
         }
-    } else if !json_mode {
-        println!(
-            "  ({} 下暂无 events_*.jsonl — start 产生日志后自动跟上)",
-            args.log_dir
-        );
+    } else {
+        if !json_mode {
+            println!(
+                "  ({} 下暂无 events_*.jsonl — start 产生日志后自动跟上)",
+                args.log_dir
+            );
+        }
+        if !follow {
+            return Ok(());
+        }
     }
 
     loop {
@@ -258,6 +468,9 @@ pub async fn run(args: &WatchArgs) -> Result<()> {
                             seen.remove(&old);
                         }
                     }
+                    if !filter.matches(&a) {
+                        continue;
+                    }
                     count += 1;
                     if json_mode {
                         if let Ok(s) = serde_json::to_string(&a) {
@@ -293,6 +506,144 @@ mod tests {
         assert!(!is_active_log_name("chain_head.log"));
         assert!(!is_active_log_name("events_short.jsonl"));
         assert!(!is_active_log_name("events_20261016.jsonl.bak"));
+    }
+
+    fn alert(rule: &str, comm: &str, severity: Severity, pid: u32, file: Option<&str>) -> Alert {
+        let mut a = Alert::new(
+            severity,
+            0,
+            "test".into(),
+            rule.into(),
+            ks_core::alert::ProcessInfo {
+                pid,
+                ppid: 1,
+                comm: comm.into(),
+                uid: 0,
+                exe_path: None,
+                cmdline: None,
+            },
+        );
+        a.file = file.map(|path| ks_core::alert::FileInfo {
+            path: path.into(),
+            operation: ks_core::alert::FileOperation::Write,
+            bytes: None,
+        });
+        a
+    }
+
+    fn empty_args() -> WatchArgs {
+        WatchArgs {
+            log_dir: "/nonexistent".into(),
+            interval: 1,
+            max: 0,
+            json: false,
+            follow: false,
+            no_follow: false,
+            rules: Vec::new(),
+            comms: Vec::new(),
+            severity: None,
+            pids: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn glob_supports_star_question_and_multibyte_text() {
+        assert!(glob_match("", ""));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("a*b*c", "axxbyyc"));
+        assert!(glob_match("a**b", "ab"));
+        assert!(glob_match("?", "x"));
+        assert!(!glob_match("?", ""));
+        assert!(!glob_match("a?c", "abbc"));
+        assert!(!glob_match("abc", "abcd"));
+        assert!(!glob_match("SSH*", "ssh"), "glob 大小写敏感");
+        assert!(glob_match("*勒索*", "检测到勒索软件"), "按字符而非字节匹配");
+    }
+
+    #[test]
+    fn same_flag_is_or_and_cross_flag_is_and() {
+        let mut args = empty_args();
+        args.rules = vec!["SSH*".into(), "*Webshell*".into()];
+        args.comms = vec!["sshd".into()];
+        let f = WatchFilter::new(&args);
+
+        assert!(f.matches(&alert("SSH Brute Force", "sshd", Severity::High, 100, None)));
+        assert!(f.matches(&alert("PHP Webshell", "sshd", Severity::High, 100, None)));
+        assert!(
+            !f.matches(&alert("PHP Webshell", "curl", Severity::High, 100, None)),
+            "不同 flag 之间必须是 AND"
+        );
+        assert!(
+            !f.matches(&alert("Other Rule", "sshd", Severity::High, 100, None)),
+            "规则不匹配时 comm 再匹配也不能通过"
+        );
+    }
+
+    #[test]
+    fn severity_is_a_floor_pid_is_exact_and_file_requires_event() {
+        let mut args = empty_args();
+        args.severity = Some(MinSeverity::High);
+        args.pids = vec![100, 200];
+        args.files = vec!["/etc/shadow".into()];
+        let f = WatchFilter::new(&args);
+
+        assert!(f.matches(&alert(
+            "r",
+            "c",
+            Severity::Critical,
+            200,
+            Some("/etc/shadow")
+        )));
+        assert!(!f.matches(&alert("r", "c", Severity::Medium, 200, Some("/etc/shadow"))));
+        assert!(!f.matches(&alert("r", "c", Severity::High, 300, Some("/etc/shadow"))));
+        assert!(!f.matches(&alert("r", "c", Severity::High, 200, Some("/etc/passwd"))));
+        assert!(
+            !f.matches(&alert("r", "c", Severity::High, 200, None)),
+            "--file 不能匹配没有文件上下文的告警"
+        );
+    }
+
+    #[test]
+    fn empty_filter_accepts_everything_and_describes_cleanly() {
+        let args = empty_args();
+        let f = WatchFilter::new(&args);
+        assert!(f.is_empty());
+        assert!(f.describe().is_empty());
+        assert!(f.matches(&alert("any", "any", Severity::Low, 1, None)));
+
+        let mut args = empty_args();
+        args.rules = vec!["SSH*".into()];
+        args.comms = vec!["sshd".into()];
+        args.severity = Some(MinSeverity::High);
+        args.pids = vec![42];
+        args.files = vec!["/etc".into()];
+        let desc = WatchFilter::new(&args).describe();
+        for needle in [
+            "rule=SSH*",
+            "comm=sshd",
+            "severity>=high",
+            "pid=42",
+            "file=/etc",
+        ] {
+            assert!(desc.contains(needle), "describe 缺少 {needle}: {desc}");
+        }
+    }
+
+    #[test]
+    fn parse_alert_line_ignores_non_alerts_and_strips_forensic_fields() {
+        assert!(parse_alert_line("{\"type\":\"event\",\"pid\":1}").is_none());
+        assert!(parse_alert_line("not json").is_none());
+
+        let a = alert("r", "c", Severity::High, 7, None);
+        let mut v = serde_json::to_value(&a).unwrap();
+        v["type"] = serde_json::json!("alert");
+        v["prev_hash"] = serde_json::json!("prev");
+        v["hash"] = serde_json::json!("hash");
+        let parsed = parse_alert_line(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(parsed.id, a.id);
+        assert_eq!(parsed.rule_name, "r");
     }
 
     /// 未压缩归档（轮转→压缩窗口内，或压缩被跳过/失败后长期存在）不能顶替活跃文件
