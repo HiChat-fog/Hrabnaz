@@ -1,9 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use ks_engine::blocker::{BlockReason, PinnedBlockMap};
 use serde_json::json;
 
-use colored::Colorize;
 use super::ui::{banner, new_table};
+use colored::Colorize;
 
 /// 手动裁决的防呆：不杀 pid 1 / 自身 / 已不存在的进程
 fn guard_pid(pid: u32) -> Result<()> {
@@ -50,7 +50,11 @@ pub async fn run_block(pid: u32, ttl_secs: u64, json: bool) -> Result<()> {
             "{}  pid {} 已写入裁决 ({}, 来源: {})",
             "阻断".red().bold(),
             pid,
-            if expire == 0 { "永久".to_string() } else { format!("{}s", ttl_secs) },
+            if expire == 0 {
+                "永久".to_string()
+            } else {
+                format!("{}s", ttl_secs)
+            },
             BlockReason::Manual
         );
     }

@@ -1,6 +1,6 @@
+use super::ui::{banner, step};
 use anyhow::Result;
 use colored::Colorize;
-use super::ui::{banner, step};
 
 /// kill 前校验目标进程身份：读 /proc/<pid>/ 的 comm 与 exe，
 /// 防 PID 复用或伪造的状态文件把 SIGTERM 发给无关进程。
@@ -69,7 +69,10 @@ pub async fn run() -> Result<()> {
                     #[cfg(not(target_os = "linux"))]
                     {
                         let _ = pid;
-                        println!("      {} 非 Linux 环境，无法发送 SIGTERM", "[MOCK]".yellow());
+                        println!(
+                            "      {} 非 Linux 环境，无法发送 SIGTERM",
+                            "[MOCK]".yellow()
+                        );
                         println!("      提示: 请在运行实例窗口按 Ctrl+C 停止");
                         banner("请手动停止运行实例 (Ctrl+C)");
                     }
@@ -77,7 +80,10 @@ pub async fn run() -> Result<()> {
                     let _ = std::fs::remove_file(&status_path);
                     return Ok(());
                 }
-                println!("      {} 状态文件格式异常 (缺少 pid 字段)", "[WARN]".yellow());
+                println!(
+                    "      {} 状态文件格式异常 (缺少 pid 字段)",
+                    "[WARN]".yellow()
+                );
             } else {
                 println!("      {} 状态文件 JSON 解析失败", "[WARN]".yellow());
             }

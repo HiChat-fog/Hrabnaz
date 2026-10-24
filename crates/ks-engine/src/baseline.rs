@@ -297,11 +297,7 @@ impl BaselineManager {
             None => (String::new(), false, false),
         };
         let enough = has_baseline
-            && self
-                .freq_history
-                .get(&pid)
-                .map_or(0, |h| h.len())
-                >= self.min_samples as usize;
+            && self.freq_history.get(&pid).map_or(0, |h| h.len()) >= self.min_samples as usize;
         if enough {
             self.recalculate_baseline(pid, &comm, is_high_freq);
             self.established_pids.insert(pid);

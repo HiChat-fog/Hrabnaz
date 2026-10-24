@@ -74,7 +74,12 @@ pub trait BpfMapReader: Send + Sync {
     /// `0` = 永久阻断；`reason` 编码 1..5 与 `BlockReason` 对齐。
     /// 默认实现返回错误：mock / C loader（NOBTF）路径没有用户态 map 句柄，
     /// 调用方（BlockManager）收到错误后降级为仅记录用户态表。
-    fn write_block_decision(&self, _pid: u32, _expire_monotonic_ns: u64, _reason: u8) -> anyhow::Result<()> {
+    fn write_block_decision(
+        &self,
+        _pid: u32,
+        _expire_monotonic_ns: u64,
+        _reason: u8,
+    ) -> anyhow::Result<()> {
         anyhow::bail!("当前 map reader 不支持写 block_decisions（非 aya 加载路径或 mock）")
     }
 
@@ -118,12 +123,36 @@ impl BpfMapReader for MockBpfMapReader {
     }
     fn list_map_stats(&self) -> Vec<MapStat> {
         vec![
-            MapStat { name: "risk_scores".into(), map_type: "HASH".into(), entry_count: 0 },
-            MapStat { name: "ip_whitelist".into(), map_type: "HASH".into(), entry_count: 0 },
-            MapStat { name: "net_conn_history".into(), map_type: "LRU_HASH".into(), entry_count: 0 },
-            MapStat { name: "freq_counters".into(), map_type: "PERCPU_ARRAY".into(), entry_count: 0 },
-            MapStat { name: "infer_config".into(), map_type: "ARRAY".into(), entry_count: 0 },
-            MapStat { name: "protected_comms".into(), map_type: "LRU_HASH".into(), entry_count: 0 },
+            MapStat {
+                name: "risk_scores".into(),
+                map_type: "HASH".into(),
+                entry_count: 0,
+            },
+            MapStat {
+                name: "ip_whitelist".into(),
+                map_type: "HASH".into(),
+                entry_count: 0,
+            },
+            MapStat {
+                name: "net_conn_history".into(),
+                map_type: "LRU_HASH".into(),
+                entry_count: 0,
+            },
+            MapStat {
+                name: "freq_counters".into(),
+                map_type: "PERCPU_ARRAY".into(),
+                entry_count: 0,
+            },
+            MapStat {
+                name: "infer_config".into(),
+                map_type: "ARRAY".into(),
+                entry_count: 0,
+            },
+            MapStat {
+                name: "protected_comms".into(),
+                map_type: "LRU_HASH".into(),
+                entry_count: 0,
+            },
         ]
     }
 
@@ -280,7 +309,10 @@ fn inject_protected_pid(bpf: &mut aya::Ebpf, self_pid: u32) -> Vec<u32> {
             Ok(s) => {
                 let ppid = s
                     .lines()
-                    .find_map(|l| l.strip_prefix("PPid:").map(|v| v.trim().parse::<u32>().ok()))
+                    .find_map(|l| {
+                        l.strip_prefix("PPid:")
+                            .map(|v| v.trim().parse::<u32>().ok())
+                    })
                     .flatten();
                 match ppid {
                     Some(p) if p > 1 && !pids.contains(&p) => {
@@ -304,7 +336,10 @@ fn inject_protected_pid(bpf: &mut aya::Ebpf, self_pid: u32) -> Vec<u32> {
                 }
                 log::info!("已注入 protected_pids 豁免 map: {:?}", pids);
             }
-            Err(e) => log::warn!("打开 protected_pids map 失败: {:?}(豁免未生效,阻断可能误杀自身)", e),
+            Err(e) => log::warn!(
+                "打开 protected_pids map 失败: {:?}(豁免未生效,阻断可能误杀自身)",
+                e
+            ),
         },
         None => log::warn!("protected_pids map 不存在(豁免未生效)"),
     }
@@ -315,14 +350,26 @@ fn inject_protected_pid(bpf: &mut aya::Ebpf, self_pid: u32) -> Vec<u32> {
 fn inject_protected_pid(_bpf: &mut (), _self_pid: u32) {}
 
 pub const DEFAULT_PROTECTED_COMMS: &[&str] = &[
-    "sshd", "systemd", "cron", "crond", "journald", "dbus-daemon",
-    "sudo", "login", "agetty", "rsyslogd", "systemd-journal",
+    "sshd",
+    "systemd",
+    "cron",
+    "crond",
+    "journald",
+    "dbus-daemon",
+    "sudo",
+    "login",
+    "agetty",
+    "rsyslogd",
+    "systemd-journal",
 ];
 
 #[cfg(target_os = "linux")]
 fn inject_protected_comms(bpf: &mut aya::Ebpf) -> Vec<String> {
     use aya::maps::HashMap;
-    let mut comms: Vec<String> = DEFAULT_PROTECTED_COMMS.iter().map(|s| s.to_string()).collect();
+    let mut comms: Vec<String> = DEFAULT_PROTECTED_COMMS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     if let Ok(extra) = std::env::var("KS_PROTECTED_COMMS") {
         for c in extra.split(',') {
             let c = c.trim();
@@ -347,7 +394,11 @@ fn inject_protected_comms(bpf: &mut aya::Ebpf) -> Vec<String> {
                         injected.push(c.clone());
                     }
                 }
-                log::info!("已注入 protected_comms 白名单({}项): {:?}", injected.len(), injected);
+                log::info!(
+                    "已注入 protected_comms 白名单({}项): {:?}",
+                    injected.len(),
+                    injected
+                );
             }
             Err(e) => log::warn!("打开 protected_comms map 失败: {:?}(enforce误杀风险)", e),
         },
@@ -366,8 +417,14 @@ const CFG_ENFORCE_KILL_THRESHOLD_IDX: u32 = 7;
 #[cfg(target_os = "linux")]
 fn boot_monotonic_sec() -> u64 {
     std::fs::read_to_string("/proc/uptime")
-        .ok().and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
-        .map(|f| f as u64).unwrap_or(0)
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .map(|f| f as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(target_os = "linux")]
@@ -432,7 +489,10 @@ const KPROBE_EVENTS: &str = "/sys/kernel/debug/tracing/kprobe_events";
 fn stale_probe_tags(kprobe_events: &str, pid_alive: impl Fn(u32) -> bool) -> Vec<String> {
     let mut out = Vec::new();
     for line in kprobe_events.lines() {
-        let rest = match line.strip_prefix("p:kprobes/").or_else(|| line.strip_prefix("r:kprobes/")) {
+        let rest = match line
+            .strip_prefix("p:kprobes/")
+            .or_else(|| line.strip_prefix("r:kprobes/"))
+        {
             Some(r) => r,
             None => continue,
         };
@@ -538,11 +598,7 @@ impl EbpfLoader {
             let obj: Vec<u8> = if let Ok(dir) = std::env::var("KS_EBPF_DIR") {
                 let obj_path = std::path::Path::new(&dir).join(obj_name);
                 std::fs::read(&obj_path).map_err(|e| {
-                    anyhow::anyhow!(
-                        "KS_EBPF_DIR覆盖读取{}失败: {}",
-                        obj_path.display(),
-                        e
-                    )
+                    anyhow::anyhow!("KS_EBPF_DIR覆盖读取{}失败: {}", obj_path.display(), e)
                 })?
             } else {
                 ebpf_objects::ebpf_object_for(tier_suffix)
@@ -732,18 +788,30 @@ impl EbpfLoader {
             let prot_pids = inject_protected_pid(&mut bpf, std::process::id());
             self.protected_pids = prot_pids;
             inject_protected_comms(&mut bpf);
-            if std::env::var("KS_ENFORCE").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("KS_ENFORCE")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 set_infer_config(&mut bpf, CFG_ENFORCE_MODE_IDX, 1);
                 let warmup_sec: u64 = std::env::var("KS_ENFORCE_WARMUP_SEC")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(120);
                 let kill_thr: u32 = std::env::var("KS_ENFORCE_KILL_THRESHOLD")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(70);
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(70);
                 let warmup_until = boot_monotonic_sec().saturating_add(warmup_sec);
-                set_infer_config(&mut bpf, CFG_ENFORCE_WARMUP_UNTIL_SEC_IDX, warmup_until as u32);
+                set_infer_config(
+                    &mut bpf,
+                    CFG_ENFORCE_WARMUP_UNTIL_SEC_IDX,
+                    warmup_until as u32,
+                );
                 set_infer_config(&mut bpf, CFG_ENFORCE_KILL_THRESHOLD_IDX, kill_thr);
                 log::info!(
                     "阻断模式: enforce(verdict==2内核态SIGKILL) 干跑期={}s kill阈值={}",
-                    warmup_sec, kill_thr
+                    warmup_sec,
+                    kill_thr
                 );
             } else {
                 log::info!("阻断模式: monitor(默认,KS_ENFORCE=1切换为enforce)");
@@ -760,11 +828,7 @@ impl EbpfLoader {
                     PROBE_REGISTRY.len()
                 );
             } else {
-                log::info!(
-                    "eBPF {} 加载完成：{} 个程序已 attach",
-                    obj_name,
-                    n_attached
-                );
+                log::info!("eBPF {} 加载完成：{} 个程序已 attach", obj_name, n_attached);
             }
         }
 
@@ -1043,32 +1107,30 @@ garbage line
     #[cfg(target_os = "linux")]
     #[test]
     fn test_registry_matches_embedded_object_sections() {
-        let obj = super::ebpf_objects::ebpf_object_for("modern")
-            .expect("modern tier .o 应内嵌进二进制");
-        let parsed = crate::probe_registry::parse_probe_sections(obj)
-            .expect("嵌入了无法解析的 .o");
+        let obj =
+            super::ebpf_objects::ebpf_object_for("modern").expect("modern tier .o 应内嵌进二进制");
+        let parsed = crate::probe_registry::parse_probe_sections(obj).expect("嵌入了无法解析的 .o");
         let mut from_obj: Vec<(String, &'static str, Option<String>, String)> = parsed
             .into_iter()
             .map(|p| (p.name, p.kind, p.category, p.target))
             .collect();
         from_obj.sort();
-        let mut from_registry: Vec<(String, &'static str, Option<String>, String)> =
-            PROBE_REGISTRY
-                .iter()
-                .map(|p| {
-                    let kind = match p.kind {
-                        ProbeKind::Tracepoint => "tracepoint",
-                        ProbeKind::Kprobe => "kprobe",
-                        ProbeKind::Kretprobe => "kretprobe",
-                    };
-                    (
-                        p.name.to_string(),
-                        kind,
-                        p.category.map(|c| c.to_string()),
-                        p.target.to_string(),
-                    )
-                })
-                .collect();
+        let mut from_registry: Vec<(String, &'static str, Option<String>, String)> = PROBE_REGISTRY
+            .iter()
+            .map(|p| {
+                let kind = match p.kind {
+                    ProbeKind::Tracepoint => "tracepoint",
+                    ProbeKind::Kprobe => "kprobe",
+                    ProbeKind::Kretprobe => "kretprobe",
+                };
+                (
+                    p.name.to_string(),
+                    kind,
+                    p.category.map(|c| c.to_string()),
+                    p.target.to_string(),
+                )
+            })
+            .collect();
         from_registry.sort();
         assert_eq!(
             from_obj, from_registry,
@@ -1192,9 +1254,13 @@ garbage line
     #[cfg(target_os = "linux")]
     #[test]
     fn test_ebpf_objects_embedded_and_elf() {
-        let modern = super::ebpf_objects::ebpf_object_for("modern")
-            .expect("modern tier .o应内嵌进二进制");
-        assert!(modern.len() > 1024, "modern .o字节数异常小: {}", modern.len());
+        let modern =
+            super::ebpf_objects::ebpf_object_for("modern").expect("modern tier .o应内嵌进二进制");
+        assert!(
+            modern.len() > 1024,
+            "modern .o字节数异常小: {}",
+            modern.len()
+        );
         assert_eq!(&modern[..4], b"\x7fELF", "modern .o不是ELF(首4字节不匹配)");
         for suffix in ["legacy", "ancient", "ancient_nobtf"] {
             if let Some(bytes) = super::ebpf_objects::ebpf_object_for(suffix) {

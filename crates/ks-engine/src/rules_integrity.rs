@@ -28,7 +28,10 @@ pub enum RulesIntegrityVerdict {
     /// 未设置 KS_RULES_DIGEST（软模式：只落快照不比对）
     NoBaseline,
     Match,
-    Mismatch { baseline: String, current: String },
+    Mismatch {
+        baseline: String,
+        current: String,
+    },
 }
 
 /// 目录规则集指纹。目录不存在/无规则文件时返回 Err（调用方决定是否 fatal）。
@@ -65,7 +68,10 @@ pub fn digest_rules_dir(dir: &Path) -> Result<RulesIntegrity> {
 
 /// 检查 + 落快照。比对的基线来自 `KS_RULES_DIGEST`。
 /// 快照写入 `log_dir/rules_integrity.log`（追加式，带时间戳）。
-pub fn check_and_record(rules_dir: &Path, log_dir: &Path) -> Result<(RulesIntegrity, RulesIntegrityVerdict)> {
+pub fn check_and_record(
+    rules_dir: &Path,
+    log_dir: &Path,
+) -> Result<(RulesIntegrity, RulesIntegrityVerdict)> {
     let integrity = digest_rules_dir(rules_dir)?;
 
     let verdict = match std::env::var("KS_RULES_DIGEST") {

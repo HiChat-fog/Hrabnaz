@@ -314,8 +314,11 @@ impl ProcessTreeManager {
         let reconstructor = crate::chain::ChainReconstructor::new();
         // family.all_events 是本调用临时聚合的 owned 数据，包装成 Arc 适配
         // reconstruct 的 Arc 切片签名（离线路径，非热路径）
-        let arcs: Vec<std::sync::Arc<DecodedEvent>> =
-            family.all_events.iter().map(|e| std::sync::Arc::new(e.clone())).collect();
+        let arcs: Vec<std::sync::Arc<DecodedEvent>> = family
+            .all_events
+            .iter()
+            .map(|e| std::sync::Arc::new(e.clone()))
+            .collect();
         let chain = reconstructor.reconstruct(&arcs)?;
         Some(TreeAttackChain {
             root_pid: family.root_pid,

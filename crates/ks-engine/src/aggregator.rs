@@ -103,7 +103,10 @@ impl EventAggregator {
                         Some(ipv6_to_string(&payload.daddr6)),
                     )
                 } else {
-                    (Some(ip_to_string(payload.saddr)), Some(ip_to_string(payload.daddr)))
+                    (
+                        Some(ip_to_string(payload.saddr)),
+                        Some(ip_to_string(payload.daddr)),
+                    )
                 };
                 DecodedEvent {
                     seq: 0,
@@ -136,29 +139,27 @@ impl EventAggregator {
                     action: None,
                 }
             }
-            30 | 31 => {
-                DecodedEvent {
-                    seq: 0,
-                    header,
-                    comm,
-                    filename: None,
-                    args: None,
-                    saddr: None,
-                    daddr: None,
-                    sport: None,
-                    dport: None,
-                    proto: None,
-                    target_pid: Some(payload.target_pid),
-                    signal: Some(payload.signal),
-                    file_bytes: None,
-                    module_name: None,
-                    prog_name: None,
-                    source_ns_inum: None,
-                    target_ns_inum: None,
-                    cap_eff: None,
-                    action: None,
-                }
-            }
+            30 | 31 => DecodedEvent {
+                seq: 0,
+                header,
+                comm,
+                filename: None,
+                args: None,
+                saddr: None,
+                daddr: None,
+                sport: None,
+                dport: None,
+                proto: None,
+                target_pid: Some(payload.target_pid),
+                signal: Some(payload.signal),
+                file_bytes: None,
+                module_name: None,
+                prog_name: None,
+                source_ns_inum: None,
+                target_ns_inum: None,
+                cap_eff: None,
+                action: None,
+            },
             2 | 3 => DecodedEvent {
                 seq: 0,
                 header,
@@ -180,29 +181,27 @@ impl EventAggregator {
                 cap_eff: None,
                 action: None,
             },
-            80 => {
-                DecodedEvent {
-                    seq: 0,
-                    header,
-                    comm,
-                    filename: None,
-                    args: None,
-                    saddr: None,
-                    daddr: None,
-                    sport: None,
-                    dport: None,
-                    proto: None,
-                    target_pid: None,
-                    signal: None,
-                    file_bytes: None,
-                    module_name: None,
-                    prog_name: None,
-                    source_ns_inum: Some(payload.source_ns_inum),
-                    target_ns_inum: Some(payload.target_ns_inum),
-                    cap_eff: Some(payload.cap_eff),
-                    action: None,
-                }
-            }
+            80 => DecodedEvent {
+                seq: 0,
+                header,
+                comm,
+                filename: None,
+                args: None,
+                saddr: None,
+                daddr: None,
+                sport: None,
+                dport: None,
+                proto: None,
+                target_pid: None,
+                signal: None,
+                file_bytes: None,
+                module_name: None,
+                prog_name: None,
+                source_ns_inum: Some(payload.source_ns_inum),
+                target_ns_inum: Some(payload.target_ns_inum),
+                cap_eff: Some(payload.cap_eff),
+                action: None,
+            },
             81 => {
                 let mname = cstr_to_string(&payload.module_name);
                 DecodedEvent {
@@ -328,10 +327,7 @@ impl EventAggregator {
             let Some(pid) = self.evict_queue.pop_front() else {
                 break;
             };
-            let is_active = self
-                .pid_windows
-                .get(&pid)
-                .is_some_and(|w| !w.is_empty());
+            let is_active = self.pid_windows.get(&pid).is_some_and(|w| !w.is_empty());
             if is_active {
                 // 60s 窗口内仍活跃的 pid 重排队，不丢统计
                 self.evict_queue.push_back(pid);
@@ -370,11 +366,7 @@ impl EventAggregator {
         } else {
             0
         };
-        self.buffer
-            .iter()
-            .skip(skip)
-            .map(|e| e.as_ref())
-            .collect()
+        self.buffer.iter().skip(skip).map(|e| e.as_ref()).collect()
     }
 
     pub fn recent_syscall_count(&mut self, pid: u32, now_ns: u64) -> usize {
@@ -507,8 +499,8 @@ fn ipv6_to_string(addr: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zerocopy::IntoBytes;
     use ks_core::event::EventHeader;
+    use zerocopy::IntoBytes;
 
     fn make_header(event_type: u32, pid: u32, timestamp_ns: u64) -> EventHeader {
         EventHeader {
@@ -565,19 +557,26 @@ mod tests {
     #[test]
     fn test_recent_syscall_count_window() {
         let mut agg = EventAggregator::new(100);
-        for t in [0u64, 10_000_000_000, 20_000_000_000, 30_000_000_000, 40_000_000_000] {
+        for t in [
+            0u64,
+            10_000_000_000,
+            20_000_000_000,
+            30_000_000_000,
+            40_000_000_000,
+        ] {
             agg.decode(&encode_header(&make_header(2, 100, t))).unwrap();
         }
-        agg.decode(&encode_header(&make_header(2, 200, 5_000_000_000))).unwrap();
+        agg.decode(&encode_header(&make_header(2, 200, 5_000_000_000)))
+            .unwrap();
 
         assert_eq!(agg.recent_syscall_count(100, 40_000_000_000), 5);
         assert_eq!(agg.recent_syscall_count(200, 40_000_000_000), 1);
         assert_eq!(agg.recent_syscall_count(999, 40_000_000_000), 0);
 
-        agg.decode(&encode_header(&make_header(2, 100, 80_000_000_000))).unwrap();
+        agg.decode(&encode_header(&make_header(2, 100, 80_000_000_000)))
+            .unwrap();
         assert_eq!(agg.recent_syscall_count(100, 80_000_000_000), 3);
     }
-
 
     #[test]
     fn test_by_time_range() {
@@ -608,7 +607,13 @@ mod tests {
     }
 
     /// 构造 FileEvent 原始字节（8-31 新增的 rename/chmod 探针走同一 file_event 结构）
-    fn encode_file_event(event_type: u32, pid: u32, ts: u64, filename: &str, bytes: u64) -> Vec<u8> {
+    fn encode_file_event(
+        event_type: u32,
+        pid: u32,
+        ts: u64,
+        filename: &str,
+        bytes: u64,
+    ) -> Vec<u8> {
         let mut fname = [0u8; 256];
         let b = filename.as_bytes();
         fname[..b.len().min(255)].copy_from_slice(&b[..b.len().min(255)]);

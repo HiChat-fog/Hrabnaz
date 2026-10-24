@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use ks_core::event::EventHeader;
 use ks_core::event::DecodedEvent;
+use ks_core::event::EventHeader;
 use ks_engine::baseline::BaselineManager;
 
 fn make_event(pid: u32, comm: &str, event_type: u32) -> DecodedEvent {

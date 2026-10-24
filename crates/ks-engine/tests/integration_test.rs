@@ -762,10 +762,7 @@ fn test_dns_tunnel_full_pipeline() {
     assert_eq!(decoded[2].proto.as_ref().unwrap(), "UDP");
 
     let matches_dns1 = detector.match_event(&decoded[1]);
-    assert!(
-        !matches_dns1.is_empty(),
-        "UDP:53 DNS查询应触发DNS隧道规则"
-    );
+    assert!(!matches_dns1.is_empty(), "UDP:53 DNS查询应触发DNS隧道规则");
 
     let matches_dns2 = detector.match_event(&decoded[2]);
     assert!(!matches_dns2.is_empty(), "第二次UDP:53查询也应触发规则");
@@ -1268,10 +1265,7 @@ async fn test_container_escape_rule_triggers_critical_alert() {
         event.prog_name.is_none(),
         "container_escape事件prog_name应为None"
     );
-    assert!(
-        event.action.is_none(),
-        "container_escape事件action应为None"
-    );
+    assert!(event.action.is_none(), "container_escape事件action应为None");
 
     let matches = detector.match_event(&event);
     assert!(!matches.is_empty(), "容器逃逸事件 (comm=runc) 应触发规则");
@@ -1381,10 +1375,7 @@ async fn test_lkm_load_rule_rootkit_critical() {
         "module_name应解码为rootkit.ko, 实际: {:?}",
         event.module_name
     );
-    assert!(
-        event.prog_name.is_none(),
-        "lkm_load事件prog_name应为None"
-    );
+    assert!(event.prog_name.is_none(), "lkm_load事件prog_name应为None");
     assert!(
         event.source_ns_inum.is_none(),
         "lkm_load事件source_ns_inum应为None"
@@ -1616,10 +1607,7 @@ async fn test_ebpf_tamper_rule_critical() {
         event.target_ns_inum.is_none(),
         "ebpf_tamper事件target_ns_inum应为None"
     );
-    assert!(
-        event.cap_eff.is_none(),
-        "ebpf_tamper事件cap_eff应为None"
-    );
+    assert!(event.cap_eff.is_none(), "ebpf_tamper事件cap_eff应为None");
 
     let matches = detector.match_event(&event);
     assert!(
@@ -1707,7 +1695,9 @@ fn test_udp_sendmsg_net_event_raw_bytes_decode() {
         2250834984494223,
     );
     let mut agg = EventAggregator::new(100);
-    let decoded = agg.decode(&encode_struct(&event)).expect("UDP net_event 应可解码");
+    let decoded = agg
+        .decode(&encode_struct(&event))
+        .expect("UDP net_event 应可解码");
 
     assert_eq!(decoded.header.event_type, 24);
     assert_eq!(decoded.comm, "python");

@@ -1,9 +1,9 @@
-use ks_core::event::DecodedEvent;
 use anyhow::Result;
 use ks_core::alert::{
     AddressFamily, Alert, AlertStatus, FileInfo, FileOperation, MitreInfo, NetworkInfo,
     ProcessInfo, Protocol,
 };
+use ks_core::event::DecodedEvent;
 use ks_core::rule::{Condition, DetectionRule, Field, MatchResult, Operator};
 use log::{info, warn};
 use std::collections::HashMap;
@@ -37,7 +37,9 @@ impl DetectionEngine {
             if let Some(&old_idx) = self.rules_index.get(&rule.name) {
                 warn!(
                     "规则名重复: '{}' (第 {} 条被第 {} 条覆盖索引) — 建议重命名",
-                    rule.name, old_idx, self.rules.len()
+                    rule.name,
+                    old_idx,
+                    self.rules.len()
                 );
             }
             let idx = self.rules.len();
@@ -60,7 +62,10 @@ impl DetectionEngine {
                             self.regex_cache.insert(cond.value.clone(), re);
                         }
                         Err(e) => {
-                            warn!("规则正则编译失败,运行时该条件恒false: '{}' — {}", cond.value, e);
+                            warn!(
+                                "规则正则编译失败,运行时该条件恒false: '{}' — {}",
+                                cond.value, e
+                            );
                         }
                     }
                 }
@@ -101,30 +106,53 @@ impl DetectionEngine {
     fn condition_matches(&self, cond: &Condition, event: &DecodedEvent) -> bool {
         let cache = &self.regex_cache;
         match &cond.field {
-            Field::EventType => match_u32(event.header.event_type, &cond.operator, &cond.value, cache),
-            Field::SyscallNr => match_i32(event.header.syscall_nr, &cond.operator, &cond.value, cache),
+            Field::EventType => {
+                match_u32(event.header.event_type, &cond.operator, &cond.value, cache)
+            }
+            Field::SyscallNr => {
+                match_i32(event.header.syscall_nr, &cond.operator, &cond.value, cache)
+            }
             Field::Pid => match_u32(event.header.pid, &cond.operator, &cond.value, cache),
             Field::Uid => match_u32(event.header.uid, &cond.operator, &cond.value, cache),
             Field::Ppid => match_u32(event.header.ppid, &cond.operator, &cond.value, cache),
-            Field::Dport => {
-                match_opt_u32(event.dport.map(|v| v as u32), &cond.operator, &cond.value, cache)
-            }
-            Field::Sport => {
-                match_opt_u32(event.sport.map(|v| v as u32), &cond.operator, &cond.value, cache)
-            }
+            Field::Dport => match_opt_u32(
+                event.dport.map(|v| v as u32),
+                &cond.operator,
+                &cond.value,
+                cache,
+            ),
+            Field::Sport => match_opt_u32(
+                event.sport.map(|v| v as u32),
+                &cond.operator,
+                &cond.value,
+                cache,
+            ),
             Field::TargetPid => match_opt_u32(event.target_pid, &cond.operator, &cond.value, cache),
             Field::Signal => match_opt_i32(event.signal, &cond.operator, &cond.value, cache),
             Field::FileBytes => match_opt_u64(event.file_bytes, &cond.operator, &cond.value),
             Field::Comm => match_str(&event.comm, &cond.operator, &cond.value, cache),
-            Field::Filename => {
-                match_opt_str(event.filename.as_deref(), &cond.operator, &cond.value, cache)
-            }
+            Field::Filename => match_opt_str(
+                event.filename.as_deref(),
+                &cond.operator,
+                &cond.value,
+                cache,
+            ),
             Field::Args => match_opt_str(event.args.as_deref(), &cond.operator, &cond.value, cache),
-            Field::Saddr => match_opt_str(event.saddr.as_deref(), &cond.operator, &cond.value, cache),
-            Field::Daddr => match_opt_str(event.daddr.as_deref(), &cond.operator, &cond.value, cache),
-            Field::Proto => match_opt_str(event.proto.as_deref(), &cond.operator, &cond.value, cache),
-            Field::Saddr6 => match_ipv6_field(event.saddr.as_deref(), &cond.operator, &cond.value, cache),
-            Field::Daddr6 => match_ipv6_field(event.daddr.as_deref(), &cond.operator, &cond.value, cache),
+            Field::Saddr => {
+                match_opt_str(event.saddr.as_deref(), &cond.operator, &cond.value, cache)
+            }
+            Field::Daddr => {
+                match_opt_str(event.daddr.as_deref(), &cond.operator, &cond.value, cache)
+            }
+            Field::Proto => {
+                match_opt_str(event.proto.as_deref(), &cond.operator, &cond.value, cache)
+            }
+            Field::Saddr6 => {
+                match_ipv6_field(event.saddr.as_deref(), &cond.operator, &cond.value, cache)
+            }
+            Field::Daddr6 => {
+                match_ipv6_field(event.daddr.as_deref(), &cond.operator, &cond.value, cache)
+            }
             Field::Family => {
                 let inferred_family =
                     event
@@ -133,16 +161,28 @@ impl DetectionEngine {
                         .map(|a| if a.contains(':') { "IPv6" } else { "IPv4" });
                 match_family_field(inferred_family, &cond.operator, &cond.value)
             }
-            Field::ModuleName => {
-                match_opt_str(event.module_name.as_deref(), &cond.operator, &cond.value, cache)
+            Field::ModuleName => match_opt_str(
+                event.module_name.as_deref(),
+                &cond.operator,
+                &cond.value,
+                cache,
+            ),
+            Field::ProgName => match_opt_str(
+                event.prog_name.as_deref(),
+                &cond.operator,
+                &cond.value,
+                cache,
+            ),
+            Field::SourceNsInum => {
+                match_opt_u32(event.source_ns_inum, &cond.operator, &cond.value, cache)
             }
-            Field::ProgName => {
-                match_opt_str(event.prog_name.as_deref(), &cond.operator, &cond.value, cache)
+            Field::TargetNsInum => {
+                match_opt_u32(event.target_ns_inum, &cond.operator, &cond.value, cache)
             }
-            Field::SourceNsInum => match_opt_u32(event.source_ns_inum, &cond.operator, &cond.value, cache),
-            Field::TargetNsInum => match_opt_u32(event.target_ns_inum, &cond.operator, &cond.value, cache),
             Field::CapEff => match_opt_u32(event.cap_eff, &cond.operator, &cond.value, cache),
-            Field::Action => match_opt_str(event.action.as_deref(), &cond.operator, &cond.value, cache),
+            Field::Action => {
+                match_opt_str(event.action.as_deref(), &cond.operator, &cond.value, cache)
+            }
         }
     }
 
@@ -338,7 +378,12 @@ impl DetectionEngine {
     }
 }
 
-fn match_i32(value: i32, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
+fn match_i32(
+    value: i32,
+    op: &Operator,
+    target: &str,
+    cache: &HashMap<String, regex::Regex>,
+) -> bool {
     match op {
         Operator::Equals
         | Operator::GreaterThan
@@ -369,7 +414,12 @@ fn match_i32(value: i32, op: &Operator, target: &str, cache: &HashMap<String, re
     }
 }
 
-fn match_u32(value: u32, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
+fn match_u32(
+    value: u32,
+    op: &Operator,
+    target: &str,
+    cache: &HashMap<String, regex::Regex>,
+) -> bool {
     match op {
         Operator::Equals
         | Operator::GreaterThan
@@ -400,14 +450,24 @@ fn match_u32(value: u32, op: &Operator, target: &str, cache: &HashMap<String, re
     }
 }
 
-fn match_opt_u32(value: Option<u32>, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
+fn match_opt_u32(
+    value: Option<u32>,
+    op: &Operator,
+    target: &str,
+    cache: &HashMap<String, regex::Regex>,
+) -> bool {
     match value {
         Some(v) => match_u32(v, op, target, cache),
         None => false,
     }
 }
 
-fn match_opt_i32(value: Option<i32>, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
+fn match_opt_i32(
+    value: Option<i32>,
+    op: &Operator,
+    target: &str,
+    cache: &HashMap<String, regex::Regex>,
+) -> bool {
     match value {
         Some(v) => match_i32(v, op, target, cache),
         None => false,
@@ -436,7 +496,12 @@ fn match_opt_u64(value: Option<u64>, op: &Operator, target: &str) -> bool {
     }
 }
 
-fn match_str(value: &str, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
+fn match_str(
+    value: &str,
+    op: &Operator,
+    target: &str,
+    cache: &HashMap<String, regex::Regex>,
+) -> bool {
     match op {
         Operator::Equals => value == target,
         Operator::NotEquals => value != target,
@@ -477,7 +542,12 @@ fn match_str(value: &str, op: &Operator, target: &str, cache: &HashMap<String, r
     }
 }
 
-fn match_opt_str(value: Option<&str>, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
+fn match_opt_str(
+    value: Option<&str>,
+    op: &Operator,
+    target: &str,
+    cache: &HashMap<String, regex::Regex>,
+) -> bool {
     match value {
         Some(v) => match_str(v, op, target, cache),
         None => false,
@@ -525,7 +595,12 @@ fn op_to_str(op: &Operator) -> &str {
     }
 }
 
-fn match_ipv6_field(value: Option<&str>, op: &Operator, target: &str, cache: &HashMap<String, regex::Regex>) -> bool {
+fn match_ipv6_field(
+    value: Option<&str>,
+    op: &Operator,
+    target: &str,
+    cache: &HashMap<String, regex::Regex>,
+) -> bool {
     match_opt_str(value, op, target, cache)
 }
 

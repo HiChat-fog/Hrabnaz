@@ -139,7 +139,10 @@ pub fn parse_probe_sections(bytes: &[u8]) -> Result<Vec<RawProbe>, String> {
 
         let (category, target) = if kind == "tracepoint" {
             let (cat, evt) = rest.split_once('/').ok_or_else(|| {
-                format!("tracepoint 段名格式应为 tracepoint/<category>/<event>: '{}'", sec.name)
+                format!(
+                    "tracepoint 段名格式应为 tracepoint/<category>/<event>: '{}'",
+                    sec.name
+                )
             })?;
             if cat.is_empty() || evt.is_empty() || evt.contains('/') {
                 return Err(format!("tracepoint 段名不合法: '{}'", sec.name));

@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
 use std::path::Path;
 
-use colored::*;
 use super::ui::{banner, severity_colored};
+use colored::*;
 
 /// 进程画像每 pid 保留的展示样本数（展示只取前 5 条，样本再多没有意义）
 const PID_SAMPLE_KEEP: usize = 5;
@@ -574,7 +574,11 @@ fn format_timestamp(ns: u64) -> String {
 /// 单调钟 + 墙钟双列：单调钟是取证序权威，墙钟便于跨主机对表。
 fn format_epoch_ms(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_else(|| format!("epoch_ms 异常值 {ms}"))
 }
 

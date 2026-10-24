@@ -1,4 +1,3 @@
-pub mod ui;
 pub mod baseline;
 pub mod block;
 pub mod correlation;
@@ -7,8 +6,9 @@ pub mod singleton;
 pub mod start;
 pub mod status;
 pub mod stop;
-pub mod watchdog;
+pub mod ui;
 pub mod watch;
+pub mod watchdog;
 
 /// 运行时状态文件路径（start 写 / status 读 / stop 读后 kill）。
 /// root 时放 /run/kernelsentinel/（root-only 目录，防本地用户伪造/symlink 后诱导 stop 杀任意进程），

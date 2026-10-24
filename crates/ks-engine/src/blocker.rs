@@ -28,7 +28,8 @@ pub struct MapWriterSink(pub Arc<dyn BpfMapReader>);
 
 impl KernelBlockWriter for MapWriterSink {
     fn apply_block(&self, pid: u32, expire_monotonic_ns: u64, reason: u8) -> anyhow::Result<()> {
-        self.0.write_block_decision(pid, expire_monotonic_ns, reason)
+        self.0
+            .write_block_decision(pid, expire_monotonic_ns, reason)
     }
     fn remove_block(&self, pid: u32) -> anyhow::Result<()> {
         self.0.remove_block_decision(pid)
@@ -182,7 +183,11 @@ impl BlockManager {
         if removed {
             if let Some(k) = &self.kernel {
                 if let Err(e) = k.remove_block(pid) {
-                    log::warn!("block_decisions 内核删除失败(pid={}): {} — TTL 到期后内核侧自动失效", pid, e);
+                    log::warn!(
+                        "block_decisions 内核删除失败(pid={}): {} — TTL 到期后内核侧自动失效",
+                        pid,
+                        e
+                    );
                 }
             }
         }
@@ -564,7 +569,10 @@ mod kernel_sync_tests {
         assert!(mgr.block_pid(1234, u64::MAX, BlockReason::Manual, "t"));
         let calls = sink.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, 0, "永久阻断应写 expire_ns=0（内核语义：0=永久）");
+        assert_eq!(
+            calls[0].1, 0,
+            "永久阻断应写 expire_ns=0（内核语义：0=永久）"
+        );
     }
 
     #[test]
@@ -574,9 +582,15 @@ mod kernel_sync_tests {
         mgr.set_kernel_sink(sink.clone());
 
         assert!(!mgr.block_pid(1234, 60, BlockReason::Manual, "t"));
-        assert!(sink.calls.lock().unwrap().is_empty(), "阻断未启用时不应下发内核");
+        assert!(
+            sink.calls.lock().unwrap().is_empty(),
+            "阻断未启用时不应下发内核"
+        );
         assert!(!mgr.unblock_pid(1234));
-        assert!(sink.removed.lock().unwrap().is_empty(), "未阻断的 unblock 不应下发内核");
+        assert!(
+            sink.removed.lock().unwrap().is_empty(),
+            "未阻断的 unblock 不应下发内核"
+        );
     }
 
     #[test]
@@ -638,10 +652,17 @@ mod user_kill_tests {
         let mut killed = HashMap::new();
         let now = 1_000_000;
         let entries = [(111, now + 60_000_000, BlockReason::Manual as u8)];
-        let out = user_kill_tick(&entries, &mut killed, &set(&[]), |_| false, now, |p| {
-            assert_eq!(p, 111);
-            true
-        });
+        let out = user_kill_tick(
+            &entries,
+            &mut killed,
+            &set(&[]),
+            |_| false,
+            now,
+            |p| {
+                assert_eq!(p, 111);
+                true
+            },
+        );
         assert_eq!(out.fired.len(), 1);
         // 下一轮同 expire 不重复杀
         let out2 = user_kill_tick(&entries, &mut killed, &set(&[]), |_| false, now, |_| true);
@@ -654,9 +675,14 @@ mod user_kill_tests {
         let mut killed = HashMap::new();
         let now = 1_000_000;
         let entries = [(42, 0u64, BlockReason::Manual as u8)];
-        let out = user_kill_tick(&entries, &mut killed, &set(&[]), |p| p == 42, now, |_| {
-            panic!("豁免进程不应进入 kill_fn")
-        });
+        let out = user_kill_tick(
+            &entries,
+            &mut killed,
+            &set(&[]),
+            |p| p == 42,
+            now,
+            |_| panic!("豁免进程不应进入 kill_fn"),
+        );
         assert!(out.fired.is_empty());
         assert_eq!(out.exempt, vec![42]);
         // 已记录，下轮不再重复判定
@@ -679,9 +705,14 @@ mod user_kill_tests {
         let mut killed = HashMap::new();
         let now = 1_000_000;
         let entries = [(1, 0u64, 5u8), (42, 0u64, 5u8), (0, 0u64, 5u8)];
-        let out = user_kill_tick(&entries, &mut killed, &set(&[1, 42]), |_| false, now, |_| {
-            panic!("protected 条目不应触发 kill")
-        });
+        let out = user_kill_tick(
+            &entries,
+            &mut killed,
+            &set(&[1, 42]),
+            |_| false,
+            now,
+            |_| panic!("protected 条目不应触发 kill"),
+        );
         assert!(out.fired.is_empty());
     }
 

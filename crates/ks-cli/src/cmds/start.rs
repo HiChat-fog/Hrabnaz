@@ -12,8 +12,8 @@ use ks_engine::engine::{
 use std::path::Path;
 use std::time::Instant;
 
-use colored::Colorize;
 use super::ui::{banner, severity_badge, step};
+use colored::Colorize;
 
 pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -70,7 +70,10 @@ pub async fn run(rules_dir: &str, log_dir: &str, sd_notify: bool) -> Result<()> 
         println!("      {}: {} 条规则", name, count);
     }
     if !info.rules_dir_exists {
-        println!("      [WARN] 规则目录不存在: {} (将使用空规则集)", rules_dir);
+        println!(
+            "      [WARN] 规则目录不存在: {} (将使用空规则集)",
+            rules_dir
+        );
     } else if info.rules_total == 0 {
         println!(
             "      [WARN] 未加载任何规则 (将仅使用异常评分，阈值 {:.2})",

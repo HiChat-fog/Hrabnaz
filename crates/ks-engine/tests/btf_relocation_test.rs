@@ -65,7 +65,12 @@ fn poison_sites(obj: &aya_obj::Object) -> Vec<String> {
                         )
                     })
                     .collect();
-                sites.push(format!("{} insn[{}]\n     {}", f.name, i, ctx.join("\n     ")));
+                sites.push(format!(
+                    "{} insn[{}]\n     {}",
+                    f.name,
+                    i,
+                    ctx.join("\n     ")
+                ));
             }
         }
     }
@@ -151,8 +156,12 @@ fn test_core_relocation_with_every_embedded_btf() {
         return;
     }
     for release in releases {
-        let bytes = btf_source::embedded_btf_for(release)
-            .unwrap_or_else(|| panic!("内嵌表登记了 {} 但查不到内容，build.rs 生成的表不自洽", release));
+        let bytes = btf_source::embedded_btf_for(release).unwrap_or_else(|| {
+            panic!(
+                "内嵌表登记了 {} 但查不到内容，build.rs 生成的表不自洽",
+                release
+            )
+        });
         let btf = Btf::parse(bytes, Endianness::default())
             .unwrap_or_else(|e| panic!("内嵌 BTF(release={}) 解析失败: {}", release, e));
         let tiers = tiers_for_release(release);
@@ -268,7 +277,12 @@ fn test_minimized_btf_relocates_identically_to_full_btf() {
                 let Some(fb) = min_obj.functions.get(key) else {
                     panic!("{}: 最小 BTF 下函数 {} 消失了", label, fa.name);
                 };
-                for (i, (ia, ib)) in fa.instructions.iter().zip(fb.instructions.iter()).enumerate() {
+                for (i, (ia, ib)) in fa
+                    .instructions
+                    .iter()
+                    .zip(fb.instructions.iter())
+                    .enumerate()
+                {
                     assert!(
                         ia.imm == ib.imm && ia.off == ib.off,
                         "{}: {} insn[{}] 重定位结果不同（完整 imm={:#x} off={} / 最小 imm={:#x} off={}）\

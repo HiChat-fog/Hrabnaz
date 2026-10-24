@@ -1,8 +1,8 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-use colored::Colorize;
 use super::ui::{banner, step};
+use colored::Colorize;
 
 /// 心跳年龄超过该秒数视为消费循环停摆（H-1.6）。
 /// 引擎 10s 写一次心跳，默认阈值 60s = 连续 6 个周期无刷新
@@ -67,12 +67,18 @@ pub async fn run(args: &WatchdogArgs) -> Result<()> {
             println!("  引擎未运行（无心跳文件）— 无需动作");
             return Ok(());
         }
-        bail!("心跳文件 {} 存在但无法解析 — 文件损坏或被篡改", hb_path.display());
+        bail!(
+            "心跳文件 {} 存在但无法解析 — 文件损坏或被篡改",
+            hb_path.display()
+        );
     };
 
     let now = now_epoch_ms();
     if hb.ts_epoch_ms > now + 60_000 {
-        bail!("心跳时间戳来自未来 ({}ms)，时钟异常，拒绝判定", hb.ts_epoch_ms);
+        bail!(
+            "心跳时间戳来自未来 ({}ms)，时钟异常，拒绝判定",
+            hb.ts_epoch_ms
+        );
     }
     let age_secs = now.saturating_sub(hb.ts_epoch_ms) / 1000;
     let alive = std::path::Path::new(&format!("/proc/{}", hb.pid)).exists();
@@ -121,13 +127,19 @@ pub async fn run(args: &WatchdogArgs) -> Result<()> {
             "动作".red().bold(),
             hb.pid
         );
-        println!("      提示: 用 systemd timer 或 while-loop 每 {}s 调一次本命令实现自动恢复", args.stale_secs);
+        println!(
+            "      提示: 用 systemd timer 或 while-loop 每 {}s 调一次本命令实现自动恢复",
+            args.stale_secs
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = args.dry_run;
-        println!("      {} 非 Linux 环境，无法发送 SIGTERM", "[MOCK]".yellow());
+        println!(
+            "      {} 非 Linux 环境，无法发送 SIGTERM",
+            "[MOCK]".yellow()
+        );
     }
 
     Ok(())

@@ -29,7 +29,10 @@ pub fn acquire() -> io::Result<File> {
             return Ok(f);
         }
         let e = io::Error::last_os_error();
-        if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EACCES) || e.raw_os_error() == Some(libc::EAGAIN) {
+        if e.kind() == io::ErrorKind::WouldBlock
+            || e.raw_os_error() == Some(libc::EACCES)
+            || e.raw_os_error() == Some(libc::EAGAIN)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("ks已在运行(锁文件{}被占用),拒绝重复启动", path),

@@ -464,8 +464,7 @@ pub use linux_impl::*;
 pub use mock_only::*;
 
 #[cfg(target_os = "linux")]
-static RELEASED_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> =
-    std::sync::Mutex::new(Vec::new());
+static RELEASED_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// 清理本进程释放的私有临时目录（优雅退出路径调用；崩溃残留由下次启动的
 /// sweep_stale_run_dirs 兜底清扫）
@@ -718,12 +717,20 @@ mod linux_impl {
     /// 启动期清扫：删除"其他进程"残留的 ks-run-* 目录（目录名内嵌 pid，
     /// 仅当该 pid 的进程已不存在时才删，绝不碰仍在运行的实例）
     fn sweep_stale_run_dirs(dir: &std::path::Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(rest) = name.strip_prefix("ks-run-") else { continue };
-            let Some(pid_str) = rest.split('-').next() else { continue };
-            let Ok(pid) = pid_str.parse::<u32>() else { continue };
+            let Some(rest) = name.strip_prefix("ks-run-") else {
+                continue;
+            };
+            let Some(pid_str) = rest.split('-').next() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
             if pid == std::process::id() {
                 continue; // 自己的目录由退出清理负责
             }
@@ -815,11 +822,7 @@ mod linux_impl {
                 log::debug!("[cloader] {}来自KS_EBPF_DIR={}", OBJ_NAME, p.display());
                 return Ok(p);
             }
-            log::warn!(
-                "[cloader] KS_EBPF_DIR={}但{}不存在,改用内嵌",
-                dir,
-                OBJ_NAME,
-            );
+            log::warn!("[cloader] KS_EBPF_DIR={}但{}不存在,改用内嵌", dir, OBJ_NAME,);
         }
 
         let bytes =
@@ -842,11 +845,7 @@ mod linux_impl {
                 log::debug!("[cloader] {}来自KS_EBPF_DIR={}", OBJ_NAME, p.display());
                 return Ok(p);
             }
-            log::warn!(
-                "[cloader] KS_EBPF_DIR={}但{}不存在,改用内嵌",
-                dir,
-                OBJ_NAME,
-            );
+            log::warn!("[cloader] KS_EBPF_DIR={}但{}不存在,改用内嵌", dir, OBJ_NAME,);
         }
 
         let bytes =

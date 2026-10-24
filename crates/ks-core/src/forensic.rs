@@ -1,6 +1,6 @@
+use crate::alert::Alert;
 use crate::event::DecodedEvent;
 use anyhow::Result;
-use crate::alert::Alert;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{read_dir, remove_file, File, OpenOptions};
@@ -34,7 +34,9 @@ fn secret_flag_re() -> &'static regex::Regex {
 
 /// 脱敏一条 argv/命令行：保留键名，值替换为 ***
 pub fn sanitize_secret(value: &str) -> String {
-    let s = secret_value_re().replace_all(value, "${1}${2}***").into_owned();
+    let s = secret_value_re()
+        .replace_all(value, "${1}${2}***")
+        .into_owned();
     secret_flag_re().replace_all(&s, "${1} ***").into_owned()
 }
 
@@ -136,7 +138,9 @@ fn ensure_private_dir(dir: &Path) {
 #[cfg(unix)]
 fn tighten_existing_files(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -395,9 +399,7 @@ impl ForensicLogger {
         });
         // 墙钟侧车：btime+monotonic 换算（btime 在 OnceLock 缓存，热路径零 IO）。
         // 换算不出来（无 /proc/stat）时省略字段，消费方退回 timestamp_ns 单调钟
-        if let Some(epoch_ms) =
-            crate::time::epoch_ms_from_monotonic_ns(event.header.timestamp_ns)
-        {
+        if let Some(epoch_ms) = crate::time::epoch_ms_from_monotonic_ns(event.header.timestamp_ns) {
             record["epoch_ms"] = serde_json::json!(epoch_ms);
         }
 
@@ -515,11 +517,7 @@ impl ForensicLogger {
             .and_then(|n| n.to_str())
             .unwrap_or("?")
             .to_string();
-        let key = (
-            self.event_count,
-            self.prev_hash.clone(),
-            file_name.clone(),
-        );
+        let key = (self.event_count, self.prev_hash.clone(), file_name.clone());
         if self.last_exported.as_ref() == Some(&key) {
             return;
         }
@@ -530,8 +528,8 @@ impl ForensicLogger {
             self.prev_hash,
             file_name,
         );
-        let write_res = open_private(&head_path, true)
-            .and_then(|mut f| f.write_all(line.as_bytes()));
+        let write_res =
+            open_private(&head_path, true).and_then(|mut f| f.write_all(line.as_bytes()));
         if let Err(e) = write_res {
             // 外落失败不影响主取证链路
             log::debug!("chain_head 外落失败: {} — {}", head_path.display(), e);
@@ -762,7 +760,10 @@ mod tests {
         let normal = "gcc -O2 -o app main.c && tar -czf backup.tar.gz /data";
         assert_eq!(sanitize_secret(normal), normal);
         // 普通单词不能被误伤
-        assert_eq!(sanitize_secret("ls -la --color=auto"), "ls -la --color=auto");
+        assert_eq!(
+            sanitize_secret("ls -la --color=auto"),
+            "ls -la --color=auto"
+        );
     }
 
     #[test]
@@ -927,7 +928,11 @@ mod tests {
     /// 手工追加一条链记录：与 log_event 相同的规范化哈希
     /// （clean 记录去 hash/prev_hash 后按 BTreeMap 序列化再 SHA-256）。
     /// 返回该条 hash，供下一条续链
-    fn append_chained_record(path: &Path, mut record: serde_json::Value, prev_hash: &str) -> String {
+    fn append_chained_record(
+        path: &Path,
+        mut record: serde_json::Value,
+        prev_hash: &str,
+    ) -> String {
         use std::io::Write as _;
         record["prev_hash"] = serde_json::Value::String(prev_hash.to_string());
         let mut clean = record.clone();
@@ -945,7 +950,11 @@ mod tests {
         hasher.update(serde_json::to_string(&btree).unwrap().as_bytes());
         let hash = format!("{:x}", hasher.finalize());
         record["hash"] = serde_json::Value::String(hash.clone());
-        let mut f = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
         writeln!(f, "{}", serde_json::to_string(&record).unwrap()).unwrap();
         hash
     }
@@ -992,7 +1001,11 @@ mod tests {
             prev = append_chained_record(&cur_file, plain_record(i), &prev);
         }
         let v = ForensicLogger::verify_chain(&cur_file).unwrap();
-        assert!(v.is_valid, "锚定文件应通过校验, 却在第 {:?} 条断裂", v.broken_at);
+        assert!(
+            v.is_valid,
+            "锚定文件应通过校验, 却在第 {:?} 条断裂",
+            v.broken_at
+        );
         assert!(v.anchored, "首条 prev_hash 非创世应标注 anchored");
         assert_eq!(v.total_records, 4);
     }
@@ -1022,7 +1035,11 @@ mod tests {
         std::fs::write(&cur_file, tampered.join("\n") + "\n").unwrap();
         let v = ForensicLogger::verify_chain(&cur_file).unwrap();
         assert!(!v.is_valid);
-        assert_eq!(v.broken_at, Some(2), "内容篡改应在第 2 条被自身哈希检查定位");
+        assert_eq!(
+            v.broken_at,
+            Some(2),
+            "内容篡改应在第 2 条被自身哈希检查定位"
+        );
     }
 
     /// H-1.1 单测③：文件内删/插记录仍被文件内连续性检查抓住
@@ -1046,7 +1063,11 @@ mod tests {
         std::fs::write(&cur_file, kept.join("\n") + "\n").unwrap();
         let v = ForensicLogger::verify_chain(&cur_file).unwrap();
         assert!(!v.is_valid);
-        assert_eq!(v.broken_at, Some(2), "删记录应在缺口后第一条被连续性检查定位");
+        assert_eq!(
+            v.broken_at,
+            Some(2),
+            "删记录应在缺口后第一条被连续性检查定位"
+        );
     }
 
     /// H-1.1 单测④：创世链语义不变——正常单文件链通过且不标注 anchored
@@ -1373,8 +1394,7 @@ mod tests {
         drop(logger);
 
         let raw = std::fs::read(&path).unwrap();
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&raw).unwrap();
         let gz_path = dir.path().join("events_20200101_120000.jsonl.gz");
         std::fs::write(&gz_path, encoder.finish().unwrap()).unwrap();

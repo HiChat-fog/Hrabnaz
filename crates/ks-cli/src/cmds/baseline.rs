@@ -4,8 +4,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use colored::Colorize;
 use super::ui::{banner, new_table};
+use colored::Colorize;
 
 /// 与引擎侧 BaselineManager 对齐的离线近似参数：
 /// 引擎按 60s 窗口计数、连续 5 个非平凡窗口(min_samples)后判定基线建立
@@ -35,11 +35,12 @@ struct PidAgg {
 
 pub async fn run(args: &BaselineArgs) -> Result<()> {
     let latest = latest_events_jsonl(&args.log_dir)?;
-    let path = latest.unwrap_or_else(|| {
-        Path::new(&args.log_dir).join("events_<date>.jsonl")
-    });
+    let path = latest.unwrap_or_else(|| Path::new(&args.log_dir).join("events_<date>.jsonl"));
     if !path.exists() {
-        anyhow::bail!("{} 下没有 events_*.jsonl — 先运行 kernelsentinel start 产生日志", args.log_dir);
+        anyhow::bail!(
+            "{} 下没有 events_*.jsonl — 先运行 kernelsentinel start 产生日志",
+            args.log_dir
+        );
     }
 
     let mut aggs: BTreeMap<u32, PidAgg> = BTreeMap::new();
@@ -85,8 +86,8 @@ pub async fn run(args: &BaselineArgs) -> Result<()> {
             (0.0, 0.0)
         } else {
             let m = completed.iter().sum::<f64>() / completed.len() as f64;
-            let var = completed.iter().map(|c| (c - m).powi(2)).sum::<f64>()
-                / completed.len() as f64;
+            let var =
+                completed.iter().map(|c| (c - m).powi(2)).sum::<f64>() / completed.len() as f64;
             (m, var.sqrt())
         };
         let high_freq = mean > HIGH_FREQ_MEAN;
@@ -134,7 +135,14 @@ pub async fn run(args: &BaselineArgs) -> Result<()> {
     }
 
     let mut t = new_table();
-    t.set_header(vec!["PID", "COMM", "样本数", "已建立", "syscall 次/60s μ/σ", "标记"]);
+    t.set_header(vec![
+        "PID",
+        "COMM",
+        "样本数",
+        "已建立",
+        "syscall 次/60s μ/σ",
+        "标记",
+    ]);
     for (pid, comm, samples, established, mean, stddev, high_freq) in &rows {
         let established = if *established {
             "✓".to_string().green()

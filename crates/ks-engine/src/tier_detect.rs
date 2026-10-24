@@ -12,7 +12,9 @@ pub fn detect_ebpf_tier() -> Option<SourceKind> {
         }
     }
     if matches!(tier, SourceKind::EbpfLegacy) && !btf_available() {
-        log::info!("Legacy tier: BTF不可用,用NOBTF硬编码4.19 offset(ks_main_legacy_nobtf.o,C loader)");
+        log::info!(
+            "Legacy tier: BTF不可用,用NOBTF硬编码4.19 offset(ks_main_legacy_nobtf.o,C loader)"
+        );
         return Some(SourceKind::EbpfLegacyNoBtf);
     }
     Some(tier)

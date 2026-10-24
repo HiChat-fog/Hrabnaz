@@ -1,6 +1,6 @@
-use ks_core::event::DecodedEvent;
 use crate::process_tree::ProcessTreeManager;
 use ks_core::alert::{Alert, MitreInfo, ProcessInfo};
+use ks_core::event::DecodedEvent;
 use ks_core::rule::Severity;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -92,8 +92,18 @@ impl CorrelationAlert {
             _ => Severity::Low,
         };
 
-        let ts = self.events.first().map(|e| e.header.timestamp_ns).unwrap_or(0);
-        let mut alert = Alert::new(severity, ts, self.rule_name.clone(), self.rule_name.clone(), proc);
+        let ts = self
+            .events
+            .first()
+            .map(|e| e.header.timestamp_ns)
+            .unwrap_or(0);
+        let mut alert = Alert::new(
+            severity,
+            ts,
+            self.rule_name.clone(),
+            self.rule_name.clone(),
+            proc,
+        );
         alert.description = self.description.clone();
         alert.event_ids = self.events.iter().map(|e| e.seq).collect();
         alert.mitre = self.mitre.as_ref().map(|m| MitreInfo {
@@ -378,19 +388,15 @@ impl CorrelationEngine {
                     ..
                 } = &self.rules[rule_idx].correlation_type
                 {
-                    if let Some(alert) = self.check_window_correlation(
-                        event,
-                        window_secs,
-                        condition_a,
-                        condition_b,
-                    ) {
+                    if let Some(alert) =
+                        self.check_window_correlation(event, window_secs, condition_a, condition_b)
+                    {
                         let rule = &self.rules[rule_idx];
                         alerts.push(self.build_alert(rule, alert));
                     }
                 }
             } else if max_gap_secs > 0 {
-                if let Some(alert) =
-                    self.check_sequence_correlation(event, rule_idx, max_gap_secs)
+                if let Some(alert) = self.check_sequence_correlation(event, rule_idx, max_gap_secs)
                 {
                     let rule = &self.rules[rule_idx];
                     alerts.push(self.build_alert(rule, alert));
@@ -612,7 +618,11 @@ impl CorrelationEngine {
 
                 let mut confidence: f64 = 0.7;
                 if events.len() >= 2 {
-                    let duration = events.last().unwrap().header.timestamp_ns
+                    let duration = events
+                        .last()
+                        .unwrap()
+                        .header
+                        .timestamp_ns
                         .saturating_sub(events.first().unwrap().header.timestamp_ns);
                     if duration < 3_000_000_000 {
                         confidence += 0.2;

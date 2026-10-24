@@ -105,20 +105,37 @@ impl Field {
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
-            Field::Pid | Field::Ppid | Field::Uid | Field::SyscallNr |
-            Field::Sport | Field::Dport | Field::TargetPid | Field::Signal |
-            Field::FileBytes | Field::EventType |
-            Field::SourceNsInum | Field::TargetNsInum | Field::CapEff
+            Field::Pid
+                | Field::Ppid
+                | Field::Uid
+                | Field::SyscallNr
+                | Field::Sport
+                | Field::Dport
+                | Field::TargetPid
+                | Field::Signal
+                | Field::FileBytes
+                | Field::EventType
+                | Field::SourceNsInum
+                | Field::TargetNsInum
+                | Field::CapEff
         )
     }
 
     pub fn is_string(&self) -> bool {
         matches!(
             self,
-            Field::Comm | Field::Filename | Field::Args |
-            Field::Saddr | Field::Daddr | Field::Proto |
-            Field::Saddr6 | Field::Daddr6 | Field::Family |
-            Field::ModuleName | Field::ProgName | Field::Action
+            Field::Comm
+                | Field::Filename
+                | Field::Args
+                | Field::Saddr
+                | Field::Daddr
+                | Field::Proto
+                | Field::Saddr6
+                | Field::Daddr6
+                | Field::Family
+                | Field::ModuleName
+                | Field::ProgName
+                | Field::Action
         )
     }
 

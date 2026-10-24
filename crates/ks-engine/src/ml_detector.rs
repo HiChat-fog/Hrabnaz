@@ -151,7 +151,8 @@ impl AdaptiveDetector {
         if observe_sec > 0 {
             // 用 Instant 缓存学习期截止时刻：旧实现每次判定都同步读 /proc/uptime，
             // 而 detect() 对每个事件每个 pid 都会调它——热路径上的文件系统 syscall
-            d.observe_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(observe_sec));
+            d.observe_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(observe_sec));
         }
         d
     }
@@ -164,23 +165,36 @@ impl AdaptiveDetector {
     pub fn from_env() -> Self {
         let mut thresholds = FixedThresholds::default();
         if let Ok(v) = std::env::var("KS_ML_SYSCALL_60S") {
-            if let Ok(n) = v.parse::<u32>() { thresholds.syscall_60s = n; }
+            if let Ok(n) = v.parse::<u32>() {
+                thresholds.syscall_60s = n;
+            }
         }
         if let Ok(v) = std::env::var("KS_ML_FILE_OPS_60S") {
-            if let Ok(n) = v.parse::<u32>() { thresholds.file_ops_60s = n; }
+            if let Ok(n) = v.parse::<u32>() {
+                thresholds.file_ops_60s = n;
+            }
         }
         if let Ok(v) = std::env::var("KS_ML_NET_OPS_60S") {
-            if let Ok(n) = v.parse::<u32>() { thresholds.net_ops_60s = n; }
+            if let Ok(n) = v.parse::<u32>() {
+                thresholds.net_ops_60s = n;
+            }
         }
         if let Ok(v) = std::env::var("KS_ML_DNS_OPS_60S") {
-            if let Ok(n) = v.parse::<u32>() { thresholds.dns_ops_60s = n; }
+            if let Ok(n) = v.parse::<u32>() {
+                thresholds.dns_ops_60s = n;
+            }
         }
         let observe_sec = std::env::var("KS_ML_OBSERVE_SEC")
-            .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(DEFAULT_OBSERVE_SEC);
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_OBSERVE_SEC);
         log::info!(
             "ML学习期: {}s (0=关闭), 冷启动阈值 syscall={}/file={}/net={}/dns={}",
-            observe_sec, thresholds.syscall_60s, thresholds.file_ops_60s,
-            thresholds.net_ops_60s, thresholds.dns_ops_60s
+            observe_sec,
+            thresholds.syscall_60s,
+            thresholds.file_ops_60s,
+            thresholds.net_ops_60s,
+            thresholds.dns_ops_60s
         );
         Self::with_config(thresholds, observe_sec)
     }

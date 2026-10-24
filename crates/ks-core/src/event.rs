@@ -2,7 +2,17 @@ use crate::EventType as ET;
 use serde::{Deserialize, Serialize};
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    zerocopy::IntoBytes,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct EventHeader {
     pub event_type: u32,
     #[serde(skip)]
@@ -20,7 +30,15 @@ pub struct EventHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct ExecEvent {
     pub header: EventHeader,
     pub filename: [u8; 256],
@@ -28,7 +46,15 @@ pub struct ExecEvent {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct FileEvent {
     pub header: EventHeader,
     pub filename: [u8; 256],
@@ -38,7 +64,15 @@ pub struct FileEvent {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct NetEvent {
     pub header: EventHeader,
     pub saddr: u32,
@@ -53,7 +87,15 @@ pub struct NetEvent {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct SignalEvent {
     pub header: EventHeader,
     pub target_pid: u32,
@@ -61,7 +103,15 @@ pub struct SignalEvent {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct ContainerEscapeEvent {
     pub header: EventHeader,
     pub pid: u32,
@@ -74,7 +124,15 @@ pub struct ContainerEscapeEvent {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct LkmLoadEvent {
     pub header: EventHeader,
     pub pid: u32,
@@ -87,7 +145,15 @@ pub struct LkmLoadEvent {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::IntoBytes,
+    zerocopy::FromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct EbpfTamperEvent {
     pub header: EventHeader,
     pub pid: u32,
@@ -270,16 +336,24 @@ pub fn decode_raw_event(data: &[u8]) -> Option<RawEvent> {
 
     let mut p = RawPayload::default();
     macro_rules! read_u64 {
-        ($off:expr) => (u64::from_ne_bytes(read_u8_array!($off, 8)));
+        ($off:expr) => {
+            u64::from_ne_bytes(read_u8_array!($off, 8))
+        };
     }
     macro_rules! read_u32 {
-        ($off:expr) => (u32::from_ne_bytes(read_u8_array!($off, 4)));
+        ($off:expr) => {
+            u32::from_ne_bytes(read_u8_array!($off, 4))
+        };
     }
     macro_rules! read_i32 {
-        ($off:expr) => (i32::from_ne_bytes(read_u8_array!($off, 4)));
+        ($off:expr) => {
+            i32::from_ne_bytes(read_u8_array!($off, 4))
+        };
     }
     macro_rules! read_u16 {
-        ($off:expr) => (u16::from_ne_bytes(read_u8_array!($off, 2)));
+        ($off:expr) => {
+            u16::from_ne_bytes(read_u8_array!($off, 2))
+        };
     }
 
     // 各结构体载荷在 EventHeader 之后的偏移 = 字段在 C struct 中的偏移

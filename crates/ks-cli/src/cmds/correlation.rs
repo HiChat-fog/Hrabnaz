@@ -7,8 +7,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use colored::Colorize;
 use super::ui::{banner, severity_colored};
+use colored::Colorize;
 
 /// 关联告警收集上限：每条告警携带事件克隆（~KB 级），2 万条 ≈ 数十 MB，
 /// 防误报洪峰把离线回放吃爆内存
@@ -55,22 +55,31 @@ fn record_to_event(v: &serde_json::Value) -> Option<DecodedEvent> {
             comm: cb,
             syscall_nr: get_u64("syscall_nr").unwrap_or(0) as i32,
             _pad2: 0,
-            retval: v
-                .get("retval")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(0),
+            retval: v.get("retval").and_then(|x| x.as_i64()).unwrap_or(0),
         },
         comm: comm.to_string(),
         filename: v
             .get("filename")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
-        args: v.get("args").and_then(|x| x.as_str()).map(|s| s.to_string()),
-        saddr: v.get("saddr").and_then(|x| x.as_str()).map(|s| s.to_string()),
-        daddr: v.get("daddr").and_then(|x| x.as_str()).map(|s| s.to_string()),
+        args: v
+            .get("args")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        saddr: v
+            .get("saddr")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        daddr: v
+            .get("daddr")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
         sport: get_opt("sport").map(|x| x as u16),
         dport: get_opt("dport").map(|x| x as u16),
-        proto: v.get("proto").and_then(|x| x.as_str()).map(|s| s.to_string()),
+        proto: v
+            .get("proto")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
         target_pid: get_opt("target_pid"),
         signal: v.get("signal").and_then(|x| x.as_i64()).map(|x| x as i32),
         file_bytes: v.get("file_bytes").and_then(|x| x.as_u64()),
@@ -162,7 +171,11 @@ pub async fn run(args: &CorrelationArgs) -> Result<()> {
         alerts.len(),
         total
     ));
-    println!("  数据源: {} ({} 事件)", path.display().to_string().dimmed(), event_count);
+    println!(
+        "  数据源: {} ({} 事件)",
+        path.display().to_string().dimmed(),
+        event_count
+    );
     if truncated {
         println!(
             "  {} 关联告警超过 {} 条，仅保留最早 {} 条",

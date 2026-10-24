@@ -271,7 +271,8 @@ mod tests {
             make_event(1, 100, 1, "bash", None, Some("bash -i"), None),
             make_event(2, 100, 20, "bash", None, None, Some(4444)),
         ];
-        let arcs: Vec<std::sync::Arc<DecodedEvent>> = events.into_iter().map(std::sync::Arc::new).collect();
+        let arcs: Vec<std::sync::Arc<DecodedEvent>> =
+            events.into_iter().map(std::sync::Arc::new).collect();
         let chain = recon.reconstruct(&arcs).unwrap();
         assert_eq!(chain.steps[0].phase, AttackPhase::InitialAccess);
     }
@@ -285,7 +286,8 @@ mod tests {
             make_event(3, 100, 12, "bash", Some("/etc/crontab"), None, None),
             make_event(4, 100, 1, "chmod", None, Some("chmod +s"), None),
         ];
-        let arcs: Vec<std::sync::Arc<DecodedEvent>> = events.into_iter().map(std::sync::Arc::new).collect();
+        let arcs: Vec<std::sync::Arc<DecodedEvent>> =
+            events.into_iter().map(std::sync::Arc::new).collect();
         let chain = recon.reconstruct(&arcs).unwrap();
         assert!(chain.steps.len() >= 3);
         assert!(chain.confidence > 0.5);
@@ -298,7 +300,8 @@ mod tests {
             make_event(1, 100, 12, "bash", Some("/etc/crontab"), None, None),
             make_event(2, 100, 12, "bash", Some("/etc/cron.d/backdoor"), None, None),
         ];
-        let arcs: Vec<std::sync::Arc<DecodedEvent>> = events.into_iter().map(std::sync::Arc::new).collect();
+        let arcs: Vec<std::sync::Arc<DecodedEvent>> =
+            events.into_iter().map(std::sync::Arc::new).collect();
         let chain = recon.reconstruct(&arcs).unwrap();
         assert_eq!(chain.steps.len(), 1);
         assert_eq!(chain.steps[0].events.len(), 2);

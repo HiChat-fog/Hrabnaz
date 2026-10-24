@@ -27,9 +27,7 @@ fn boot_epoch_secs() -> Option<i64> {
 /// 使用 `timestamp_ns` 单调钟并标注"开机后"。
 pub fn epoch_ms_from_monotonic_ns(monotonic_ns: u64) -> Option<i64> {
     let btime = (*BOOT_EPOCH_SECS.get_or_init(boot_epoch_secs))?;
-    Some(
-        btime.saturating_mul(1000) + i64::try_from(monotonic_ns / 1_000_000).unwrap_or(i64::MAX),
-    )
+    Some(btime.saturating_mul(1000) + i64::try_from(monotonic_ns / 1_000_000).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

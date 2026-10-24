@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use aya::maps::{Array, HashMap};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::loader::{BpfMapReader, MapSnapshot, MapStat};
 
@@ -31,9 +31,7 @@ fn decode_net_conn_key(k: &[u8; 12]) -> (u32, u32, u16, u8) {
 
 /// freq_counter: 六个 u32 计数器 @0..24, 两个 u64 时间戳 @24/@32, u32 anomaly_flags @40
 fn decode_freq_counter(v: &[u8; 48]) -> [u32; 7] {
-    let u32at = |off: usize| {
-        u32::from_ne_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]])
-    };
+    let u32at = |off: usize| u32::from_ne_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]]);
     [
         u32at(0),  // syscall_count_60s
         u32at(4),  // file_op_count_60s
@@ -64,9 +62,9 @@ impl LinuxBpfMapReader {
             .bpf
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let map = bpf
-            .map_mut("block_decisions")
-            .ok_or_else(|| anyhow::anyhow!("block_decisions map 不存在（该 tier 未加载或已被 take）"))?;
+        let map = bpf.map_mut("block_decisions").ok_or_else(|| {
+            anyhow::anyhow!("block_decisions map 不存在（该 tier 未加载或已被 take）")
+        })?;
         write_block_decision_map(map, pid, expire_monotonic_ns, reason)
     }
 
@@ -122,94 +120,94 @@ impl LinuxBpfMapReader {
 /// `map` 必须已确认存在；未知 map 返回空。
 pub(crate) fn read_entries(map_name: &str, map: &aya::maps::Map) -> (usize, Vec<Value>) {
     match map_name {
-            "risk_scores" => {
-                if let Ok(hm) = HashMap::<_, u32, u32>::try_from(map) {
-                    let mut entries = Vec::new();
-                    for (pid, score) in hm.iter().flatten() {
+        "risk_scores" => {
+            if let Ok(hm) = HashMap::<_, u32, u32>::try_from(map) {
+                let mut entries = Vec::new();
+                for (pid, score) in hm.iter().flatten() {
                     entries.push(json!({"pid": pid, "risk_score": score}));
-                    }
-                    let n = entries.len();
-                    return (n, entries);
                 }
+                let n = entries.len();
+                return (n, entries);
             }
-            "ip_whitelist" => {
-                if let Ok(hm) = HashMap::<_, u32, u8>::try_from(map) {
-                    let mut entries = Vec::new();
-                    for (ip, flag) in hm.iter().flatten() {
-                    entries.push(json!({"ip": ip, "whitelisted": flag}));
-                    }
-                    let n = entries.len();
-                    return (n, entries);
-                }
-            }
-            "net_conn_history" => {
-                if let Ok(hm) = HashMap::<_, [u8; 12], u64>::try_from(map) {
-                    let mut entries = Vec::new();
-                    for (k, ts) in hm.iter().flatten() {
-                        let (pid, daddr, dport, proto) = decode_net_conn_key(&k);
-                        let [b0, b1, b2, b3] = daddr.to_le_bytes();
-                        entries.push(json!({
-                            "pid": pid,
-                            "daddr": format!("{}.{}.{}.{}", b0, b1, b2, b3),
-                            "dport": dport,
-                            "proto": proto,
-                            "last_ns": ts,
-                        }));
-                    }
-                    let n = entries.len();
-                    return (n, entries);
-                }
-            }
-            "freq_counters" => {
-                if let Ok(hm) = HashMap::<_, u32, [u8; 48]>::try_from(map) {
-                    let mut entries = Vec::new();
-                    for (pid, v) in hm.iter().flatten() {
-                        let fc = decode_freq_counter(&v);
-                        entries.push(json!({
-                            "pid": pid,
-                            "syscall_60s": fc[0],
-                            "file_60s": fc[1],
-                            "net_60s": fc[2],
-                            "dns_60s": fc[3],
-                            "ptrace_60s": fc[4],
-                            "signal_60s": fc[5],
-                            "anomaly_flags": fc[6],
-                        }));
-                    }
-                    let n = entries.len();
-                    return (n, entries);
-                }
-            }
-            "infer_config" => {
-                let md = map_data_ref(map);
-                if let Ok(info) = md.info() {
-                    let max = info.max_entries() as usize;
-                    if let Ok(arr) = Array::<_, u32>::try_from(map) {
-                        let mut entries = Vec::new();
-                        for i in 0..max as u32 {
-                            if let Ok(v) = arr.get(&i, 0) {
-                                entries.push(json!({"idx": i, "value": v}));
-                            }
-                        }
-                        return (max, entries);
-                    }
-                }
-            }
-            "protected_comms" => {
-                if let Ok(hm) = HashMap::<_, [u8; 16], u8>::try_from(map) {
-                    let mut entries = Vec::new();
-                    for (key, flag) in hm.iter().flatten() {
-                        let end = key.iter().position(|&b| b == 0).unwrap_or(16);
-                        let comm = String::from_utf8_lossy(&key[..end]).to_string();
-                        entries.push(json!({"comm": comm, "protected": flag}));
-                    }
-                    let n = entries.len();
-                    return (n, entries);
-                }
-            }
-            _ => {}
         }
-        (0, Vec::new())
+        "ip_whitelist" => {
+            if let Ok(hm) = HashMap::<_, u32, u8>::try_from(map) {
+                let mut entries = Vec::new();
+                for (ip, flag) in hm.iter().flatten() {
+                    entries.push(json!({"ip": ip, "whitelisted": flag}));
+                }
+                let n = entries.len();
+                return (n, entries);
+            }
+        }
+        "net_conn_history" => {
+            if let Ok(hm) = HashMap::<_, [u8; 12], u64>::try_from(map) {
+                let mut entries = Vec::new();
+                for (k, ts) in hm.iter().flatten() {
+                    let (pid, daddr, dport, proto) = decode_net_conn_key(&k);
+                    let [b0, b1, b2, b3] = daddr.to_le_bytes();
+                    entries.push(json!({
+                        "pid": pid,
+                        "daddr": format!("{}.{}.{}.{}", b0, b1, b2, b3),
+                        "dport": dport,
+                        "proto": proto,
+                        "last_ns": ts,
+                    }));
+                }
+                let n = entries.len();
+                return (n, entries);
+            }
+        }
+        "freq_counters" => {
+            if let Ok(hm) = HashMap::<_, u32, [u8; 48]>::try_from(map) {
+                let mut entries = Vec::new();
+                for (pid, v) in hm.iter().flatten() {
+                    let fc = decode_freq_counter(&v);
+                    entries.push(json!({
+                        "pid": pid,
+                        "syscall_60s": fc[0],
+                        "file_60s": fc[1],
+                        "net_60s": fc[2],
+                        "dns_60s": fc[3],
+                        "ptrace_60s": fc[4],
+                        "signal_60s": fc[5],
+                        "anomaly_flags": fc[6],
+                    }));
+                }
+                let n = entries.len();
+                return (n, entries);
+            }
+        }
+        "infer_config" => {
+            let md = map_data_ref(map);
+            if let Ok(info) = md.info() {
+                let max = info.max_entries() as usize;
+                if let Ok(arr) = Array::<_, u32>::try_from(map) {
+                    let mut entries = Vec::new();
+                    for i in 0..max as u32 {
+                        if let Ok(v) = arr.get(&i, 0) {
+                            entries.push(json!({"idx": i, "value": v}));
+                        }
+                    }
+                    return (max, entries);
+                }
+            }
+        }
+        "protected_comms" => {
+            if let Ok(hm) = HashMap::<_, [u8; 16], u8>::try_from(map) {
+                let mut entries = Vec::new();
+                for (key, flag) in hm.iter().flatten() {
+                    let end = key.iter().position(|&b| b == 0).unwrap_or(16);
+                    let comm = String::from_utf8_lossy(&key[..end]).to_string();
+                    entries.push(json!({"comm": comm, "protected": flag}));
+                }
+                let n = entries.len();
+                return (n, entries);
+            }
+        }
+        _ => {}
+    }
+    (0, Vec::new())
 }
 
 /// block_decisions 布局与 common.h 逐字节对齐：
@@ -232,10 +230,7 @@ pub(crate) fn write_block_decision_map(
     Ok(())
 }
 
-pub(crate) fn remove_block_decision_map(
-    map: &mut aya::maps::Map,
-    pid: u32,
-) -> anyhow::Result<()> {
+pub(crate) fn remove_block_decision_map(map: &mut aya::maps::Map, pid: u32) -> anyhow::Result<()> {
     let mut hm = HashMap::<_, [u8; 8], [u8; 16]>::try_from(map)?;
     let mut key = [0u8; 8];
     key[..4].copy_from_slice(&pid.to_ne_bytes());
@@ -375,19 +370,17 @@ impl BpfMapReader for LinuxBpfMapReader {
     fn list_map_stats(&self) -> Vec<MapStat> {
         SHARED_MAPS
             .iter()
-            .map(|&name| {
-                match self.read_map(name) {
-                    Ok(snap) => MapStat {
-                        name: snap.name,
-                        map_type: snap.map_type,
-                        entry_count: snap.entry_count,
-                    },
-                    Err(_) => MapStat {
-                        name: name.to_string(),
-                        map_type: "UNKNOWN".to_string(),
-                        entry_count: 0,
-                    },
-                }
+            .map(|&name| match self.read_map(name) {
+                Ok(snap) => MapStat {
+                    name: snap.name,
+                    map_type: snap.map_type,
+                    entry_count: snap.entry_count,
+                },
+                Err(_) => MapStat {
+                    name: name.to_string(),
+                    map_type: "UNKNOWN".to_string(),
+                    entry_count: 0,
+                },
             })
             .collect()
     }
@@ -447,9 +440,7 @@ mod tests {
             *b = (i as u8).wrapping_mul(3);
         }
         let fc = decode_freq_counter(&v);
-        let u32at = |off: usize| {
-            u32::from_ne_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]])
-        };
+        let u32at = |off: usize| u32::from_ne_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]]);
         for (i, &expected) in fc.iter().enumerate().take(6) {
             assert_eq!(expected, u32at(i * 4), "counter[{i}] 偏移不符");
         }

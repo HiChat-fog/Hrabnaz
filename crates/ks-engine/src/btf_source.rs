@@ -121,7 +121,11 @@ pub fn load_target_btf() -> Result<(Btf, BtfOrigin)> {
             Ok(btf) => return Ok((btf, BtfOrigin::SysFs(sysfs.to_path_buf()))),
             Err(e) => {
                 // 个别发行版会给出截断/精简的 vmlinux BTF，解析失败不该直接放弃内嵌兜底
-                log::warn!("[btf] {} 存在但解析失败: {} — 继续尝试内嵌 BTF", SYSFS_BTF, e);
+                log::warn!(
+                    "[btf] {} 存在但解析失败: {} — 继续尝试内嵌 BTF",
+                    SYSFS_BTF,
+                    e
+                );
                 tried.push(format!("{}（解析失败: {}）", SYSFS_BTF, e));
             }
         }

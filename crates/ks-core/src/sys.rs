@@ -18,8 +18,7 @@ use nix::unistd::Pid;
 #[cfg(target_os = "linux")]
 pub fn set_memlock_unlimited() -> Result<(), std::io::Error> {
     use nix::sys::resource::{setrlimit, Resource, RLIM_INFINITY};
-    setrlimit(Resource::RLIMIT_MEMLOCK, RLIM_INFINITY, RLIM_INFINITY)
-        .map_err(std::io::Error::from)
+    setrlimit(Resource::RLIMIT_MEMLOCK, RLIM_INFINITY, RLIM_INFINITY).map_err(std::io::Error::from)
 }
 
 /// 当前 euid 是否 root
@@ -40,7 +39,9 @@ pub fn try_lock_file<F: std::os::fd::AsFd>(fd: &F) -> Result<(), std::io::Error>
         l_len: 0,
         l_pid: 0,
     };
-    fcntl(fd, FcntlArg::F_SETLK(&fl)).map(|_| ()).map_err(std::io::Error::from)
+    fcntl(fd, FcntlArg::F_SETLK(&fl))
+        .map(|_| ())
+        .map_err(std::io::Error::from)
 }
 
 /// 与 `bpf_ktime_get_ns()` 同源的 CLOCK_MONOTONIC 纳秒。

@@ -77,7 +77,11 @@ async fn main() -> anyhow::Result<()> {
     let v = ForensicLogger::verify_chain(&forensic_path)?;
     println!(
         "取证链校验: {} ({} 条记录)",
-        if v.is_valid { "通过 ✓" } else { "断裂 ✗" },
+        if v.is_valid {
+            "通过 ✓"
+        } else {
+            "断裂 ✗"
+        },
         v.total_records
     );
     assert!(v.is_valid, "引擎产出的取证链必须完整");

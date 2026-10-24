@@ -90,7 +90,10 @@ pub struct EngineInfo {
 /// 避免消费方再去反查
 pub enum AlertSource {
     Rule,
-    Correlation { confidence: f64, trigger_pid: u32 },
+    Correlation {
+        confidence: f64,
+        trigger_pid: u32,
+    },
     BaselineDeviation,
     MlAnomaly,
     ProcessTree {
@@ -241,12 +244,22 @@ struct ForensicSink {
 
 impl ForensicSink {
     async fn log_event(&self, event: &Arc<DecodedEvent>) {
-        if self.tx.send(ForensicOp::Event(event.clone())).await.is_err() {
+        if self
+            .tx
+            .send(ForensicOp::Event(event.clone()))
+            .await
+            .is_err()
+        {
             warn!("forensic worker已退出,事件丢失");
         }
     }
     async fn log_alert(&self, alert: &Alert) {
-        if self.tx.send(ForensicOp::Alert(Box::new(alert.clone()))).await.is_err() {
+        if self
+            .tx
+            .send(ForensicOp::Alert(Box::new(alert.clone())))
+            .await
+            .is_err()
+        {
             warn!("forensic worker已退出,告警丢失");
         }
     }
@@ -303,7 +316,11 @@ fn load_rules_into(
 }
 
 /// 规则热加载（H-1.5 起每次重载同步落完整性快照）
-async fn rule_hot_loader(detector: Arc<Mutex<DetectionEngine>>, rules_dir: String, log_dir: String) {
+async fn rule_hot_loader(
+    detector: Arc<Mutex<DetectionEngine>>,
+    rules_dir: String,
+    log_dir: String,
+) {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
@@ -347,7 +364,10 @@ async fn rule_hot_loader(detector: Arc<Mutex<DetectionEngine>>, rules_dir: Strin
         if changed {
             info!("检测到规则文件变更，重新加载...");
             // H-1.5：热加载前后规则集可能变化，同步落一次完整性快照
-            match check_and_record(std::path::Path::new(&rules_dir), std::path::Path::new(&log_dir)) {
+            match check_and_record(
+                std::path::Path::new(&rules_dir),
+                std::path::Path::new(&log_dir),
+            ) {
                 Ok((i, v)) => info!(
                     "[rules-integrity] 热加载快照: digest={}… verdict={}",
                     &i.combined_digest[..16.min(i.combined_digest.len())],
@@ -383,7 +403,10 @@ async fn rule_hot_loader(detector: Arc<Mutex<DetectionEngine>>, rules_dir: Strin
                 }
             }
             *detector.lock().await = new_detector;
-            info!("规则热加载完成: {} 条规则", detector.lock().await.rule_count());
+            info!(
+                "规则热加载完成: {} 条规则",
+                detector.lock().await.rule_count()
+            );
         }
     }
 }
@@ -532,10 +555,9 @@ impl Engine {
         let correlation_engine = CorrelationEngine::new(300);
         let process_tree_mgr = ProcessTreeManager::new();
         let ml_detector = match options.ml_observe_sec {
-            Some(sec) => AdaptiveDetector::with_config(
-                crate::ml_detector::FixedThresholds::default(),
-                sec,
-            ),
+            Some(sec) => {
+                AdaptiveDetector::with_config(crate::ml_detector::FixedThresholds::default(), sec)
+            }
             None => AdaptiveDetector::from_env(),
         };
         let mut block_mgr = BlockManager::new();
@@ -549,7 +571,10 @@ impl Engine {
             Some(mr) => match mr.pin_block_map(crate::blocker::BLOCK_DECISIONS_PIN) {
                 Ok(()) => Some(crate::blocker::BLOCK_DECISIONS_PIN.to_string()),
                 Err(e) => {
-                    warn!("block_decisions pin 失败: {} — ks block 不可用，自动阻断不受影响", e);
+                    warn!(
+                        "block_decisions pin 失败: {} — ks block 不可用，自动阻断不受影响",
+                        e
+                    );
                     None
                 }
             },
@@ -589,9 +614,9 @@ impl Engine {
                             // comm 可伪造（prctl PR_SET_NAME），与内核 ks_check_block 同款守卫：
                             // 从 /tmp、/dev/shm 等可疑路径启动的进程不享受 comm 豁免
                             |pid| {
-                                crate::blocker::comm_of(pid).is_some_and(|comm| {
-                                    protect.contains(&comm)
-                                }) && !crate::blocker::exe_path_suspicious(pid)
+                                crate::blocker::comm_of(pid)
+                                    .is_some_and(|comm| protect.contains(&comm))
+                                    && !crate::blocker::exe_path_suspicious(pid)
                             },
                             crate::blocker::monotonic_now_ns(),
                             crate::blocker::kill_pid_sigkill,
@@ -615,8 +640,10 @@ impl Engine {
 
         // 6. 取证 logger + 异步 worker
         std::fs::create_dir_all(&options.log_dir)?;
-        let log_path = std::path::Path::new(&options.log_dir)
-            .join(format!("events_{}.jsonl", chrono::Local::now().format("%Y%m%d")));
+        let log_path = std::path::Path::new(&options.log_dir).join(format!(
+            "events_{}.jsonl",
+            chrono::Local::now().format("%Y%m%d")
+        ));
         let rotation_config = RotationConfig {
             max_file_size: config.forensic.max_log_size_mb as u64 * 1024 * 1024,
             retain_days: config.forensic.retention_days,
@@ -966,7 +993,10 @@ impl Engine {
             let recent_count = self
                 .aggregator
                 .recent_syscall_count(event.header.pid, event.header.timestamp_ns);
-            self.detector.lock().await.anomaly_score(&event, recent_count)
+            self.detector
+                .lock()
+                .await
+                .anomaly_score(&event, recent_count)
         };
         prof_add(6, t.elapsed().as_nanos() as u64);
         if score > self.anomaly_threshold {
@@ -984,38 +1014,38 @@ impl Engine {
                 || !matches.is_empty()
                 || !corr_alerts.is_empty();
             // H-1.4：天然高频白名单进程跳过基线偏离与 ML 冷启动告警
-            let is_high_freq_comm = !is_protected
-                && self.baseline_mgr.is_inherently_high_freq(&event.comm);
+            let is_high_freq_comm =
+                !is_protected && self.baseline_mgr.is_inherently_high_freq(&event.comm);
             if !is_protected && !is_high_freq_comm {
                 if let Some(dev) = self.baseline_mgr.detect_deviation(event.header.pid) {
                     if self
                         .alert_throttle
                         .allow("baseline_deviation", event.header.pid)
                     {
-                    let dim = dev
-                        .most_deviated_dimension
-                        .map(|d| format!("{:?}", d))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let alert = Alert::new(
-                        Severity::High,
-                        event.header.timestamp_ns,
-                        format!("基线偏离: {} (PID {})", dim, event.header.pid),
-                        "baseline_deviation".to_string(),
-                        ProcessInfo {
-                            pid: event.header.pid,
-                            ppid: event.header.ppid,
-                            comm: event.comm.clone(),
-                            uid: event.header.uid,
-                            exe_path: None,
-                            cmdline: None,
-                        },
-                    );
-                    self.forensic_sink.log_alert(&alert).await;
-                    self.stats.anomaly_alerts += 1;
-                    effects.push(EngineEffect::Alert(Box::new(RaisedAlert {
-                        alert,
-                        source: AlertSource::BaselineDeviation,
-                    })));
+                        let dim = dev
+                            .most_deviated_dimension
+                            .map(|d| format!("{:?}", d))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let alert = Alert::new(
+                            Severity::High,
+                            event.header.timestamp_ns,
+                            format!("基线偏离: {} (PID {})", dim, event.header.pid),
+                            "baseline_deviation".to_string(),
+                            ProcessInfo {
+                                pid: event.header.pid,
+                                ppid: event.header.ppid,
+                                comm: event.comm.clone(),
+                                uid: event.header.uid,
+                                exe_path: None,
+                                cmdline: None,
+                            },
+                        );
+                        self.forensic_sink.log_alert(&alert).await;
+                        self.stats.anomaly_alerts += 1;
+                        effects.push(EngineEffect::Alert(Box::new(RaisedAlert {
+                            alert,
+                            source: AlertSource::BaselineDeviation,
+                        })));
                     } else {
                         self.stats.suppressed_alerts += 1;
                     }
@@ -1025,38 +1055,38 @@ impl Engine {
             if !is_protected && !is_high_freq_comm {
                 if let Some(ml_result) = self.ml_detector.detect(event.header.pid) {
                     if self.alert_throttle.allow("ml_anomaly", event.header.pid) {
-                    let dim_str = ml_result
-                        .dimensions
-                        .first()
-                        .map(|d| format!("{:?}", d.dimension))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let model_str = match ml_result.model {
-                        crate::ml_detector::AnomalyModel::Ewma => "EWMA",
-                        crate::ml_detector::AnomalyModel::ColdStart => "ColdStart",
-                    };
-                    let alert = Alert::new(
-                        Severity::High,
-                        event.header.timestamp_ns,
-                        format!(
-                            "ML异常检测: {} (PID {}, {})",
-                            dim_str, event.header.pid, model_str
-                        ),
-                        "ml_anomaly".to_string(),
-                        ProcessInfo {
-                            pid: event.header.pid,
-                            ppid: event.header.ppid,
-                            comm: event.comm.clone(),
-                            uid: event.header.uid,
-                            exe_path: None,
-                            cmdline: None,
-                        },
-                    );
-                    self.forensic_sink.log_alert(&alert).await;
-                    self.stats.anomaly_alerts += 1;
-                    effects.push(EngineEffect::Alert(Box::new(RaisedAlert {
-                        alert,
-                        source: AlertSource::MlAnomaly,
-                    })));
+                        let dim_str = ml_result
+                            .dimensions
+                            .first()
+                            .map(|d| format!("{:?}", d.dimension))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let model_str = match ml_result.model {
+                            crate::ml_detector::AnomalyModel::Ewma => "EWMA",
+                            crate::ml_detector::AnomalyModel::ColdStart => "ColdStart",
+                        };
+                        let alert = Alert::new(
+                            Severity::High,
+                            event.header.timestamp_ns,
+                            format!(
+                                "ML异常检测: {} (PID {}, {})",
+                                dim_str, event.header.pid, model_str
+                            ),
+                            "ml_anomaly".to_string(),
+                            ProcessInfo {
+                                pid: event.header.pid,
+                                ppid: event.header.ppid,
+                                comm: event.comm.clone(),
+                                uid: event.header.uid,
+                                exe_path: None,
+                                cmdline: None,
+                            },
+                        );
+                        self.forensic_sink.log_alert(&alert).await;
+                        self.stats.anomaly_alerts += 1;
+                        effects.push(EngineEffect::Alert(Box::new(RaisedAlert {
+                            alert,
+                            source: AlertSource::MlAnomaly,
+                        })));
                     } else {
                         self.stats.suppressed_alerts += 1;
                     }
@@ -1267,7 +1297,10 @@ mod tests {
         // 取证哈希链自洽
         let v = ForensicLogger::verify_chain(&forensic_path).unwrap();
         assert!(v.is_valid, "引擎产出的取证链应完整: {:?}", v.broken_at);
-        assert_eq!(v.total_records, summary.events_logged + summary.alerts_logged);
+        assert_eq!(
+            v.total_records,
+            summary.events_logged + summary.alerts_logged
+        );
     }
 
     fn event_seqs(path: &std::path::Path) -> Vec<u64> {
@@ -1339,7 +1372,9 @@ mod tests {
             rules_dir: rules.to_string_lossy().to_string(),
             log_dir: dir.path().to_string_lossy().to_string(),
             source: EventSourceSpec::Provided(
-                Box::new(MockEventSource::new_with_scenario(MockScenario::ReverseShell)),
+                Box::new(MockEventSource::new_with_scenario(
+                    MockScenario::ReverseShell,
+                )),
                 None,
             ),
             heartbeat_path: None,
