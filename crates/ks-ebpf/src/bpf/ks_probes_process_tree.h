@@ -69,7 +69,7 @@ int trace_sched_fork(KS_TP_SCHED_FORK *ctx) {
     if (existing_parent)
         __builtin_memcpy(parent_info, existing_parent, sizeof(*parent_info));
     else {
-        bpf_get_current_comm(&parent_info->comm, sizeof(parent_info->comm));
+        KS_WRITE_COMM(&parent_info->comm, sizeof(parent_info->comm));
         parent_info->pid = parent_pid;
         parent_info->create_time = now;
         parent_info->risk_score = 0;
@@ -79,13 +79,11 @@ int trace_sched_fork(KS_TP_SCHED_FORK *ctx) {
     child_node->ppid = parent_pid;
     child_node->create_time = now;
     child_node->risk_score = parent_info->risk_score;
-    bpf_get_current_comm(&child_node->comm, sizeof(child_node->comm));
+    KS_WRITE_COMM(&child_node->comm, sizeof(child_node->comm));
     __builtin_memcpy(child_node->exe_path, parent_info->exe_path, sizeof(child_node->exe_path));
 
     u64 uid_gid = bpf_get_current_uid_gid();
     if ((u32)uid_gid == 0) child_node->flags |= PROC_FLAG_ROOT;
-
-    bpf_map_update_elem(&process_tree, &child_pid, child_node, BPF_ANY);
 
     struct anomaly_relation_key rel_key = {};
     __builtin_memcpy(rel_key.parent_comm, parent_info->comm, 16);
@@ -100,7 +98,12 @@ int trace_sched_fork(KS_TP_SCHED_FORK *ctx) {
         child_node->flags |= PROC_FLAG_ANOMALOUS;
         if (detected_anomaly == 0) detected_anomaly = 1;
     }
-    bpf_map_update_elem(&process_tree, &child_pid, child_node, BPF_ANY);
+    /* 4.15 verifier: update 的 value 只接受栈指针（child_node 是 scratch map_value）。
+     * 312B 栈拷贝在 512B 栈限内；上面同一节点的首轮 update 已删除（中间只改本地字段，
+     * 一次提交最终状态即可）。 */
+    struct process_node tree_tmp;
+    __builtin_memcpy(&tree_tmp, child_node, sizeof(tree_tmp));
+    bpf_map_update_elem(&process_tree, &child_pid, &tree_tmp, BPF_ANY);
 
     if (detected_anomaly > 0 || parent_info->risk_score >= 40) {
         struct process_tree_event *evt = KS_RESERVE(tree_events, struct process_tree_event);
@@ -141,15 +144,18 @@ int trace_sched_exec_tree(KS_TP_SCHED_EXEC *ctx) {
         updated->flags = 0;
     }
 
-    bpf_get_current_comm(&updated->comm, sizeof(updated->comm));
+    KS_WRITE_COMM(&updated->comm, sizeof(updated->comm));
     u16 filename_off = ctx->__data_loc_filename & 0xFFFF;
     const char *filename = (const void *)ctx + filename_off;
-    bpf_probe_read_kernel_str(updated->exe_path, sizeof(updated->exe_path), filename);
+    KS_WRITE_KERNEL_STR(updated->exe_path, sizeof(updated->exe_path), filename);
     updated->exit_time = 0;
 
     u32 *risk = bpf_map_lookup_elem(&risk_scores, &pid);
     if (risk) updated->risk_score = *risk;
-    bpf_map_update_elem(&process_tree, &pid, updated, BPF_ANY);
+    /* 同上：scratch map_value → 栈拷贝再 update（4.15 兼容） */
+    struct process_node exec_tmp;
+    __builtin_memcpy(&exec_tmp, updated, sizeof(exec_tmp));
+    bpf_map_update_elem(&process_tree, &pid, &exec_tmp, BPF_ANY);
 
     struct process_tree_event *evt = KS_RESERVE(tree_events, struct process_tree_event);
     if (!evt) return 0;
@@ -160,7 +166,10 @@ int trace_sched_exec_tree(KS_TP_SCHED_EXEC *ctx) {
     evt->create_time = updated->create_time;  evt->exit_time = 0;
     evt->flags = updated->flags;  evt->risk_score = updated->risk_score;
 
-    struct process_node *parent = bpf_map_lookup_elem(&process_tree, &updated->ppid);
+    /* 4.15 verifier: lookup 的 key 也只接受栈指针；updated 是 scratch map_value，
+     * 取字段地址当 key 会被拒（R2 type=map_value expected=fp），先拷到栈。 */
+    u32 ppid_key = updated->ppid;
+    struct process_node *parent = bpf_map_lookup_elem(&process_tree, &ppid_key);
     if (parent) {
         __builtin_memcpy(evt->parent_comm, parent->comm, 16);
         evt->parent_risk = (u16)parent->risk_score;

@@ -58,6 +58,117 @@ fn cstr_at(b: &[u8], off: usize) -> Result<String, String> {
     String::from_utf8(tail[..end].to_vec()).map_err(|e| format!("节名非 UTF-8: {e}"))
 }
 
+/// 解析 ELF64 节表（内部复用：探针枚举 + 指令数预算检查）。
+fn parse_sections(bytes: &[u8]) -> Result<Vec<Section>, String> {
+    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
+        return Err("不是 ELF 文件".into());
+    }
+    let shoff = rd_u64(bytes, 0x28)? as usize;
+    let shentsize = rd_u16(bytes, 0x3A)? as usize;
+    let shnum = rd_u16(bytes, 0x3C)? as usize;
+    let shstrndx = rd_u16(bytes, 0x3E)? as usize;
+    if shentsize < 64 {
+        return Err(format!("节头尺寸异常: {shentsize}"));
+    }
+    if shnum == 0 || shstrndx >= shnum {
+        return Err("节表为空或 shstrndx 越界".into());
+    }
+    let raw_section = |i: usize| -> Result<(u32, u32, u64, usize, usize, usize), String> {
+        let base = shoff
+            .checked_add(i.checked_mul(shentsize).ok_or("节表偏移溢出")?)
+            .ok_or("节表偏移溢出")?;
+        Ok((
+            rd_u32(bytes, base)?,
+            rd_u32(bytes, base + 4)?,
+            rd_u64(bytes, base + 8)?,
+            rd_u64(bytes, base + 24)? as usize,
+            rd_u64(bytes, base + 32)? as usize,
+            rd_u32(bytes, base + 40)? as usize,
+        ))
+    };
+    let (_, _, _, shstr_off, shstr_size, _) = raw_section(shstrndx)?;
+    let shstrtab = bytes
+        .get(shstr_off..shstr_off + shstr_size)
+        .ok_or("shstrtab 越界")?;
+    let mut sections = Vec::with_capacity(shnum);
+    for i in 0..shnum {
+        let (name_off, typ, flags, offset, size, link) = raw_section(i)?;
+        let name = cstr_at(shstrtab, name_off as usize)?;
+        sections.push(Section {
+            name,
+            typ,
+            flags,
+            offset,
+            size,
+            link,
+        });
+    }
+    Ok(sections)
+}
+
+/// 各探针程序段的指令数（段大小 ÷ 8），供构建期守老内核指令上限。
+///
+/// 为什么必须守：老内核验证器 BPF_MAXINSNS=4096（<5.2 的 privileged 上限）。
+/// 程序超限时 BPF_PROG_LOAD 返回 E2BIG，运行时回退 mock——而部署的旧二进制
+/// 可能仍小于上限，本地一切正常，直到某次发布才在 3.10 上静默哑火（QEMU 实测
+/// trace_sys_exit 曾膨胀到 7483 条）。故在构建期直接失败。
+pub fn program_sizes(bytes: &[u8]) -> Result<Vec<(String, u64)>, String> {
+    let sections = parse_sections(bytes)?;
+    // 一个 SEC 段可含多个程序函数（如 sys_exit 拆 proc/file/net）：按符号表逐函数
+    // 统计 st_size/8；找不到函数符号时回退整段大小。
+    let mut symtab: Option<(usize, usize, usize)> = None; // (off, size, link)
+    for sec in &sections {
+        if sec.typ == SHT_SYMTAB {
+            symtab = Some((sec.offset, sec.size, sec.link));
+            break;
+        }
+    }
+    let mut out = Vec::new();
+    for (idx, sec) in sections.iter().enumerate() {
+        if sec.flags & SHF_EXECINSTR == 0 || sec.name == ".text" {
+            continue;
+        }
+        if !(sec.name.starts_with("tracepoint/")
+            || sec.name.starts_with("kprobe/")
+            || sec.name.starts_with("kretprobe/"))
+        {
+            continue;
+        }
+        let mut found = false;
+        if let Some((off, size, link)) = symtab {
+            if let Some(strtab) = sections.get(link) {
+                let str_off = strtab.offset;
+                let str_end = strtab.offset + strtab.size;
+                let mut i = 0usize;
+                while i + 24 <= size {
+                    let base = off + i;
+                    let name_off = rd_u32(bytes, base)? as usize;
+                    let info = *bytes.get(base + 4).ok_or("符号表越界")?;
+                    let shndx = rd_u16(bytes, base + 6)? as usize;
+                    let st_size = rd_u64(bytes, base + 16)?;
+                    if info & 0xf == STT_FUNC && shndx == idx && st_size > 0 {
+                        if let Some(name_bytes) = bytes.get(str_off + name_off..str_end) {
+                            let end = name_bytes
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(name_bytes.len());
+                            if let Ok(name) = String::from_utf8(name_bytes[..end].to_vec()) {
+                                out.push((name, st_size / 8));
+                                found = true;
+                            }
+                        }
+                    }
+                    i += 24;
+                }
+            }
+        }
+        if !found {
+            out.push((sec.name.clone(), (sec.size / 8) as u64));
+        }
+    }
+    Ok(out)
+}
+
 /// 解析 `.o`，枚举全部探针 SEC 段。
 ///
 /// 约束（违反即构建失败，防"新增探针静默未注册"）：
@@ -75,49 +186,7 @@ pub fn parse_probe_sections(bytes: &[u8]) -> Result<Vec<RawProbe>, String> {
         return Err("仅支持小端 ELF".into());
     }
 
-    let shoff = rd_u64(bytes, 0x28)? as usize;
-    let shentsize = rd_u16(bytes, 0x3A)? as usize;
-    let shnum = rd_u16(bytes, 0x3C)? as usize;
-    let shstrndx = rd_u16(bytes, 0x3E)? as usize;
-    if shentsize < 64 {
-        return Err(format!("节头尺寸异常: {shentsize}"));
-    }
-    if shnum == 0 || shstrndx >= shnum {
-        return Err("节表为空或 shstrndx 越界".into());
-    }
-
-    let raw_section = |i: usize| -> Result<(u32, u32, u64, usize, usize, usize), String> {
-        let base = shoff
-            .checked_add(i.checked_mul(shentsize).ok_or("节表偏移溢出")?)
-            .ok_or("节表偏移溢出")?;
-        Ok((
-            rd_u32(bytes, base)?,
-            rd_u32(bytes, base + 4)?,
-            rd_u64(bytes, base + 8)?,
-            rd_u64(bytes, base + 24)? as usize,
-            rd_u64(bytes, base + 32)? as usize,
-            rd_u32(bytes, base + 40)? as usize,
-        ))
-    };
-
-    let (_, _, _, shstr_off, shstr_size, _) = raw_section(shstrndx)?;
-    let shstrtab = bytes
-        .get(shstr_off..shstr_off + shstr_size)
-        .ok_or("shstrtab 越界")?;
-
-    let mut sections = Vec::with_capacity(shnum);
-    for i in 0..shnum {
-        let (name_off, typ, flags, offset, size, link) = raw_section(i)?;
-        let name = cstr_at(shstrtab, name_off as usize)?;
-        sections.push(Section {
-            name,
-            typ,
-            flags,
-            offset,
-            size,
-            link,
-        });
-    }
+    let sections = parse_sections(bytes)?;
 
     let mut probes = Vec::new();
     for (idx, sec) in sections.iter().enumerate() {
@@ -202,10 +271,17 @@ pub fn parse_probe_sections(bytes: &[u8]) -> Result<Vec<RawProbe>, String> {
                 target,
             }),
             many => {
-                return Err(format!(
-                    "探针段 '{}' 含多个函数符号 {:?}：一个 SEC 段只能挂一个探针",
-                    sec.name, many
-                ))
+                // 一个 SEC 段可挂多个程序（同一 tracepoint/kprobe 允许多个 BPF 程序）：
+                // 用于把超长程序拆小以守住老内核 4096 指令上限（raw_syscalls/sys_exit
+                // 拆成 proc/file/net 三个）。每个函数符号独立注册为一条探针。
+                for one in many {
+                    probes.push(RawProbe {
+                        name: one.clone(),
+                        kind,
+                        category: category.clone(),
+                        target: target.clone(),
+                    });
+                }
             }
         }
     }

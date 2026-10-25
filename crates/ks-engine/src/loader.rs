@@ -250,6 +250,8 @@ pub struct ProbeDef {
 include!(concat!(env!("OUT_DIR"), "/probes_generated.rs"));
 
 pub struct EbpfLoader {
+    /// 因目标 BTF 缺字段（重定位毒化）被跳过的探针名，供 status 如实上报
+    reloc_skipped: Vec<String>,
     #[cfg(target_os = "linux")]
     backend: EventBackend,
     #[cfg(target_os = "linux")]
@@ -549,13 +551,38 @@ fn sweep_stale_probes() -> usize {
     n
 }
 
+/// aya-obj 对"目标 BTF 缺字段"的处理不是报错，而是把该条指令毒化成这个 imm
+/// （aya-obj/src/btf/relocation.rs 的 poison_insn）。毒化指令过不了内核验证器。
+pub const POISON_IMM: i32 = 0x0BAD2310;
+
+/// 重定位毒化可容忍跳过的探针（K7 字段级容差）：这类探针缺失只损失单项能力，
+/// 不影响主事件流；跳过必须可见（loader 告警 + status 上报），不许静默。
+/// 核心数据路径探针（exec/file/net/dns）不在此列——毒化即该内核不支持，整体拒绝加载。
+pub const RELOC_TOLERANT_PROBES: &[&str] = &["kprobe_security_bpf_prog_free"];
+
+/// 加载前重定位预检：返回因目标 BTF 缺字段而毒化的程序名。
+/// 复用 aya-obj 对原始 .o 字节做一次与 EbpfLoader 相同的重定位（启动期一次，成本低）；
+/// relocate_btf 返回 Err 时上抛——那类错误 aya 加载同样会失败，行为与旧实现一致。
+#[cfg(target_os = "linux")]
+fn poisoned_programs(obj_bytes: &[u8], btf: &aya::Btf) -> anyhow::Result<Vec<String>> {
+    let mut obj = aya_obj::Object::parse(obj_bytes)?;
+    obj.relocate_btf(btf)?;
+    Ok(obj
+        .functions
+        .values()
+        .filter(|f| f.instructions.iter().any(|i| i.imm == POISON_IMM))
+        .map(|f| f.name.clone())
+        .collect())
+}
+
 #[cfg(target_os = "linux")]
 fn attach_kprobe(bpf: &mut aya::Ebpf, def: &ProbeDef) -> anyhow::Result<()> {
     let prog: &mut aya::programs::KProbe = bpf
         .program_mut(def.name)
         .ok_or_else(|| anyhow::anyhow!("kprobe程序'{}'未找到", def.name))?
         .try_into()?;
-    prog.load()?;
+    prog.load()
+        .map_err(|e| anyhow::anyhow!("加载 kprobe 程序 {} 失败: {}", def.name, e))?;
     // kretprobe 的 ProbeKind 由 aya 从 SEC 段解析，attach 接口相同
     prog.attach(def.target, 0)?;
     Ok(())
@@ -564,6 +591,7 @@ fn attach_kprobe(bpf: &mut aya::Ebpf, def: &ProbeDef) -> anyhow::Result<()> {
 impl EbpfLoader {
     pub fn new() -> Self {
         Self {
+            reloc_skipped: Vec::new(),
             #[cfg(target_os = "linux")]
             backend: EventBackend::Empty,
             #[cfg(target_os = "linux")]
@@ -642,6 +670,35 @@ impl EbpfLoader {
                 Some(btf)
             };
 
+            // K7 字段级容差预检：与 aya 相同的重定位先跑一遍，找出被毒化的程序。
+            // 可容忍清单内的探针（自保护类）跳过加载并如实上报；核心探针毒化
+            // 说明该内核不支持本 tier，保持整体失败（与旧行为一致，不静默降级）。
+            let mut reloc_skip: std::collections::HashSet<String> = Default::default();
+            if let Some(btf_ref) = btf.as_ref() {
+                let poisoned = poisoned_programs(&obj, btf_ref)
+                    .map_err(|e| anyhow::anyhow!("{} CO-RE 重定位预检失败: {}", obj_name, e))?;
+                let fatal: Vec<String> = poisoned
+                    .iter()
+                    .filter(|n| !RELOC_TOLERANT_PROBES.contains(&n.as_str()))
+                    .cloned()
+                    .collect();
+                if !fatal.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "{} 重定位后核心探针被毒化（目标内核 BTF 缺字段）: {:?}；该内核不支持本 tier",
+                        obj_name,
+                        fatal
+                    ));
+                }
+                for n in &poisoned {
+                    log::warn!(
+                        "[loader] 探针 {} 的重定位字段在目标内核 BTF 中缺失，跳过该探针（其余探针不受影响）",
+                        n
+                    );
+                    reloc_skip.insert(n.clone());
+                }
+                self.reloc_skipped = poisoned;
+            }
+
             // 注: EbpfLoader::new() 内部会先按 /sys/kernel/btf/vmlinux 解析一次，
             // 随即被 btf() 覆盖；多出的这一次解析只在启动期发生，可接受。
             let mut bpf = aya::EbpfLoader::new()
@@ -657,11 +714,17 @@ impl EbpfLoader {
                 .iter()
                 .filter(|d| d.kind == ProbeKind::Tracepoint)
             {
+                if reloc_skip.contains(def.name) {
+                    n_skipped += 1;
+                    continue;
+                }
                 let prog: &mut aya::programs::TracePoint = bpf
                     .program_mut(def.name)
                     .ok_or_else(|| anyhow::anyhow!("tracepoint程序'{}'未找到", def.name))?
                     .try_into()?;
-                prog.load()?;
+                prog.load().map_err(|e| {
+                    anyhow::anyhow!("加载 tracepoint 程序 {} 失败: {}", def.name, e)
+                })?;
                 prog.attach(def.category.unwrap_or(""), def.target)?;
                 n_attached += 1;
             }
@@ -709,6 +772,10 @@ impl EbpfLoader {
                 matches!(d.kind, ProbeKind::Kprobe | ProbeKind::Kretprobe)
                     && !handled.contains(&d.name)
             }) {
+                if reloc_skip.contains(def.name) {
+                    n_skipped += 1;
+                    continue;
+                }
                 if !symbol_exists(def.target) {
                     log::warn!(
                         "[loader] 内核无符号 {}，跳过探针 {}（不影响其它探针）",
@@ -836,6 +903,38 @@ impl EbpfLoader {
     }
 
     /// 探针清单（构建期注册表，与 status 报表同源）
+    /// 对当前内核做一次重定位预检（不加载、不 root），返回会被跳过的探针名。
+    /// 供 status 独立进程如实展示（status 无法读取运行中引擎的内存状态，
+    /// 但同一台机器 + 同一内核 BTF 上预检结果与引擎实际行为一致）。
+    #[cfg(target_os = "linux")]
+    pub fn relocation_skip_preview() -> Vec<String> {
+        let tier = match crate::tier_detect::detect_ebpf_tier() {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let suffix = match tier {
+            SourceKind::EbpfModern => "modern",
+            SourceKind::EbpfLegacy => "legacy",
+            SourceKind::EbpfAncient => "ancient",
+            // nobtf 档无 CO-RE 重定位（构建期已剥 .BTF.ext），不存在重定位毒化
+            _ => return Vec::new(),
+        };
+        let bytes = match ebpf_objects::ebpf_object_for(suffix) {
+            Some(b) => b.to_vec(),
+            None => return Vec::new(),
+        };
+        let (btf, _origin) = match crate::btf_source::load_target_btf() {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        poisoned_programs(&bytes, &btf).unwrap_or_default()
+    }
+
+    /// 因目标 BTF 缺字段被跳过的探针（重定位毒化可容忍清单内），供 status 如实上报
+    pub fn relocation_skipped_probes(&self) -> &[String] {
+        &self.reloc_skipped
+    }
+
     pub fn loaded_probes(&self) -> &'static [ProbeDef] {
         PROBE_REGISTRY
     }

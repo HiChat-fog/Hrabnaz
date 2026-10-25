@@ -69,6 +69,7 @@ fn snapshot() -> Value {
             "tracepoint": tracepoints,
             "kprobe": kprobes,
             "kretprobe": kretprobes,
+            "skipped_relocation": ks_engine::loader::EbpfLoader::relocation_skip_preview(),
         },
         "rules": {
             "dir": "rules/",
@@ -173,6 +174,14 @@ pub async fn run(watch: bool, interval: u64, json: bool) -> Result<()> {
         tp_count,
         kp_count
     );
+    let skipped = ks_engine::loader::EbpfLoader::relocation_skip_preview();
+    if !skipped.is_empty() {
+        println!(
+            "  重定位缺失跳过 {} 个: {:?}（本内核 BTF 缺字段，相应能力不可用）",
+            skipped.len(),
+            skipped
+        );
+    }
     println!("  覆盖范围: 系统调用 + 进程调度 + VFS + 网络栈 + 凭据/模块/自身完整性");
     println!("  分层:    modern(RingBuf) / legacy(PerfBuf) / ancient(CO-RE 或 NOBTF C loader)");
 

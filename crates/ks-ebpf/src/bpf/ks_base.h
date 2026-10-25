@@ -56,9 +56,34 @@ typedef __s64 i64;
    否则 legacy tier 在 4.19 上加载时 helper 不存在直接失败 */
 #if !defined(KS_TIER_MODERN)
     #define bpf_probe_read_kernel       bpf_probe_read
-    #define bpf_probe_read_kernel_str   bpf_probe_read_str
     #define bpf_probe_read_user         bpf_probe_read
+    /* 注：曾尝试用 probe_read + 展开扫描兼容 Debian 4.9（无 probe_read_str，helper 45），
+     * 但展开扫描把 ancient 程序推过 3.10 验证器的 4096 指令上限（E2BIG，QEMU 实测），
+     * 打坏真正的 3.10 目标——故回退为 probe_read_str。4.9 vanilla 记为已知不支持
+     *（其验证器还缺 helper 45）。 */
+    #define bpf_probe_read_kernel_str   bpf_probe_read_str
     #define bpf_probe_read_user_str     bpf_probe_read_str
+
+    /* 老 vanilla 验证器（QEMU 实测 Debian 4.9）要求 helper 的写入目标必须是栈指针
+     *（ARG_PTR_TO_UNINIT_MEM 仅接受 fp）。Ancient 档的事件体在 per-CPU scratch map 中，
+     * 直接传 map_value 会被拒（"R1 type=map_value_adj expected=fp"），故先写栈临时再拷贝。
+     * 仅 Ancient 档生效（RHEL 3.10 的验证器两者都接受；Legacy/Modern 保持零拷贝）。 */
+    #define KS_WRITE_COMM(dst, len) ({ \
+        char _kc[len]; __builtin_memset(_kc, 0, len); \
+        bpf_get_current_comm(_kc, len); \
+        __builtin_memcpy((dst), _kc, len); })
+    #define KS_WRITE_USER_STR(dst, len, src) ({ \
+        char _ks[len]; __builtin_memset(_ks, 0, len); \
+        long _kr = bpf_probe_read_user_str(_ks, len, (src)); \
+        __builtin_memcpy((dst), _ks, len); _kr; })
+    #define KS_WRITE_USER(dst, len, src) ({ \
+        char _km[len]; __builtin_memset(_km, 0, len); \
+        long _kr = bpf_probe_read_user(_km, len, (src)); \
+        __builtin_memcpy((dst), _km, len); _kr; })
+    #define KS_WRITE_KERNEL_STR(dst, len, src) ({ \
+        char _kk[len]; __builtin_memset(_kk, 0, len); \
+        long _kr = bpf_probe_read_kernel_str(_kk, len, (src)); \
+        __builtin_memcpy((dst), _kk, len); _kr; })
 #endif
 
 #ifdef KS_NOBTF
@@ -197,6 +222,13 @@ typedef __s64 i64;
         _out; \
     }); \
 })
+
+#if !(defined(KS_TIER_ANCIENT) && defined(KS_NOBTF)) && !defined(KS_TIER_ANCIENT)
+#define KS_WRITE_COMM(dst, len)              bpf_get_current_comm((dst), (len))
+#define KS_WRITE_USER_STR(dst, len, src)     bpf_probe_read_user_str((dst), (len), (src))
+#define KS_WRITE_USER(dst, len, src)         bpf_probe_read_user((dst), (len), (src))
+#define KS_WRITE_KERNEL_STR(dst, len, src)   bpf_probe_read_kernel_str((dst), (len), (src))
+#endif
 
 /* KS_D_PATH：struct path* 入口的树形路径（语义同 KS_D_TREE） */
 #define KS_D_PATH(buf, buf_len, path_ptr) ({ \

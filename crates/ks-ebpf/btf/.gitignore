@@ -1,0 +1,3 @@
+*.btf
+*.btf.xz
+!blobs/*.min.btf

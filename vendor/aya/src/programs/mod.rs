@@ -788,10 +788,43 @@ fn load_program<T: Link>(
             *fd = Some(ProgramFd(prog_fd));
             Ok(())
         }
-        Err(io_error) => Err(ProgramError::LoadError {
-            io_error,
-            verifier_log,
-        }),
+        Err(io_error) => {
+            // HRABNAZ-PATCH(9): 见 vendor/aya/PATCHES.md
+            // 部分内核自身的 vmlinux BTF 损坏（QEMU 实测 Ubuntu 5.8.0："btf_vmlinux is
+            // malformed"），任何携带 prog BTF 的加载都会被拒。prog BTF 只提供
+            // func_info/line_info（调试行号 + 类型信息），并非运行必需；
+            // 去掉 prog BTF（连同 func/line info）重试一次。
+            if btf_fd.is_some() {
+                let attr2 = EbpfLoadProgramAttrs {
+                    prog_btf_fd: None,
+                    func_info_rec_size: 0,
+                    func_info: Default::default(),
+                    line_info_rec_size: 0,
+                    line_info: Default::default(),
+                    ..attr
+                };
+                let (ret2, log2) = retry_with_verifier_logs(10, |logger| {
+                    bpf_load_program(&attr2, logger, *verifier_log_level)
+                });
+                match ret2 {
+                    Ok(prog_fd) => {
+                        *fd = Some(ProgramFd(prog_fd));
+                        return Ok(());
+                    }
+                    // 报第二次（无 prog BTF）的错误：更能说明真实阻塞点
+                    Err(io_error2) => {
+                        return Err(ProgramError::LoadError {
+                            io_error: io_error2,
+                            verifier_log: log2,
+                        })
+                    }
+                }
+            }
+            Err(ProgramError::LoadError {
+                io_error,
+                verifier_log,
+            })
+        }
     }
 }
 

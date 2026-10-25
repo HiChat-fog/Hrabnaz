@@ -89,22 +89,26 @@ int trace_sys_enter(KS_TP_SYS_ENTER *ctx) {
 }
 
 SEC("tracepoint/raw_syscalls/sys_exit")
-int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
+int trace_sys_exit_proc(KS_TP_SYS_EXIT *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
-
-    {
-        u32 _k = 0;
-        struct syscount *sc = bpf_map_lookup_elem(&syscount_map, &_k);
-        if (sc) sc->exit++;
-    }
-
     struct syscall_ctx *sctx = bpf_map_lookup_elem(&syscall_ctxs, &pid_tgid);
     if (!sctx) return 0;
 
     long ret = ctx->ret;
     u32 syscall_nr = sctx->syscall_nr;
 
+    /* 系统调用计数与频率窗口只在 proc 程序做一次（三个程序都会收到同一事件，
+     * 若各做一次会三倍计数）。 */
+    {
+        u32 _k = 0;
+        struct syscount *sc = bpf_map_lookup_elem(&syscount_map, &_k);
+        if (sc) sc->exit++;
+    }
     freq_handle_sys_exit(ctx, syscall_nr);
+    /* 注：raw_syscalls/sys_exit 上挂了 3 个程序（proc/file/net）以守住 3.10 的
+     * 4096 指令上限（单程序实测 7483 条 → E2BIG）。syscall_ctxs 条目不再在退出侧
+     * 删除：键是 pid_tgid，下一次 sys_enter 会覆盖；三程序顺序不确定，任何一方
+     * 删除都可能截断其它程序的读取。 */
 
     if (syscall_nr == 59 && ret >= 0) {
         struct exec_event *evt = KS_RESERVE(events, struct exec_event);
@@ -115,7 +119,7 @@ int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
         evt->header.retval = ret;
 
         const char __user *filename_ptr = (const char __user *)sctx->args[0];
-        bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), filename_ptr);
+        KS_WRITE_USER_STR(evt->filename, sizeof(evt->filename), filename_ptr);
 
         __builtin_memcpy(evt->args, sctx->exec_args, sizeof(sctx->exec_args));
 
@@ -124,83 +128,6 @@ int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
         KS_MAYBE_BLOCK(evt->header.pid, verdict);
         if (ks_should_drop(evt->header.pid, EVENT_PROCESS_EXEC,
                            (const char *)evt->filename, verdict)) {
-            KS_DISCARD(evt); goto cleanup;
-        }
-        KS_SUBMIT(ctx, events, evt);
-        goto cleanup;
-    }
-
-    if ((syscall_nr == 2 || syscall_nr == 257) && ret >= 0) {
-        struct file_event *evt = KS_RESERVE(events, struct file_event);
-        if (!evt) { ks_count_drop(); goto cleanup; }
-
-        fill_header(&evt->header, EVENT_FILE_OPEN);
-        evt->header.syscall_nr = syscall_nr;
-        evt->header.retval = ret;
-
-        const char __user *path_ptr;
-        if (syscall_nr == 257)
-            path_ptr = (const char __user *)sctx->args[1];
-        else
-            path_ptr = (const char __user *)sctx->args[0];
-        bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), path_ptr);
-        evt->fd = (i32)ret;
-        evt->flags = (syscall_nr == 2) ? (i32)sctx->args[1] : (i32)sctx->args[2];
-        evt->bytes = 0;
-
-        int verdict2 = infer_event(evt->header.pid, EVENT_FILE_OPEN,
-                    (const char *)evt->filename, 0, 0, 0, 0);
-        KS_MAYBE_BLOCK(evt->header.pid, verdict2);
-        if (ks_should_drop(evt->header.pid, EVENT_FILE_OPEN,
-                           (const char *)evt->filename, verdict2)) {
-            KS_DISCARD(evt); goto cleanup;
-        }
-        KS_SUBMIT(ctx, events, evt);
-        goto cleanup;
-    }
-
-    if (syscall_nr == 42) {
-        struct net_event *evt = KS_RESERVE(events, struct net_event);
-        if (!evt) { ks_count_drop(); goto cleanup; }
-
-        fill_header(&evt->header, EVENT_NET_CONNECT);
-        evt->header.syscall_nr = 42;
-        evt->header.retval = ret;
-
-        evt->saddr = 0;  evt->daddr = 0;
-        evt->sport = 0;  evt->dport = 0;
-        evt->proto = 0;  evt->family = 0;
-        __builtin_memset(evt->saddr6, 0, sizeof(evt->saddr6));
-        __builtin_memset(evt->daddr6, 0, sizeof(evt->daddr6));
-        evt->_pad3[0]=0;  evt->_pad3[1]=0;
-
-        int fd = (int)sctx->args[0];
-        struct sockaddr __user *addr = (struct sockaddr __user *)sctx->args[1];
-        struct sockaddr sa;
-        if (bpf_probe_read_user(&sa, sizeof(sa), addr) == 0) {
-            if (sa.sa_family == 2) {
-                struct sockaddr_in sin;
-                if (bpf_probe_read_user(&sin, sizeof(sin), addr) == 0) {
-                    evt->family = 2;
-                    evt->daddr  = sin.sin_addr.s_addr;
-                    evt->dport  = bpf_ntohs(sin.sin_port);
-                    evt->proto  = 6;
-                }
-            } else if (sa.sa_family == 10) {
-                struct sockaddr_in6 sin6;
-                if (bpf_probe_read_user(&sin6, sizeof(sin6), addr) == 0) {
-                    evt->family = 10;
-                    evt->dport  = bpf_ntohs(sin6.sin6_port);
-                    evt->proto  = 6;
-                    bpf_probe_read_user(evt->daddr6, sizeof(evt->daddr6), sin6.sin6_addr.in6_u.u6_addr8);
-                }
-            }
-        }
-
-        int verdict3 = infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
-                    evt->daddr, evt->dport, evt->proto, 0);
-        KS_MAYBE_BLOCK(evt->header.pid, verdict3);
-        if (ks_should_drop(evt->header.pid, EVENT_NET_CONNECT, NULL, verdict3)) {
             KS_DISCARD(evt); goto cleanup;
         }
         KS_SUBMIT(ctx, events, evt);
@@ -245,6 +172,65 @@ int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
         goto cleanup;
     }
 
+    if (syscall_nr == 313 && ret < 0) {
+        struct lkm_load_event *evt = KS_RESERVE(events, struct lkm_load_event);
+        if (!evt) { ks_count_drop(); goto cleanup; }
+
+        fill_header(&evt->header, EVENT_LKM_LOAD);
+        evt->header.syscall_nr = 313;
+        evt->header.retval = ret;
+        evt->pid = evt->header.pid;
+        evt->uid = evt->header.uid;
+        evt->_pad_lkm1 = 0;
+        __builtin_memcpy(evt->comm, evt->header.comm, sizeof(evt->comm));
+        __builtin_memcpy(evt->module_name, "finit_module", 13);
+
+        KS_SUBMIT(ctx, events, evt);
+        goto cleanup;
+    }
+
+cleanup:
+    return 0;
+}
+
+SEC("tracepoint/raw_syscalls/sys_exit")
+int trace_sys_exit_file(KS_TP_SYS_EXIT *ctx) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct syscall_ctx *sctx = bpf_map_lookup_elem(&syscall_ctxs, &pid_tgid);
+    if (!sctx) return 0;
+
+    long ret = ctx->ret;
+    u32 syscall_nr = sctx->syscall_nr;
+
+    if ((syscall_nr == 2 || syscall_nr == 257) && ret >= 0) {
+        struct file_event *evt = KS_RESERVE(events, struct file_event);
+        if (!evt) { ks_count_drop(); goto cleanup; }
+
+        fill_header(&evt->header, EVENT_FILE_OPEN);
+        evt->header.syscall_nr = syscall_nr;
+        evt->header.retval = ret;
+
+        const char __user *path_ptr;
+        if (syscall_nr == 257)
+            path_ptr = (const char __user *)sctx->args[1];
+        else
+            path_ptr = (const char __user *)sctx->args[0];
+        KS_WRITE_USER_STR(evt->filename, sizeof(evt->filename), path_ptr);
+        evt->fd = (i32)ret;
+        evt->flags = (syscall_nr == 2) ? (i32)sctx->args[1] : (i32)sctx->args[2];
+        evt->bytes = 0;
+
+        int verdict2 = infer_event(evt->header.pid, EVENT_FILE_OPEN,
+                    (const char *)evt->filename, 0, 0, 0, 0);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict2);
+        if (ks_should_drop(evt->header.pid, EVENT_FILE_OPEN,
+                           (const char *)evt->filename, verdict2)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
+        KS_SUBMIT(ctx, events, evt);
+        goto cleanup;
+    }
+
     if ((syscall_nr == 82 || syscall_nr == 264 || syscall_nr == 316) && ret >= 0) {
         struct file_event *evt = KS_RESERVE(events, struct file_event);
         if (!evt) { ks_count_drop(); goto cleanup; }
@@ -259,7 +245,7 @@ int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
         const char __user *new_path = (syscall_nr == 82)
             ? (const char __user *)sctx->args[1]
             : (const char __user *)sctx->args[3];
-        bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), new_path);
+        KS_WRITE_USER_STR(evt->filename, sizeof(evt->filename), new_path);
         evt->bytes = 0;  evt->fd = -1;  evt->flags = 0;
 
         int verdict_r = infer_event(evt->header.pid, EVENT_FILE_RENAME,
@@ -286,7 +272,7 @@ int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
         const char __user *path_ptr = (syscall_nr == 90)
             ? (const char __user *)sctx->args[0]
             : (const char __user *)sctx->args[1];
-        bpf_probe_read_user_str(evt->filename, sizeof(evt->filename), path_ptr);
+        KS_WRITE_USER_STR(evt->filename, sizeof(evt->filename), path_ptr);
         evt->bytes = 0;  evt->fd = -1;  evt->flags = 0;
 
         int verdict_c = infer_event(evt->header.pid, EVENT_FILE_CHMOD,
@@ -300,25 +286,68 @@ int trace_sys_exit(KS_TP_SYS_EXIT *ctx) {
         goto cleanup;
     }
 
-    if (syscall_nr == 313 && ret < 0) {
-        struct lkm_load_event *evt = KS_RESERVE(events, struct lkm_load_event);
+cleanup:
+    return 0;
+}
+
+SEC("tracepoint/raw_syscalls/sys_exit")
+int trace_sys_exit_net(KS_TP_SYS_EXIT *ctx) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct syscall_ctx *sctx = bpf_map_lookup_elem(&syscall_ctxs, &pid_tgid);
+    if (!sctx) return 0;
+
+    long ret = ctx->ret;
+    u32 syscall_nr = sctx->syscall_nr;
+
+    if (syscall_nr == 42) {
+        struct net_event *evt = KS_RESERVE(events, struct net_event);
         if (!evt) { ks_count_drop(); goto cleanup; }
 
-        fill_header(&evt->header, EVENT_LKM_LOAD);
-        evt->header.syscall_nr = 313;
+        fill_header(&evt->header, EVENT_NET_CONNECT);
+        evt->header.syscall_nr = 42;
         evt->header.retval = ret;
-        evt->pid = evt->header.pid;
-        evt->uid = evt->header.uid;
-        evt->_pad_lkm1 = 0;
-        __builtin_memcpy(evt->comm, evt->header.comm, sizeof(evt->comm));
-        __builtin_memcpy(evt->module_name, "finit_module", 13);
 
+        evt->saddr = 0;  evt->daddr = 0;
+        evt->sport = 0;  evt->dport = 0;
+        evt->proto = 0;  evt->family = 0;
+        __builtin_memset(evt->saddr6, 0, sizeof(evt->saddr6));
+        __builtin_memset(evt->daddr6, 0, sizeof(evt->daddr6));
+        evt->_pad3[0]=0;  evt->_pad3[1]=0;
+
+        int fd = (int)sctx->args[0];
+        struct sockaddr __user *addr = (struct sockaddr __user *)sctx->args[1];
+        struct sockaddr sa;
+        if (bpf_probe_read_user(&sa, sizeof(sa), addr) == 0) {
+            if (sa.sa_family == 2) {
+                struct sockaddr_in sin;
+                if (bpf_probe_read_user(&sin, sizeof(sin), addr) == 0) {
+                    evt->family = 2;
+                    evt->daddr  = sin.sin_addr.s_addr;
+                    evt->dport  = bpf_ntohs(sin.sin_port);
+                    evt->proto  = 6;
+                }
+            } else if (sa.sa_family == 10) {
+                struct sockaddr_in6 sin6;
+                if (bpf_probe_read_user(&sin6, sizeof(sin6), addr) == 0) {
+                    evt->family = 10;
+                    evt->dport  = bpf_ntohs(sin6.sin6_port);
+                    evt->proto  = 6;
+                    KS_WRITE_USER(evt->daddr6, sizeof(evt->daddr6), &sin6.sin6_addr.in6_u.u6_addr8);
+                }
+            }
+        }
+
+        int verdict3 = infer_event(evt->header.pid, EVENT_NET_CONNECT, NULL,
+                    evt->daddr, evt->dport, evt->proto, 0);
+        KS_MAYBE_BLOCK(evt->header.pid, verdict3);
+        if (ks_should_drop(evt->header.pid, EVENT_NET_CONNECT, NULL, verdict3)) {
+            KS_DISCARD(evt); goto cleanup;
+        }
         KS_SUBMIT(ctx, events, evt);
         goto cleanup;
     }
 
 cleanup:
-    bpf_map_delete_elem(&syscall_ctxs, &pid_tgid);
     return 0;
 }
 

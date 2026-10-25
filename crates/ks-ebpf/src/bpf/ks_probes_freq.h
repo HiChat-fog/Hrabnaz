@@ -136,7 +136,11 @@ report:
         KS_SUBMIT(ctx, freq_events, evt);
     }
 
-    bpf_map_update_elem(&freq_counters, &pid, fc, BPF_ANY);
+    /* 4.15 verifier 对 bpf_map_update_elem 的 value 参数只接受栈指针
+     *（传 map_value 报 "R3 type=map_value expected=fp"），先拷到栈再更新。 */
+    struct freq_counter freq_tmp;
+    __builtin_memcpy(&freq_tmp, fc, sizeof(freq_tmp));
+    bpf_map_update_elem(&freq_counters, &pid, &freq_tmp, BPF_ANY);
 }
 
 static __always_inline void freq_handle_sys_exit(void *ctx, u32 syscall_nr) {

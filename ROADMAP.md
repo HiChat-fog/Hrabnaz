@@ -29,7 +29,11 @@
     手动 cherry-pick。通用性修复（如 BPF_PROG_LOAD 字段门控）可顺手提上游，不作目标
 - **路径 B（优先）：自主 BTF 内嵌正式化**
   - 保持零依赖交付形态：BTF 采集在构建期完成（按发行版 release 采集或由 debuginfo+pahole 现场生成），裁剪后随单二进制发布，加载时按内核版本自动选取
-  - 扩容批次（2026-10-24 规划）：一批 RHEL8 4.18 + Ubuntu 5.4（管道现成，成本低）；二批 4.9/4.4 下限（配合 QEMU 实机验证）；三批 3.10 点版本别名（用现有 BTF 对其它 3.10.0-1160.x 跑重定位比对，等价才显式登记，不做隐式通配）。现代内核不内嵌（宿主自带 /sys/kernel/btf/vmlinux）
+  - 扩容（2026-10-24 一批完成）：BTFHub 全量枚举 3062 → 目标 496 → 到手 427 → **内嵌 281 份全过逐份重定位门禁**
+（RHEL7/CentOS7 全系 3.10、RHEL8/CentOS8 4.18、Debian 9/10、Ubuntu 16.04/18.04/20.04 采样、OL/SLES/Fedora），
+单二进制 +325KB，235 测试全绿；剔除 106（Amazon 全系 + 老 vanilla 4.x，字段缺失毒化，见
+ks-test-evidence/btf-embed-2026-10-24/）。**K7 字段级容差已完成**（loader 预检毒化→可容忍探针跳过+status 如实上报，281→382 份，仅 UEK 4.1 ×5 核心毒化剔除）；补拉完成至 **425 份**。
+**2026-10-25 存储形态定稿**：仓库只存 `btf/index.tsv`（425 个 release → 149 个唯一 min BTF，322KB），完整 BTF 由 `scripts/btf-fetch.sh` 按需拉取到 `~/.cache/hrabnaz/btf-full`，`scripts/btf-regen.sh` 负责裁剪与重建索引；构建不再依赖 bpftool 与 xz。待办：4.4/4.9 QEMU 实机下限验证。
 - **共同收尾**：vanilla 4.4/4.9（Debian 9/Ubuntu 16.04 世代）下限验证；nobtf 编译档与 C loader 退役
 
 ### H-3 吞吐优化与性能基准 ✅ (2026-10-15 代码完成+真机对照)
@@ -45,7 +49,7 @@
 ### H-4 质量与长稳
 
 - **unsafe 收敛 ✅ (2026-10-16)**：运行时 unsafe 20 处 → **8 处**（sys.rs 6 个 libc FFI 块 + linux_map_reader 2 个 aya Pod 声明），业务代码零 unsafe。聚合器字节流解析用固定偏移手工提取替代 union 指针读（union 删除，逐字段下界检查越界置 0）；测试/回放编码走 zerocopy IntoBytes（含显式化尾部对齐填充）；libc 边界收拢 `ks-engine/src/sys.rs`（CLI 经依赖复用，FFI 只剩一份）。等价性：mock 前 300 条告警序列逐字段一致、告警率 1.3510→1.3520；真机双机 15 万+ 真实 eBPF 字节走安全解码，H-2/H-3 回归正常。187 测试全绿。后续剩余 8 处也已归零：libc 边界改走 nix 安全封装，`linux_map_reader` 的 Pod 声明删除（aya 对 `[u8; N]` 自带实现）；当前全仓库 `unsafe {` 为 0。
-- **检出率校准（进行中 2026-10-24）**：ART 两层法已落地——规则层本地复现测试 `tests/art_rule_repro.rs`（8/8 可达，揪出 SUID 正则漏 `u+xs` 已修）+ 6.1 真机矩阵（dns 频率/LKM+阻断闭环已确认命中，负样本零误报）；揭示内核敏感路径表过窄（cron.d/id_rsa/非 root authorized_keys 的事件对低风险进程被 FILE_OPEN 默认丢弃）、FILE_WRITE ≥1024B 门槛、勒索扩展名缺 .enc 等缺口（详见 ks-test-evidence/art-2026-10-24/）；另修复两个 H-1 级 bug：轮转后活跃文件 0644、引擎自反馈（自写事件 11 万条/5min，修复后写入量 −93~97%）。第二轮（同日）已完成 K1 内核敏感路径扩充（/etc//boot/ 前缀放行，cron.d 双机 MISS→HIT，零稳态代价）、DNS 关联重写为 Repeat 60s≥50 次 + 解析器排除（新增 CorrelationType::Repeat 与 Not 条件）、FPR 白名单三批（sshd/crond/(systemd)/cron），全部双机部署验证；3.10 真实业务机 FPR 基线 109/h（主项已清），48h 复测协议已启。同日收尾：Repeat 归属修复+规则级冷却（60 连发仅 1 条告警）、gzip 自触发观察关闭（0 复发）、伴生基础设施白名单走部署方自配（双机 systemd drop-in 配 KS_BASELINE_HIGHFREQ，编译期默认名单保持普适项），双机验证零行为误报。剩余待查：base64/LD_PRELOAD 规则形态缺口（K6，需 envp 捕获）、/home 后缀匹配（H-2）、风暴期跨文件重复写入（未复现挂起）
+- **检出率校准（进行中 2026-10-24）**：ART 两层法已落地——规则层本地复现测试 `tests/art_rule_repro.rs`（8/8 可达，揪出 SUID 正则漏 `u+xs` 已修）+ 6.1 真机矩阵（dns 频率/LKM+阻断闭环已确认命中，负样本零误报）；揭示内核敏感路径表过窄（cron.d/id_rsa/非 root authorized_keys 的事件对低风险进程被 FILE_OPEN 默认丢弃）、FILE_WRITE ≥1024B 门槛、勒索扩展名缺 .enc 等缺口（详见 ks-test-evidence/art-2026-10-24/）；另修复两个 H-1 级 bug：轮转后活跃文件 0644、引擎自反馈（自写事件 11 万条/5min，修复后写入量 −93~97%）。第二轮（同日）已完成 K1 内核敏感路径扩充（/etc//boot/ 前缀放行，cron.d 双机 MISS→HIT，零稳态代价）、DNS 关联重写为 Repeat 60s≥50 次 + 解析器排除（新增 CorrelationType::Repeat 与 Not 条件）、FPR 白名单三批（sshd/crond/(systemd)/cron），全部双机部署验证；3.10 真实业务机 FPR 基线 109/h（主项已清），48h 复测协议已启。同日收尾：Repeat 归属修复+规则级冷却（60 连发仅 1 条告警）、gzip 自触发观察关闭（0 复发）、伴生基础设施白名单走部署方自配（双机 systemd drop-in 配 KS_BASELINE_HIGHFREQ，编译期默认名单保持普适项），双机验证零行为误报。剩余待查：base64/LD_PRELOAD 规则形态缺口（K6，需 envp 捕获）、/home 后缀匹配（H-2）、风暴期跨文件重复写入（未复现挂起）。**2026-10-25：I-2 初稿成稿**（ks-test-evidence/i2-2026-10-25/report.md）——ART 真机 9/18 直接命中 + 规则层 8/8；内核矩阵 122 实测（本机 80/84 + 6.1 38/38）与 425 份内嵌 BTF；FPR 八类误报已修，复测残差约 1-2/h（未达 <10/天，下一轮收敛 crontab 过宽规则、ntpd/chronyd 行为、云盾 DNS 噪音）；已知不支持：Debian 4.9（helper45/栈限制）、Ubuntu 5.8（内核 BTF 损坏+验证器缺陷）、UEK 4.1；构建期新增 4096 指令闸门（ancient 最大 3965）
 - **长稳矩阵**：4.19 补入 systemd 长稳 soak（本地 QEMU），与 3.10、6.1 同标准验收；3.10/6.1 现有常驻继续积累运行时长
 
 ### H-5 新探针贡献架构：单一来源注册表 ✅ (2026-10-17)

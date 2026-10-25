@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -37,7 +38,7 @@ fn main() {
             bpf_src_dir
         );
         // btf_objects.rs 必须存在，否则 btf_source.rs 的 include! 编译失败
-        write_btf_objects(&out_dir, &manifest_dir, &[]);
+        write_btf_objects(&out_dir, &manifest_dir);
         write_ebpf_objects(&out_dir, &[], false);
         write_probe_registry(&out_dir, &BTreeMap::new());
         return;
@@ -182,6 +183,40 @@ fn main() {
         println!("cargo:warning=Modern tier .o未编译成功,运行时将无法在5.8+ 内核上加载");
     }
 
+    // ── 指令数预算闸门：老内核验证器 BPF_MAXINSNS=4096 ──
+    // 超限 = BPF_PROG_LOAD E2BIG → 运行时回退 mock；旧部署二进制可能仍合规，
+    // 本地不会暴露，直到发布才在 3.10 静默哑火（QEMU 实测 trace_sys_exit 曾 7483 条）。
+    // 这里在构建期硬失败，并打印各程序尺寸（预算表）。
+    const INSNS_LIMIT: u64 = 4096;
+    for name in &compiled {
+        let obj_path = out_dir.join(name);
+        let bytes = std::fs::read(&obj_path)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {}", obj_path.display(), e));
+        let mut sizes = probe_registry::program_sizes(&bytes)
+            .unwrap_or_else(|e| panic!("{} 程序尺寸解析失败: {}", name, e));
+        sizes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let top: Vec<String> = sizes
+            .iter()
+            .take(4)
+            .map(|(n, c)| format!("{n}={c}"))
+            .collect();
+        println!("cargo:warning={} 程序指令数 TOP: {}", name, top.join(", "));
+        let over: Vec<String> = sizes
+            .iter()
+            .filter(|(_, c)| *c > INSNS_LIMIT)
+            .map(|(n, c)| format!("{n}={c}"))
+            .collect();
+        if !over.is_empty() {
+            panic!(
+                "{} 有程序超过老内核指令上限 {}（{}）。拆分该 SEC 段为多个程序（同一 tracepoint 可挂多个），\
+                 或精简逻辑后再提交。",
+                name,
+                INSNS_LIMIT,
+                over.join(", ")
+            );
+        }
+    }
+
     // ── 探针注册表：从各 tier 编译产物的 SEC 段自动枚举（单一来源）──
     // 五个 tier 的探针集合应完全一致；不一致说明条件编译把某个探针排除在某个
     // tier 之外，attach 逻辑会按"缺失即跳过"处理，但注册表必须发出同一份。
@@ -213,13 +248,7 @@ fn main() {
 
     let ks_loader_built = build_static_ks_loader(&out_dir, &manifest_dir);
 
-    // 带 CO-RE 重定位的对象（*_nobtf 已剥 .BTF.ext，喂给 bpftool 没有意义）
-    let core_objects: Vec<PathBuf> = compiled
-        .iter()
-        .filter(|n| !n.contains("_nobtf"))
-        .map(|n| out_dir.join(n))
-        .collect();
-    write_btf_objects(&out_dir, &manifest_dir, &core_objects);
+    write_btf_objects(&out_dir, &manifest_dir);
 
     write_ebpf_objects(&out_dir, &compiled, ks_loader_built);
 }
@@ -251,252 +280,139 @@ fn write_probe_registry(out_dir: &Path, probes: &BTreeMap<String, probe_registry
         .expect("写入 probes_generated.rs 失败");
 }
 
-/// 扫描 crates/ks-ebpf/btf/，把目标内核 BTF 内嵌进二进制，生成 `btf_objects.rs`。
+/// 把裁剪后的目标内核 BTF 内嵌进二进制，生成 `btf_objects.rs`。
 ///
-/// 用途：交付到没有 `/sys/kernel/btf/vmlinux` 的老内核时，aya 的 CO-RE 重定位
-/// 仍需要一份该内核的 BTF，否则会静默跳过重定位并读取错误字段。
-///
-/// 文件名约定 `<kernel-release>.btf`，或入库形态 `<kernel-release>.btf.xz`
-/// （实测可压到原始的 24%）。xz 在**构建期**解压，因此运行时不引入解压依赖。
-/// 目录为空（默认交付情形）时生成空表，走 sysfs。
-///
-/// 解压后再用 `bpftool gen min_core_btf` 裁成"只含 `core_objects` 真正用到的类型"
-/// 的最小 BTF 内嵌（实测 30.9MB → 1515 字节，重定位结果与完整 BTF 一致）：
-/// 内嵌体积直接进交付单二进制，不能带着整份 vmlinux BTF 走。bpftool 缺失或失败
-/// 时回退完整 BTF 并告警，不阻断构建。
-fn write_btf_objects(
-    out_dir: &std::path::Path,
-    manifest_dir: &std::path::Path,
-    core_objects: &[PathBuf],
-) {
+/// `btf/index.tsv` 是唯一入口：`<release>\t<blob>\t<full_btf_sha256>`。
+/// `btf/blobs/<sha256[0:16]>.min.btf` 由 `scripts/btf-regen.sh` 生成。
+fn write_btf_objects(out_dir: &Path, manifest_dir: &Path) {
     let btf_dir = manifest_dir.join("../ks-ebpf/btf");
-    let out_btf_dir = out_dir.join("btf");
-    let bpftool = which::which("bpftool").ok();
+    let blobs_dir = btf_dir.join("blobs");
+    let index_path = btf_dir.join("index.tsv");
+    println!("cargo:rerun-if-changed={}", index_path.display());
+    println!("cargo:rerun-if-changed={}", blobs_dir.display());
 
-    // 目录已在仓库中(.gitkeep)，所以这条 rerun-if-changed 不会因为路径不存在
-    // 而导致 build script 每次重跑；往里放文件即可触发重新内嵌
-    println!("cargo:rerun-if-changed={}", btf_dir.display());
-
-    // (release, OUT_DIR 内文件名, 内嵌字节数, 是否裁过)
-    let mut entries: Vec<(String, String, u64, bool)> = Vec::new();
-    let mut warned_no_bpftool = false;
-
-    let mut names: Vec<String> = std::fs::read_dir(&btf_dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| e.path().is_file())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort(); // 输出顺序稳定，避免无谓的重新编译
-
-    for name in names {
-        let Some(release) = name
-            .strip_suffix(".btf.xz")
-            .or_else(|| name.strip_suffix(".btf"))
-        else {
-            continue; // .gitkeep 等非 BTF 文件
-        };
-        if release.is_empty()
-            || !release
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || ".-_+".contains(c))
-        {
-            println!(
-                "cargo:warning=btf/{} 的文件名不是合法的内核 release，跳过",
-                name
+    let index = std::fs::read_to_string(&index_path).unwrap_or_default();
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for line in index.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 2 {
+            panic!("btf/index.tsv 行格式错误: {:?}", line);
+        }
+        let (release, blob) = (parts[0], parts[1]);
+        let path = blobs_dir.join(format!("{}.min.btf", blob));
+        if !path.is_file() {
+            panic!(
+                "btf/index.tsv 引用了不存在的 blob: {}（release {}）",
+                path.display(),
+                release
             );
-            continue;
         }
-        println!("cargo:rerun-if-changed={}", btf_dir.join(&name).display());
+        entries.push((release.to_string(), blob.to_string()));
+    }
+    entries.sort();
+    entries.dedup();
 
-        let dest_name = format!("{}.btf", release);
-        let dest = out_btf_dir.join(&dest_name);
-        if std::fs::create_dir_all(&out_btf_dir).is_err() {
-            println!("cargo:warning=创建 {:?} 失败，跳过 {}", out_btf_dir, name);
-            continue;
+    let mut blobs: Vec<String> = entries.iter().map(|(_, b)| b.clone()).collect();
+    blobs.sort();
+    blobs.dedup();
+
+    for blob in &blobs {
+        let path = blobs_dir.join(format!("{}.min.btf", blob));
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("读取 {} 失败: {}", path.display(), e));
+        let actual = hex(&Sha256::digest(&bytes));
+        if !actual.starts_with(blob.as_str()) {
+            panic!("{} 的内容哈希是 {}，与文件名不一致", path.display(), actual);
         }
-
-        let src = btf_dir.join(&name);
-        let copied = if name.ends_with(".xz") {
-            decompress_xz(&src, &dest)
-        } else {
-            std::fs::copy(&src, &dest)
-                .map(|_| ())
-                .map_err(|e| format!("拷贝失败: {}", e))
-        };
-        if let Err(e) = copied {
-            // 不阻断开发机构建（现代内核走 sysfs BTF 即可），但发布前必须确认
-            // 内嵌表非空，否则交付到老内核时会退化成硬编码偏移
-            println!("cargo:warning={} 未能内嵌: {}", name, e);
-            continue;
-        }
-
-        let full_len = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-        let mut picked = (dest_name, full_len, false);
-
-        if !core_objects.is_empty() {
-            match &bpftool {
-                Some(tool) => {
-                    let min_name = format!("{}.min.btf", release);
-                    let min_dest = out_btf_dir.join(&min_name);
-                    match minimize_btf(tool, &dest, &min_dest, core_objects) {
-                        Ok(len) => {
-                            println!(
-                                "cargo:warning=内嵌内核 BTF {} 已裁剪为最小核心 BTF: {} → {} 字节",
-                                release, full_len, len
-                            );
-                            picked = (min_name, len, true);
-                        }
-                        Err(e) => println!(
-                            "cargo:warning={} 裁剪最小核心 BTF 失败({})，内嵌完整 BTF {} 字节",
-                            name, e, full_len
-                        ),
-                    }
-                }
-                None => {
-                    if !warned_no_bpftool {
-                        warned_no_bpftool = true;
-                        println!(
-                            "cargo:warning=未找到 bpftool，内嵌完整内核 BTF（体积大数十 MB）。\
-                             安装 bpftool(linux-tools) 可裁剪为最小核心 BTF（KB 级）"
-                        );
-                    }
-                }
-            }
-        }
-
-        entries.push((release.to_string(), picked.0, picked.1, picked.2));
     }
 
-    let mut lines: Vec<String> = vec![
-        "// AUTO-GENERATED by build.rs - 内嵌的目标内核 BTF(交付到无 BTF 老内核用)。请勿手改。"
-            .into(),
-        "// 来源: crates/ks-ebpf/btf/<release>.btf 或 <release>.btf.xz(构建期解压)。".into(),
+    let mut lines = vec![
+        "// AUTO-GENERATED by build.rs - 内嵌的目标内核最小 BTF。请勿手改。".to_string(),
+        "// 来源: crates/ks-ebpf/btf/index.tsv 与 blobs/（scripts/btf-regen.sh 生成）。"
+            .to_string(),
         String::new(),
-        "/// 已内嵌 BTF 的内核 release 列表(精确匹配,不做前缀猜测)。".into(),
     ];
-    let releases: Vec<String> = entries
-        .iter()
-        .map(|(r, _, _, _)| format!("{:?}", r))
-        .collect();
+    for (i, blob) in blobs.iter().enumerate() {
+        lines.push(format!(
+            "static BTF_{}: &[u8] = include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../ks-ebpf/btf/blobs/{}.min.btf\"));",
+            i, blob
+        ));
+    }
+    lines.push(String::new());
+    lines.push("/// 已内嵌 BTF 的内核 release 列表(精确匹配,不做前缀猜测)。".to_string());
+    let releases: Vec<String> = entries.iter().map(|(r, _)| format!("{:?}", r)).collect();
     lines.push(format!(
         "pub const BTF_EMBEDDED_RELEASES: &[&str] = &[{}];",
         releases.join(", ")
     ));
     lines.push(String::new());
-    lines.push("/// 按内核 release 取内嵌 BTF。偏移随内核构建而变，故只做精确匹配。".into());
-    lines.push("pub fn btf_for_release(release: &str) -> Option<&'static [u8]> {".into());
-    lines.push("    match release {".into());
-    for (release, dest_name, _, _) in &entries {
+    lines.push("/// 按内核 release 取内嵌 BTF。偏移随内核构建而变，故只做精确匹配。".to_string());
+    lines.push("pub fn btf_for_release(release: &str) -> Option<&'static [u8]> {".to_string());
+    lines.push("    match release {".to_string());
+    let blob_index: std::collections::HashMap<&str, usize> = blobs
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.as_str(), i))
+        .collect();
+    for (release, blob) in &entries {
         lines.push(format!(
-            "        {:?} => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/btf/{}\"))),",
-            release, dest_name
+            "        {:?} => Some(BTF_{}),",
+            release,
+            blob_index[blob.as_str()]
         ));
     }
-    lines.push("        _ => None,".into());
-    lines.push("    }".into());
-    lines.push("}".into());
+    lines.push("        _ => None,".to_string());
+    lines.push("    }".to_string());
+    lines.push("}".to_string());
     lines.push(String::new());
-    lines.push(
-        "/// 该 release 的内嵌 BTF 是否为 bpftool 裁出的最小核心 BTF（而非完整 vmlinux BTF）。"
-            .into(),
-    );
-    // 生成的布尔 match 会被 clippy 判成 matches! 可改写；本文件是构建产物，加 allow 免改写
-    lines.push("#[allow(clippy::match_like_matches_macro)]".into());
-    lines.push("pub fn btf_minimized(release: &str) -> bool {".into());
-    lines.push("    match release {".into());
-    for (release, _, _, minimized) in &entries {
-        lines.push(format!("        {:?} => {},", release, minimized));
+    lines.push("/// 内嵌表里的 BTF 都是 `bpftool gen min_core_btf` 的产物。".to_string());
+    lines.push("#[allow(clippy::match_like_matches_macro)]".to_string());
+    lines.push("pub fn btf_minimized(release: &str) -> bool {".to_string());
+    lines.push("    match release {".to_string());
+    for (release, _) in &entries {
+        lines.push(format!("        {:?} => true,", release));
     }
-    lines.push("        _ => false,".into());
-    lines.push("    }".into());
-    lines.push("}".into());
+    lines.push("        _ => false,".to_string());
+    lines.push("    }".to_string());
+    lines.push("}".to_string());
 
     std::fs::write(out_dir.join("btf_objects.rs"), lines.join("\n") + "\n")
         .expect("无法写入 btf_objects.rs");
 
-    if entries.is_empty() {
-        println!(
-            "cargo:warning=未内嵌任何内核 BTF（crates/ks-ebpf/btf/ 为空）——\
-             无 /sys/kernel/btf/vmlinux 的内核需靠 KS_BTF_PATH 指定"
-        );
-    } else {
-        let detail: Vec<String> = entries
-            .iter()
-            .map(|(r, _, len, min)| {
-                format!(
-                    "{}={} 字节{}",
-                    r,
-                    len,
-                    if *min {
-                        "(最小核心 BTF)"
-                    } else {
-                        "(完整)"
-                    }
-                )
-            })
-            .collect();
-        println!(
-            "cargo:warning=已内嵌 {} 份内核 BTF: {}，合计 {} 字节",
-            entries.len(),
-            detail.join(", "),
-            entries.iter().map(|(_, _, l, _)| l).sum::<u64>()
-        );
+    let total: u64 = blobs
+        .iter()
+        .map(|b| {
+            std::fs::metadata(blobs_dir.join(format!("{}.min.btf", b)))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
+        .sum();
+    println!(
+        "cargo:warning=内嵌 {} 份内核 BTF（{} 个唯一 blob，{} 字节）",
+        entries.len(),
+        blobs.len(),
+        total
+    );
+
+    if let Ok(rd) = std::fs::read_dir(&blobs_dir) {
+        let used: std::collections::HashSet<&str> = blobs.iter().map(|b| b.as_str()).collect();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(stem) = name.strip_suffix(".min.btf") {
+                if !used.contains(stem) {
+                    println!("cargo:warning=btf/blobs/{} 未被 index.tsv 引用", name);
+                }
+            }
+        }
     }
 }
 
-/// 用 `bpftool gen min_core_btf` 从完整 BTF 裁出只含 `objects` 引用到的类型的最小 BTF。
-/// 纯文件操作，不需要 root，也不碰内核。
-fn minimize_btf(
-    bpftool: &std::path::Path,
-    full: &std::path::Path,
-    dest: &std::path::Path,
-    objects: &[PathBuf],
-) -> Result<u64, String> {
-    let out = Command::new(bpftool)
-        .arg("gen")
-        .arg("min_core_btf")
-        .arg(full)
-        .arg(dest)
-        .args(objects)
-        .output()
-        .map_err(|e| format!("执行 bpftool 失败: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "退出码 {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let len = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-    if len == 0 {
-        return Err("产物为空".into());
-    }
-    Ok(len)
-}
-
-/// 用系统 xz 解压。与 build.rs 已有的 clang/cc/llvm-objcopy 同样走外部工具，
-/// 不新增 crate 依赖；xz 缺失只影响该份 BTF 的内嵌，不阻断构建。
-fn decompress_xz(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
-    let xz = which::which("xz").map_err(|e| format!("未找到 xz: {}", e))?;
-    let out = std::process::Command::new(xz)
-        .arg("-dc")
-        .arg(src)
-        .output()
-        .map_err(|e| format!("执行 xz 失败: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "xz -dc 退出码 {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    if out.stdout.is_empty() {
-        return Err("xz 解压输出为空".into());
-    }
-    std::fs::write(dest, &out.stdout).map_err(|e| format!("写入 {} 失败: {}", dest.display(), e))
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn write_ebpf_objects(out_dir: &std::path::Path, compiled: &[String], ks_loader_built: bool) {

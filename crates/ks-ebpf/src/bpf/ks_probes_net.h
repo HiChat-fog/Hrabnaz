@@ -26,8 +26,8 @@ int BPF_KPROBE(kprobe_tcp_connect, struct sock *sk, struct sockaddr *uaddr, int 
     // 旧实现 bpf_probe_read_kernel 在此恒 -EFAULT，connect 目标地址全丢。
     // ancient/legacy_nobtf 由 common.h 宏回落 bpf_probe_read
     struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
-    bpf_probe_read_user(&evt->daddr, sizeof(evt->daddr), &addr->sin_addr.s_addr);
-    bpf_probe_read_user(&evt->dport, sizeof(evt->dport), &addr->sin_port);
+    KS_WRITE_USER(&evt->daddr, sizeof(evt->daddr), &addr->sin_addr.s_addr);
+    KS_WRITE_USER(&evt->dport, sizeof(evt->dport), &addr->sin_port);
     evt->dport = bpf_ntohs(evt->dport);
     evt->proto = 6;   evt->family = 2;
 

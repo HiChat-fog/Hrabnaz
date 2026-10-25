@@ -1,10 +1,9 @@
 //! CO-RE 重定位回归测试（不需要 root，也不需要真机加载）。
 //!
-//! 为什么需要这个测试：`aya_obj::Object::relocate_btf` 在**遇到第一个无法解析的
-//! 访问路径时就返回 Err**，而 `EbpfLoader::load` 会把该错误整个上抛 —— 也就是说
-//! 目标内核的 BTF 里只要缺一个我们读的字段，**整个 tier 都加载不起来**，不是单个
-//! 探针失败。而这类缺失恰恰出现在最老的内核上（3.10 的 BTF 里可能没有
-//! `bpf_prog_aux` 之类后来才有的类型）。
+//! 门禁语义（K7 字段级容差后）：aya-obj 对缺字段不报错而是毒化指令；loader 在加载前
+//! 用同样的重定位做预检，**可容忍清单**（RELOC_TOLERANT_PROBES，自保护类探针）内的
+//! 毒化 → 跳过该探针并如实上报；**核心探针**毒化 → 该内核不支持本 tier，整体拒绝。
+//! 本测试按同一规则判定每一份内嵌 BTF：只允许可容忍探针毒化。
 //!
 //! 所以：把每一份可用的 BTF（本机 sysfs + 构建期内嵌的每一份）都拿来对三个
 //! CO-RE tier 的真实 .o 做一次重定位。老内核的 BTF 一旦内嵌进来却无法解析全部
@@ -38,13 +37,11 @@ fn tiers_for_release(release: &str) -> Vec<&'static str> {
     }
 }
 
-/// aya 对"目标 BTF 里找不到的字段"不是报错，而是把指令毒化成 jmp 0xBAD2310
-/// （aya-obj/src/btf/relocation.rs 的 poison_insn），并让 relocate_btf 返回 Ok。
-/// 毒化后的指令内核验证器一律拒绝，所以"重定位成功"不等于"能加载"——
-/// 必须显式检查毒化，否则老内核 BTF 缺类型时测试会假绿。
-const POISON_IMM: i32 = 0x0BAD2310;
+/// 毒化标记与可容忍清单从 loader 导入，保证测试门禁与运行时行为同源（防止漂移）。
+use ks_engine::loader::{POISON_IMM, RELOC_TOLERANT_PROBES};
 
-fn poison_sites(obj: &aya_obj::Object) -> Vec<String> {
+/// 返回 (程序名, 现场描述)；程序名用于对照可容忍清单。
+fn poison_sites(obj: &aya_obj::Object) -> Vec<(String, String)> {
     let mut sites = Vec::new();
     for f in obj.functions.values() {
         for (i, ins) in f.instructions.iter().enumerate() {
@@ -65,11 +62,9 @@ fn poison_sites(obj: &aya_obj::Object) -> Vec<String> {
                         )
                     })
                     .collect();
-                sites.push(format!(
-                    "{} insn[{}]\n     {}",
-                    f.name,
-                    i,
-                    ctx.join("\n     ")
+                sites.push((
+                    f.name.clone(),
+                    format!("{} insn[{}]\n     {}", f.name, i, ctx.join("\n     ")),
                 ));
             }
         }
@@ -96,14 +91,27 @@ fn assert_relocates(obj_bytes: &[u8], btf: &Btf, label: &str) {
         );
     }
     let sites = poison_sites(&obj);
+    let (tolerant, fatal): (Vec<_>, Vec<_>) = sites
+        .into_iter()
+        .partition(|(name, _)| RELOC_TOLERANT_PROBES.contains(&name.as_str()));
+    if !tolerant.is_empty() {
+        let names: Vec<&str> = tolerant.iter().map(|(n, _)| n.as_str()).collect();
+        eprintln!(
+            "[容差] {}: 可容忍探针毒化，运行时会跳过: {:?}",
+            label, names
+        );
+    }
     assert!(
-        sites.is_empty(),
-        "{}: 重定位后有 {} 条指令被毒化（目标 BTF 缺对应字段，内核验证器会拒绝整个程序）:\n  {}\n\
-         修法：不要用 vmlinux.h 里 preserve_access_index 的类型去访问老内核 BTF 缺失的\n\
-         结构（例如 tracepoint ctx 的 trace_event_raw_*），改成本地定义的结构体。",
+        fatal.is_empty(),
+        "{}: 核心探针被毒化（目标 BTF 缺对应字段，该内核将不支持此 tier）:\n  {}\n\
+         修法：核心数据路径探针不要读老内核 BTF 缺失的字段；确属可选能力的探针\n\
+         加入 loader::RELOC_TOLERANT_PROBES（须同时保证 status 如实上报）。",
         label,
-        sites.len(),
-        sites.join("\n  ")
+        fatal
+            .iter()
+            .map(|(_, d)| d.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
     );
 }
 

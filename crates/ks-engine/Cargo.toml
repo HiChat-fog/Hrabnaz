@@ -33,6 +33,7 @@ zerocopy = { version = "0.8", features = ["derive"] }
 
 [build-dependencies]
 which = "7"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

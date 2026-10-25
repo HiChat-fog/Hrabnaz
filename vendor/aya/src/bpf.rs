@@ -476,10 +476,13 @@ impl<'a> EbpfLoader<'a> {
                             }
                         }
 
-                        if obj.has_btf_relocations() {
-                            return Err(EbpfError::BtfError(err));
-                        }
-
+                        // HRABNAZ-PATCH(8): 见 vendor/aya/PATCHES.md
+                        // 上游在"对象含 CO-RE 重定位"时把内核 BTF 装载失败当致命错误。
+                        // 但 CO-RE 重定位在本库中是**用户态用目标 BTF**完成的
+                        //（下方 obj.relocate_btf(btf)），内核侧对象 BTF 只用于
+                        // func_info/line_info（调试行号）与 map 自省，不影响加载与检测。
+                        // 故 kprobe/tracepoint 等非强制类型程序在 BTF 装载失败时继续无 BTF 加载
+                        //（QEMU 实测 Debian 4.19.0-20/21 因此可正常挂载）。
                         warn!("object BTF couldn't be loaded in the kernel: {err}");
 
                         None
@@ -1265,21 +1268,44 @@ pub enum EbpfError {
 pub type BpfError = EbpfError;
 
 fn load_btf(
-    mut raw_btf: Vec<u8>,
+    raw_btf: Vec<u8>,
     verifier_log_level: VerifierLogLevel,
 ) -> Result<crate::MockableFd, BtfError> {
     // HRABNAZ-PATCH(6): 见 vendor/aya/PATCHES.md
-    sanitize_btf_for_old_kernels(&mut raw_btf);
+    // 策略：先按原样装载；仅在老内核明确拒绝时才用兼容清洗版本重试一次。
+    // （无条件清洗会误伤部分 4.19 变体——QEMU 实测 Debian 4.19.0-20/21 拒收清洗版；
+    //  4.18 系则需要清洗才能过 kflag/空枚举名校验。重试策略同时覆盖两者，
+    //  现代内核原生即通过、根本不会被改写。）
     if let Some(path) = std::env::var_os("KS_DUMP_BTF") {
         let _ = std::fs::write(&path, &raw_btf);
     }
     let (ret, verifier_log) = retry_with_verifier_logs(10, |logger| {
         bpf_load_btf(raw_btf.as_slice(), logger, verifier_log_level)
     });
-    ret.map_err(|io_error| BtfError::LoadError {
-        io_error,
-        verifier_log,
-    })
+    match ret {
+        Ok(fd) => Ok(fd),
+        Err(first_err) => {
+            let mut fixed = raw_btf.clone();
+            sanitize_btf_for_old_kernels(&mut fixed);
+            if fixed == raw_btf {
+                return Err(BtfError::LoadError {
+                    io_error: first_err,
+                    verifier_log,
+                });
+            }
+            if let Some(path) = std::env::var_os("KS_DUMP_BTF") {
+                let dump = std::path::PathBuf::from(path).with_extension("sanitized.btf");
+                let _ = std::fs::write(dump, &fixed);
+            }
+            let (ret2, log2) = retry_with_verifier_logs(10, |logger| {
+                bpf_load_btf(fixed.as_slice(), logger, verifier_log_level)
+            });
+            ret2.map_err(|io_error| BtfError::LoadError {
+                io_error,
+                verifier_log: log2,
+            })
+        }
+    }
 }
 
 /// 让 BTF blob 能通过 4.18/4.19 内核的 BTF 校验器。

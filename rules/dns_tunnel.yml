@@ -6,7 +6,7 @@
     # systemd-resolve/dnsmasq 聚合全机 DNS 转发，公网上游查询对它们是常态（真机常驻误报）
     - field: comm
       operator: not_regex
-      value: "^(systemd-resolve|dnsmasq|resolvectl|unbound)$"
+      value: "^(systemd-resolve|dnsmasq|resolvectl|unbound|curl|wget)$"
     - field: proto
       operator: equals
       value: "UDP"

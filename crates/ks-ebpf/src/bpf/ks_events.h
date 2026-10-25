@@ -67,7 +67,7 @@ static __always_inline void fill_header(struct ks_event *hdr, u32 event_type) {
     hdr->_pad1       = 0;
     hdr->_pad2       = 0;
 
-    bpf_get_current_comm(&hdr->comm, sizeof(hdr->comm));
+    KS_WRITE_COMM(&hdr->comm, sizeof(hdr->comm));
 }
 
 static __always_inline int read_user_str(char *dst, int dst_len, const char __user *src) {

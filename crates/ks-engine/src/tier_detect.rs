@@ -90,9 +90,12 @@ fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
 fn tier_from_version(major: u32, minor: u32) -> Option<SourceKind> {
     if major > 5 || (major == 5 && minor >= 8) {
         Some(SourceKind::EbpfModern)
-    } else if major >= 4 {
+    } else if major > 4 || (major == 4 && minor >= 10) {
+        // BPF_MAP_TYPE_LRU_HASH 是 4.10 才有的内核特性；Legacy 档全部用 LRU map，
+        // 4.9 及更老 4.x 上建图直接 EINVAL（QEMU 实测 4.9.0-13 失败）。
+        // 这些内核改走 Ancient 档（非 LRU map + perfbuf，3.10 已长期验证）。
         Some(SourceKind::EbpfLegacy)
-    } else if major == 3 && minor >= 10 {
+    } else if major == 4 || (major == 3 && minor >= 10) {
         Some(SourceKind::EbpfAncient)
     } else {
         None
@@ -138,7 +141,10 @@ mod tests {
 
         assert_eq!(tier_from_version(5, 7), Some(SourceKind::EbpfLegacy));
 
-        assert_eq!(tier_from_version(4, 4), Some(SourceKind::EbpfLegacy));
+        // 4.10+ 才支持 BPF_MAP_TYPE_LRU_HASH：4.9 及更老 4.x 必须走非 LRU 的 Ancient 档
+        assert_eq!(tier_from_version(4, 9), Some(SourceKind::EbpfAncient));
+        assert_eq!(tier_from_version(4, 4), Some(SourceKind::EbpfAncient));
+        assert_eq!(tier_from_version(4, 10), Some(SourceKind::EbpfLegacy));
         assert_eq!(tier_from_version(4, 19), Some(SourceKind::EbpfLegacy));
 
         assert_eq!(tier_from_version(3, 10), Some(SourceKind::EbpfAncient));

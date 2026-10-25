@@ -134,7 +134,23 @@ pub(crate) fn bpf_create_map(
             .copy_from_slice(unsafe { mem::transmute::<&[u8], &[c_char]>(&name_bytes[..len]) });
     }
 
-    bpf_map_create(&mut attr)
+    // HRABNAZ-PATCH(7): 见 vendor/aya/PATCHES.md
+    // 部分老内核（QEMU 实测 Debian 4.19.0-20/21）对带 BTF 的 map 创建校验过严
+    //（对象 BTF 的类型被其回移校验器拒收 EINVAL）。map 的 BTF 只用于自省
+    //（bpftool 展示 key/value 类型），不影响 map 功能与探针逻辑，故带 BTF
+    // 创建失败时降级为不带 BTF 重试一次。
+    let had_btf = u.btf_fd != 0;
+    match bpf_map_create(&mut attr) {
+        Ok(fd) => Ok(fd),
+        Err(first_err) if !had_btf => Err(first_err),
+        Err(_) => {
+            let u = unsafe { &mut attr.__bindgen_anon_1 };
+            u.btf_fd = 0;
+            u.btf_key_type_id = 0;
+            u.btf_value_type_id = 0;
+            bpf_map_create(&mut attr)
+        }
+    }
 }
 
 pub(crate) fn bpf_pin_object(fd: BorrowedFd<'_>, path: &CStr) -> io::Result<()> {
