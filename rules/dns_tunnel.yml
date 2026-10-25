@@ -3,6 +3,10 @@
   description: "DNS 查询指向公网 DNS 服务器,若配合高频/长域名查询则为 DNS 隧道特征"
   severity: medium
   conditions:
+    # systemd-resolve/dnsmasq 聚合全机 DNS 转发，公网上游查询对它们是常态（真机常驻误报）
+    - field: comm
+      operator: not_regex
+      value: "^(systemd-resolve|dnsmasq|resolvectl|unbound)$"
     - field: proto
       operator: equals
       value: "UDP"

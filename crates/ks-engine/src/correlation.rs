@@ -12,6 +12,14 @@ pub enum CorrelationType {
         condition_a: CorrelationCondition,
         condition_b: CorrelationCondition,
     },
+    /// 单条件窗口内重复 ≥min_count 次才告警（频率型关联，如 DNS 隧道 60s≥50 次）。
+    /// 旧 DNS 规则用 Window(a=b=EventType) 表达，语义退化为"窗口内出现第 2 次"，
+    /// 单条 dig 的 A+AAAA 两查询即触发 high 告警（真机实测含 systemd-resolved 常驻误报）。
+    Repeat {
+        window_secs: u64,
+        min_count: usize,
+        condition: CorrelationCondition,
+    },
     Sequence {
         steps: Vec<CorrelationCondition>,
         max_gap_secs: u64,
@@ -40,6 +48,9 @@ pub enum CorrelationCondition {
     DaddrMatches(String),
     ArgsContains(String),
     And(Vec<CorrelationCondition>),
+    /// 取反：用于排除系统组件（如 DNS 规则排除 systemd-resolve/dnsmasq——
+    /// 它们聚合全机查询，任何频率模型对它们必然爆表）
+    Not(Box<CorrelationCondition>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +138,9 @@ pub struct CorrelationEngine {
     sequence_trackers: HashMap<(usize, u32), SequenceTracker>,
     max_trackers: usize,
     max_window_events: usize,
+    /// Repeat 规则的规则级冷却：流级频率告警（如 DNS 隧道）一阵爆发只应报一条；
+    /// 引擎级 (rule,pid) 节流挡不住它——每个越限事件都可能是不同 pid，逐个放行
+    repeat_last_fired: HashMap<String, std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +169,7 @@ impl CorrelationEngine {
             rules: Self::default_rules(),
             sequence_trackers: HashMap::new(),
             max_trackers: 10000,
+            repeat_last_fired: HashMap::new(),
             max_window_events: 2000,
         }
     }
@@ -272,12 +287,24 @@ impl CorrelationEngine {
             },
             CorrelationRule {
                 name: "DNS隧道: 高频DNS+可疑目标".to_string(),
-                correlation_type: CorrelationType::Window {
+                // 旧语义 Window(a=b=Event(24)) = 60s 内第 2 次查询即 high 告警：
+                // 单条 dig 的 A+AAAA 两查询、systemd-resolved 常驻流量全部误报（真机实测）。
+                // 改为 60s≥50 次（与 alert_message 宣称一致），并排除系统解析器——
+                // 它们聚合全机查询，逐进程频率模型对其必然爆表。
+                correlation_type: CorrelationType::Repeat {
                     window_secs: 60,
-                    condition_a: CorrelationCondition::EventType(24),
-                    condition_b: CorrelationCondition::EventType(24),
+                    min_count: 50,
+                    condition: CorrelationCondition::And(vec![
+                        CorrelationCondition::EventType(24),
+                        CorrelationCondition::Not(Box::new(CorrelationCondition::CommContains(
+                            "systemd-resolve".to_string(),
+                        ))),
+                        CorrelationCondition::Not(Box::new(CorrelationCondition::CommContains(
+                            "dnsmasq".to_string(),
+                        ))),
+                    ]),
                 },
-                description: "60秒内重复DNS查询".to_string(),
+                description: "60秒内≥50次DNS查询（排除系统解析器）".to_string(),
                 severity: "high".to_string(),
                 mitre: Some(MitreMapping {
                     tactic: "TA0011".to_string(),
@@ -369,37 +396,76 @@ impl CorrelationEngine {
         let mut alerts = Vec::new();
         // 只收集 (规则下标, window_secs, max_gap_secs) 标量，条件按需借自 self.rules，
         // 旧实现每事件把所有规则的 condition_a/b 与 steps 整个 Vec 深拷贝一遍
-        let rule_checks: Vec<(usize, u64, u64)> = self
+        enum Check {
+            Window(u64),
+            Sequence(u64),
+            Repeat(u64, usize),
+        }
+        let rule_checks: Vec<(usize, Check)> = self
             .rules
             .iter()
             .enumerate()
             .filter_map(|(i, rule)| match &rule.correlation_type {
-                CorrelationType::Window { window_secs, .. } => Some((i, *window_secs, 0)),
-                CorrelationType::Sequence { max_gap_secs, .. } => Some((i, 0, *max_gap_secs)),
+                CorrelationType::Window { window_secs, .. } => {
+                    Some((i, Check::Window(*window_secs)))
+                }
+                CorrelationType::Sequence { max_gap_secs, .. } => {
+                    Some((i, Check::Sequence(*max_gap_secs)))
+                }
+                CorrelationType::Repeat {
+                    window_secs,
+                    min_count,
+                    ..
+                } => Some((i, Check::Repeat(*window_secs, *min_count))),
                 CorrelationType::ProcessTree { .. } => None,
             })
             .collect();
 
-        for (rule_idx, window_secs, max_gap_secs) in rule_checks {
-            if window_secs > 0 {
-                if let CorrelationType::Window {
-                    condition_a,
-                    condition_b,
-                    ..
-                } = &self.rules[rule_idx].correlation_type
-                {
+        for (rule_idx, check) in rule_checks {
+            match check {
+                Check::Window(window_secs) => {
+                    if let CorrelationType::Window {
+                        condition_a,
+                        condition_b,
+                        ..
+                    } = &self.rules[rule_idx].correlation_type
+                    {
+                        if let Some(alert) = self.check_window_correlation(
+                            event,
+                            window_secs,
+                            condition_a,
+                            condition_b,
+                        ) {
+                            let rule = &self.rules[rule_idx];
+                            alerts.push(self.build_alert(rule, alert));
+                        }
+                    }
+                }
+                Check::Sequence(max_gap_secs) => {
                     if let Some(alert) =
-                        self.check_window_correlation(event, window_secs, condition_a, condition_b)
+                        self.check_sequence_correlation(event, rule_idx, max_gap_secs)
                     {
                         let rule = &self.rules[rule_idx];
                         alerts.push(self.build_alert(rule, alert));
                     }
                 }
-            } else if max_gap_secs > 0 {
-                if let Some(alert) = self.check_sequence_correlation(event, rule_idx, max_gap_secs)
-                {
+                Check::Repeat(window_secs, min_count) => {
                     let rule = &self.rules[rule_idx];
-                    alerts.push(self.build_alert(rule, alert));
+                    // 规则级冷却：窗口期内已报过就不再报（一阵爆发一条告警）
+                    if let Some(t) = self.repeat_last_fired.get(&rule.name) {
+                        if t.elapsed().as_secs() < window_secs {
+                            continue;
+                        }
+                    }
+                    if let CorrelationType::Repeat { condition, .. } = &rule.correlation_type {
+                        if let Some(alert) =
+                            self.check_repeat_correlation(event, window_secs, min_count, condition)
+                        {
+                            self.repeat_last_fired
+                                .insert(rule.name.clone(), std::time::Instant::now());
+                            alerts.push(self.build_alert(rule, alert));
+                        }
+                    }
                 }
             }
         }
@@ -511,6 +577,43 @@ impl CorrelationEngine {
             events: all_events,
             confidence: 0.8,
         })
+    }
+
+    fn check_repeat_correlation(
+        &self,
+        event: &DecodedEvent,
+        window_secs: u64,
+        min_count: usize,
+        condition: &CorrelationCondition,
+    ) -> Option<PartialAlert> {
+        if !matches_condition(event, condition) {
+            return None;
+        }
+        let window_ns = window_secs * 1_000_000_000;
+        let current_ts = event.header.timestamp_ns;
+        // 事件在 detect 入口已 push 进 event_window（含当前事件），这里只统计，勿再加一
+        let matched: Vec<&DecodedEvent> = self
+            .event_window
+            .iter()
+            .filter(|e| {
+                current_ts.saturating_sub(e.header.timestamp_ns) <= window_ns
+                    && matches_condition(e, condition)
+            })
+            .collect();
+        if matched.len() < min_count {
+            return None;
+        }
+        // 置信度随超出阈值的倍数增长：刚到阈值 0.7，两倍阈值封顶 1.0
+        let over = matched.len() as f64 / min_count as f64;
+        let confidence = (0.7 + (over - 1.0) * 0.3).min(1.0);
+        // 证据首元素 = 触发事件：to_alert() 用 events.first() 归属 pid/时间戳，
+        // 取窗口最老事件会让一阵爆发的多条告警被错误归到同一个旧 pid 上（真机实测 6 条同 pid 同毫秒）
+        let mut events: Vec<DecodedEvent> = Vec::with_capacity(10);
+        events.push(event.clone());
+        for e in matched.iter().rev().skip(1).take(9) {
+            events.push((*e).clone());
+        }
+        Some(PartialAlert { events, confidence })
     }
 
     fn check_window_correlation(
@@ -651,6 +754,7 @@ fn matches_condition(event: &DecodedEvent, condition: &CorrelationCondition) -> 
         }
         CorrelationCondition::ArgsContains(s) => event.args.as_ref().is_some_and(|a| a.contains(s)),
         CorrelationCondition::And(conds) => conds.iter().all(|c| matches_condition(event, c)),
+        CorrelationCondition::Not(inner) => !matches_condition(event, inner),
     }
 }
 
@@ -1107,5 +1211,93 @@ mod tests {
         assert_eq!(alert.process.pid, 0);
         assert_eq!(alert.process.comm, "unknown");
         assert_eq!(alert.timestamp_ns, 0);
+    }
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+    use ks_core::event::EventHeader;
+
+    fn dns_event(i: u64, comm: &str) -> DecodedEvent {
+        DecodedEvent {
+            seq: i,
+            header: EventHeader {
+                event_type: 24,
+                _pad1: 0,
+                timestamp_ns: i * 100_000_000,
+                pid: 7000,
+                tid: 7000,
+                uid: 0,
+                ppid: 1,
+                comm: {
+                    let mut b = [0u8; 16];
+                    b[..comm.len().min(16)].copy_from_slice(&comm.as_bytes()[..comm.len().min(16)]);
+                    b
+                },
+                syscall_nr: 0,
+                _pad2: 0,
+                retval: 0,
+            },
+            comm: comm.to_string(),
+            filename: None,
+            args: None,
+            saddr: None,
+            daddr: Some("100.100.2.136".into()),
+            sport: None,
+            dport: Some(53),
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
+        }
+    }
+
+    /// Repeat 语义：49 次不告警，第 50 次触发且归属触发者；冷却期内不再报；解析器永不计数
+    #[test]
+    fn dns_repeat_threshold_and_resolver_exclusion() {
+        let mut eng = CorrelationEngine::new(300);
+        for i in 0..49 {
+            assert!(
+                eng.detect_correlations(&dns_event(i, "dig")).is_empty(),
+                "第 {} 次（<50）不应告警",
+                i + 1
+            );
+        }
+        let fired = eng.detect_correlations(&dns_event(49, "dig"));
+        assert!(
+            fired.iter().any(|a| a.rule_name.contains("DNS隧道")),
+            "第 50 次应触发 DNS 隧道, 实际 {:?}",
+            fired.iter().map(|a| &a.rule_name).collect::<Vec<_>>()
+        );
+        // 归属：告警首事件应是触发事件（timestamp_ns == 第 50 条的），不是窗口最老事件
+        let a = fired
+            .iter()
+            .find(|a| a.rule_name.contains("DNS隧道"))
+            .unwrap();
+        assert_eq!(
+            a.events.first().unwrap().header.timestamp_ns,
+            49 * 100_000_000
+        );
+        // 冷却：越限后的后续事件在窗口期内不再重复报警
+        for i in 50..60 {
+            assert!(
+                eng.detect_correlations(&dns_event(i, "dig")).is_empty(),
+                "冷却期内第 {} 次不应再报",
+                i + 1
+            );
+        }
+
+        let mut eng2 = CorrelationEngine::new(300);
+        for i in 0..200 {
+            let a = eng2.detect_correlations(&dns_event(i, "systemd-resolve"));
+            assert!(a.is_empty(), "解析器查询不应计数告警");
+        }
     }
 }

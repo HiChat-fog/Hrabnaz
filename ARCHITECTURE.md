@@ -66,7 +66,7 @@
 | 层 | 选型 | 说明 |
 |---|---|---|
 | 内核态 | C（libbpf 风格头文件） | 2179 行，`SEC(...)` 显式挂载，CO-RE |
-| 加载器 | aya（vendor 2.3 万行 + 4 处补丁） | 纯 Rust 加载器 |
+| 加载器 | aya 0.14.0 vendor fork（+6 处老内核补丁，清单见 vendor/aya/PATCHES.md） | 纯 Rust 加载器，自维护不随上游 |
 | 用户态 | Rust stable | 引擎 + CLI，运行期 unsafe 0 处 |
 | 规则 | YAML | 14 个文件 40 条规则，加载期枚举校验 |
 | 取证 | JSONL + SHA-256 哈希链 | 链尾外置，BTreeMap 规范化序列化 |

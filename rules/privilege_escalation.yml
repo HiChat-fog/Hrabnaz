@@ -8,7 +8,8 @@
       value: "chmod"
     - field: args
       operator: regex
-      value: "(\\+s|u\\+s|4755|4[0-9]{3})"
+      # u+xs/g+xs 是 ART T1548.001 的标准写法，旧正则 (\+s|u\+s|4755) 匹配不到
+      value: "([ug]?\\+x?s|\\+s|4[0-9]{3})"
   alert_message: "检测到 chmod 设置 SUID 位操作，疑似提权行为"
   mitre_tactic: "TA0004"
   mitre_technique: "T1548.001"

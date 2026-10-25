@@ -305,10 +305,7 @@ impl ForensicLogger {
         let archive_path = self.log_dir.join(&archive_name);
         std::fs::rename(&self.path, &archive_path)?;
 
-        let new_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let new_file = open_private(&self.path, true)?;
         self.writer = BufWriter::with_capacity(65536, new_file);
         self.current_file_size = 0;
         log::info!("日志轮转: 归档至 {}", archive_path.display());
@@ -923,6 +920,30 @@ mod tests {
             logger.flush().unwrap();
         }
         assert!(path.exists());
+    }
+
+    /// 轮转新建的活跃文件必须保持 0600：旧实现在此处用裸 OpenOptions，
+    /// 每次按大小轮转后新文件以默认 umask（0644）落地，契约被静默破坏
+    #[test]
+    #[cfg(unix)]
+    fn test_rotated_active_file_keeps_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events_20261024.jsonl");
+        let config = RotationConfig {
+            max_file_size: 500,
+            retain_days: 30,
+            compress_archives: false,
+        };
+        {
+            let mut logger = ForensicLogger::with_rotation(path.clone(), config).unwrap();
+            for i in 1..=50 {
+                logger.log_event(&make_event(i, 100)).unwrap();
+            }
+            logger.flush().unwrap();
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "轮转新建的活跃文件应为 0600，实际 {:o}", mode);
     }
 
     /// 手工追加一条链记录：与 log_event 相同的规范化哈希

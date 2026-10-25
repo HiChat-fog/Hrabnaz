@@ -8,6 +8,10 @@
   description: "对 authorized_keys 的写入/删除/打开（root 的 open 事件经 /root/.ssh 风险加成放行）"
   severity: critical
   conditions:
+    # sshd 每次公钥认证都会读 authorized_keys（真机实测每次 root 登录一条 critical 误报）
+    - field: comm
+      operator: not_regex
+      value: "^sshd$"
     - field: filename
       operator: contains
       value: "authorized_keys"

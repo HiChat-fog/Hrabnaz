@@ -164,6 +164,8 @@ pub struct EngineStats {
     pub anomaly_alerts: u64,
     /// 被去重窗口压掉的告警数（仅观测用；压制策略见 AlertThrottle）
     pub suppressed_alerts: u64,
+    /// 自身进程事件丢弃数：取证写入/gzip 线程与引擎同 tgid，不丢弃会自反馈
+    pub self_events_dropped: u64,
 }
 
 pub struct ShutdownSummary {
@@ -507,6 +509,9 @@ pub struct Engine {
     block_ttl: u64,
     block_severity_threshold: String,
     protected_pids: HashSet<u32>,
+    /// 引擎自身 tgid（含 tokio 写入线程与 gzip 线程）：事件头 pid 即 tgid，
+    /// 与之相同的事件在进任何消费方之前整条丢弃
+    self_tgid: u32,
     block_pinned: bool,
     info: EngineInfo,
     hot_reload_task: tokio::task::JoinHandle<()>,
@@ -789,6 +794,7 @@ impl Engine {
             block_ttl,
             block_severity_threshold,
             protected_pids,
+            self_tgid: std::process::id(),
             block_pinned: info.block_channel.is_some(),
             info,
             hot_reload_task,
@@ -894,6 +900,16 @@ impl Engine {
         prof_add(0, t.elapsed().as_nanos() as u64);
         let is_protected = self.protected_pids.contains(&event.header.pid);
         self.stats.consumed += 1;
+
+        // 自排除（根因修复）：取证写入线程（tokio worker）与 gzip 线程与引擎同
+        // tgid，vfs_write 探针会把"写取证日志"本身再记成 FILE_WRITE 事件并写进
+        // 日志，形成自反馈——真机实测 5 分钟 11 万条自写事件、日志以 ~300KB/s
+        // 自噬。事件头 pid 即 tgid（bpf_get_current_pid_tgid >> 32），等于自身
+        // 进程号的事件在进取证/基线/规则之前整条丢弃，环路增益归零。
+        if event.header.pid == self.self_tgid {
+            self.stats.self_events_dropped += 1;
+            return Ok(effects);
+        }
 
         let t = Instant::now();
         self.forensic_sink.log_event(&event).await;
@@ -1245,6 +1261,84 @@ mod tests {
         assert!(!severity_meets_threshold(&Severity::High, "critical"));
         assert!(severity_meets_threshold(&Severity::High, "high"));
         assert!(severity_meets_threshold(&Severity::Low, "low"));
+    }
+
+    fn file_write_bytes(pid: u32) -> Vec<u8> {
+        use ks_core::event::{EventHeader, FileEvent};
+        use zerocopy::IntoBytes as _;
+        let ev = FileEvent {
+            header: EventHeader {
+                event_type: 12, // FILE_WRITE
+                _pad1: 0,
+                timestamp_ns: 1,
+                pid,
+                tid: pid,
+                uid: 0,
+                ppid: 1,
+                comm: {
+                    let mut b = [0u8; 16];
+                    b[..8].copy_from_slice(b"tokio-rt");
+                    b
+                },
+                syscall_nr: 1,
+                _pad2: 0,
+                retval: 0,
+            },
+            filename: {
+                let mut b = [0u8; 256];
+                let p = b"/var/log/kernelsentinel/events_test.jsonl";
+                b[..p.len()].copy_from_slice(p);
+                b
+            },
+            bytes: 65536,
+            fd: 3,
+            flags: 0,
+        };
+        ev.as_bytes().to_vec()
+    }
+
+    /// 自排除回归：pid == 自身 tgid 的事件（取证写入线程产生的 FILE_WRITE）
+    /// 不得进入任何消费方——否则"写日志"被记成事件、事件又被写进日志，
+    /// 自反馈把日志灌成自噬流（真机实测 5min 11 万条自写事件）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_engine_drops_own_process_events() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules");
+        let options = EngineOptions {
+            config: Config::default(),
+            rules_dir: rules.to_string_lossy().to_string(),
+            log_dir: dir.path().to_string_lossy().to_string(),
+            source: EventSourceSpec::Provided(
+                Box::new(MockEventSource::new_with_scenario(MockScenario::All)),
+                None,
+            ),
+            heartbeat_path: None,
+            ml_observe_sec: None,
+        };
+        let mut engine = Engine::start(options).await.unwrap();
+        let forensic_path = engine.info().forensic_path.clone();
+
+        // 自身 tgid 的事件：消费但不落链、不产效果
+        let out = engine
+            .process_event(&file_write_bytes(std::process::id()))
+            .await
+            .unwrap();
+        assert_eq!(out.effects.len(), 0);
+        assert_eq!(engine.stats().self_events_dropped, 1);
+
+        // 其他进程的同一事件：正常落链
+        let out = engine.process_event(&file_write_bytes(4242)).await.unwrap();
+        assert_eq!(out.consumed, 1);
+
+        engine.shutdown().await.unwrap();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&forensic_path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"type\":\"event\""))
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(lines.len(), 1, "只有非自身事件应入链");
+        assert_eq!(lines[0]["pid"].as_u64(), Some(4242));
     }
 
     /// 引擎 e2e：Provided mock（无需 root/内核）走完整主链——

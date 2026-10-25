@@ -543,7 +543,13 @@ mod tests {
 
     #[test]
     fn test_high_freq_env_extension() {
-        std::env::set_var("KS_BASELINE_HIGHFREQ", "kubelet, my-worker ,");
+        // 部署环境专属 comm（云盾/伴生控制台/tokio worker/rsyslog 模块）由部署方经
+        // KS_BASELINE_HIGHFREQ 配置——默认名单只放普适项，不得回退成硬编码。
+        // 注：同进程内多个测试会并行抢该环境变量，相关断言必须集中在同一个测试里。
+        std::env::set_var(
+            "KS_BASELINE_HIGHFREQ",
+            "kubelet, my-worker , AliYunDun, hlidskjalf-serv, tokio-rt-worker, in:imjournal",
+        );
         let comms = inherently_high_freq_comms();
         std::env::remove_var("KS_BASELINE_HIGHFREQ");
         // 默认条目保留 + 环境变量扩展（去空格、忽略空段）
@@ -551,5 +557,20 @@ mod tests {
         assert!(comms.iter().any(|c| c == "kubelet"));
         assert!(comms.iter().any(|c| c == "my-worker"));
         assert_eq!(comms.iter().filter(|c| c.is_empty()).count(), 0);
+        // 真机实测形态全覆盖：15 字节截断 + 子串匹配变体
+        assert!(is_inherently_high_freq_comm(&comms, "AliYunDunMonito"));
+        assert!(is_inherently_high_freq_comm(&comms, "hlidskjalf-serv"));
+        assert!(is_inherently_high_freq_comm(&comms, "tokio-rt-worker"));
+        assert!(is_inherently_high_freq_comm(&comms, "in:imjournal"));
+        assert!(
+            is_inherently_high_freq_comm(&comms, "crond"),
+            "cron 子串覆盖 crond"
+        );
+        assert!(is_inherently_high_freq_comm(&comms, "systemd-journal"));
+        // 未配置时默认名单不得命中部署专属 comm
+        assert!(!INHERENTLY_HIGH_FREQ.iter().any(|c| {
+            "aliyundunmonito".contains(&c.to_lowercase())
+                || "tokio-rt-worker".contains(&c.to_lowercase())
+        }));
     }
 }

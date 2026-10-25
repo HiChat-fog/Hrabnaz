@@ -84,6 +84,16 @@ static __always_inline int ks_exe_path_suspicious(void) {
 
 static __always_inline int infer_sensitive_file(const char *filename, u32 pid) {
     if (!filename) return 0;
+    /*
+     * 低敏放行（只穿透智能过滤，不加分）：FILE_OPEN/READ 对低风险进程默认丢弃，
+     * 而 /etc/ 与 /boot/ 下的路径是配置篡改类规则（cron.d、sudoers、/boot 启动文件）
+     * 的唯一信号源——不在这里放行，那些用户态规则对新起进程永远等不到事件
+     * （ART T1053.003 真机实测：写 /etc/cron.d 零告警，规则层本地可达）。
+     * 不加分的原因：/etc 读取是正常运维高频行为，加分会把长跑进程误推过风险阈值；
+     * 分支放在具体路径之后，避免短路 shadow/gshadow/sudoers 的加分。
+     * /home 下 authorized_keys/id_rsa 需要后缀匹配，3.10 verifier 无循环支持做不了，
+     * 列入 H-2；当前以 /root/.ssh 前缀覆盖 root 场景。
+     */
     if (filename[0]=='/' && filename[1]=='e' && filename[2]=='t' &&
         filename[3]=='c' && filename[4]=='/' && filename[5]=='s' &&
         filename[6]=='h' && filename[7]=='a' && filename[8]=='d' &&
@@ -107,6 +117,14 @@ static __always_inline int infer_sensitive_file(const char *filename, u32 pid) {
         filename[6]=='.' && filename[7]=='s' && filename[8]=='s' &&
         filename[9]=='h') {
         add_risk(pid, 30); return 1;
+    }
+    if (filename[0]=='/' && filename[1]=='e' && filename[2]=='t' &&
+        filename[3]=='c' && filename[4]=='/') {
+        return 1;
+    }
+    if (filename[0]=='/' && filename[1]=='b' && filename[2]=='o' &&
+        filename[3]=='o' && filename[4]=='t' && filename[5]=='/') {
+        return 1;
     }
     return 0;
 }

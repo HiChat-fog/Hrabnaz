@@ -14,6 +14,13 @@
   description: "检测对 /etc/shadow 等敏感系统文件的访问"
   severity: high
   conditions:
+    # cron(PAM 认证)/systemd 合读 shadow 属正常运维行为（真机 1 小时 18 条误报）；
+    # 攻击进程 comm 不会是 cron/systemd，此排除不弱化检测
+    - field: comm
+      operator: not_regex
+      # 真机实测：cron(PAM 认证)/crond(CentOS 名)/systemd(ProcFS 显示带括号)/sshd(PAM)
+      # 合法读 shadow 都属正常认证行为，一小时可产生 30+ 条 high 误报
+      value: "^(cron|crond|CRON|\\(?systemd\\)?|sshd)$"
     - field: filename
       operator: contains
       value: "/etc/shadow"

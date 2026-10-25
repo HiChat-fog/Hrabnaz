@@ -1268,6 +1268,7 @@ fn load_btf(
     mut raw_btf: Vec<u8>,
     verifier_log_level: VerifierLogLevel,
 ) -> Result<crate::MockableFd, BtfError> {
+    // HRABNAZ-PATCH(6): 见 vendor/aya/PATCHES.md
     sanitize_btf_for_old_kernels(&mut raw_btf);
     if let Some(path) = std::env::var_os("KS_DUMP_BTF") {
         let _ = std::fs::write(&path, &raw_btf);

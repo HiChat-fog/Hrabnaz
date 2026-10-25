@@ -71,7 +71,8 @@ impl Link for PerfLink {
         let Self { perf_fd, event } = self;
         let _unused: io::Result<()> =
             perf_event_ioctl(perf_fd.as_fd(), PerfEventIoctlRequest::Disable);
-        // vendor patch: 必须先关 perf fd 再删 tracefs 条目。<4.17 的内核
+        // HRABNAZ-PATCH(3): 见 vendor/aya/PATCHES.md
+        // 必须先关 perf fd 再删 tracefs 条目。<4.17 的内核
         // （走 debugfs 建条目的路径）在条目仍被 perf event 引用时返回 EBUSY
         // ——实测 3.10 上写成 "-:kprobes/<tag>" 报 "设备或资源忙"，删除静默失败，
         // 每次退出都留一批 aya_<pid>_* 条目。
@@ -94,7 +95,8 @@ pub(crate) fn perf_attach(
     if cookie.is_some() && (!is_bpf_cookie_supported() || !FEATURES.bpf_perf_link()) {
         return Err(ProgramError::AttachCookieNotSupported);
     }
-    // vendor patch: 强制走老式 PERF_EVENT_IOC_SET_BPF，绕过 bpf(BPF_LINK_CREATE)。
+    // HRABNAZ-PATCH(4): 见 vendor/aya/PATCHES.md
+    // 强制走老式 PERF_EVENT_IOC_SET_BPF，绕过 bpf(BPF_LINK_CREATE)。
     // 背景是在5.15 KVM上调试modern tier时曾观察到LINK_CREATE路径异常，统一改用
     // SET_BPF后3.10(nobtf C loader)/5.15(modern aya)两路均验证稳定。cookie依赖
     // bpf_perf_link，禁用link_create则cookie不可用（当前探针不使用cookie）。
@@ -128,7 +130,8 @@ fn perf_attach_either(
         }
     })?;
 
-    // vendor patch: 不再 disarm。上游在这里关掉 ProbeEvent 的 RAII 守卫，条目在
+    // HRABNAZ-PATCH(5): 见 vendor/aya/PATCHES.md
+    // 不再 disarm。上游在这里关掉 ProbeEvent 的 RAII 守卫，条目在
     // PerfLink 存活期不会被误删，但 PerfLink 没有 Drop 实现，条目就再没人删——
     // <4.17 的 debugfs 路径（3.10 等老内核）上每次启动都往 kprobe_events 留一批
     // aya_<pid>_* 残留。保持守卫有效即可：PerfLink drop 时先关 perf 事件

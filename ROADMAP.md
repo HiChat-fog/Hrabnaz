@@ -15,17 +15,22 @@
 | H-1.5 ✅ | **规则文件完整性校验缺失** | root 可篡改 YAML 将 enforce 改 audit（威胁模型内 root 是管理者，但纵深上应有防线） | 加载时对规则集做哈希比对，基线哈希由部署方保管；不一致时告警并可选拒载 | 篡改规则后启动产生完整性告警（2026-10-15 完成：rules_integrity 模块——目录指纹（文件名+逐文件 SHA-256 组合，重命名/删文件必变）+ `ks rules-digest` 子命令生成基线 + KS_RULES_DIGEST 环境比对；MISMATCH 产生 High 审计告警进取证哈希链留痕，KS_RULES_DIGEST_STRICT=1 拒绝启动；热加载同步落快照；快照常落 rules_integrity.log 供无基线回溯。真机 6.1 验证：MISMATCH 告警落链 ✓；+4 单测） |
 | H-1.6 ✅ | **watchdog 缺失** | 引擎被 kill 后用户态检测与 killer 失效，内核探针残留空转（systemd Restart 可拉起，但停机窗口无覆盖） | 探针活性自检（ringbuf 消费心跳）+ 可选独立守护进程 | kill 引擎后 ≤N 秒自动恢复消费（2026-10-15 完成：引擎主循环 10s 原子写心跳文件（/run/kernelsentinel/ks-heartbeat.json，含 pid/时间戳/消费数，退出清理）；`ks watchdog` 子命令读心跳判停摆（默认 60s=6 周期），SIGTERM 前做 /proc 身份校验（复用 stop 同款判定防 PID 复用误杀），--dry-run 巡检模式；deploy/ 新增 kernelsentinel-watchdog.service+timer（每分钟巡检，KS_WITH_WATCHDOG=1 安装启用），systemd Restart 闭环=停摆后 ≤1min 恢复消费。真机 6.1 验证：心跳文件 ✓ watchdog 心跳正常判定 ✓） |
 
-### H-2 架构主线：aya 上游化与 BTF 内嵌正式化
+### H-2 架构主线：aya vendor fork 定型与 BTF 内嵌正式化
 
-3.10 真机已证明 CO-RE 重定位可完全在用户态完成，内核侧 BTF 支持并非必要条件，这项能力如果有可能则应回到上游生态本体。
+3.10 真机已证明 CO-RE 重定位可完全在用户态完成，内核侧 BTF 支持并非必要条件。
 
-- **路径 A（并行）：aya 上游化**
-  - 三层 vendor 补丁整理成可提交系列：老内核 BTF 清洗（kind_flag/位域结构/空枚举值名）、BPF_PROG_LOAD 字段按 5.0 门控、<4.17 kprobe 条目先关 perf fd 再删的 EBUSY 修复
-  - PR #1751（无 BTF 场景 map 创建修复）跟进评审直至合并
-  - H-1 修复中产生的新补丁随修随提
+- **路径 A（2026-10-24 定型）：aya vendor fork 为正式策略，上游化降为机会性**
+  - 决策依据：本地补丁全部是老内核（3.10~4.19）加载路径修改，aya 上游只服务现代内核、
+    不收也不维护这类兼容；跟随上游升级反而要重放补丁面，纯负债
+  - 已落地：与 crates.io 原版 0.14.0 全量 diff 核对，6 处补丁逐一登记进
+    vendor/aya/PATCHES.md（改了什么/为什么/影响内核/可上游化评估），代码处统一
+    HRABNAZ-PATCH(n) 标记
+  - 升级纪律：默认不升级；仅 cargo audit 命中 aya 通告、或上游出现目标内核关键修复时
+    手动 cherry-pick。通用性修复（如 BPF_PROG_LOAD 字段门控）可顺手提上游，不作目标
 - **路径 B（优先）：自主 BTF 内嵌正式化**
   - 保持零依赖交付形态：BTF 采集在构建期完成（按发行版 release 采集或由 debuginfo+pahole 现场生成），裁剪后随单二进制发布，加载时按内核版本自动选取
-- **共同收尾**：vanilla 4.4/4.9（Debian 9/Ubuntu 16.04 世代）下限验证；Ubuntu 4.15/5.4、RHEL8/9 等常见企业内核 BTF 预埋扩容（每份约十分钟接入，等价性测试自动验证）；nobtf 编译档与 C loader 退役
+  - 扩容批次（2026-10-24 规划）：一批 RHEL8 4.18 + Ubuntu 5.4（管道现成，成本低）；二批 4.9/4.4 下限（配合 QEMU 实机验证）；三批 3.10 点版本别名（用现有 BTF 对其它 3.10.0-1160.x 跑重定位比对，等价才显式登记，不做隐式通配）。现代内核不内嵌（宿主自带 /sys/kernel/btf/vmlinux）
+- **共同收尾**：vanilla 4.4/4.9（Debian 9/Ubuntu 16.04 世代）下限验证；nobtf 编译档与 C loader 退役
 
 ### H-3 吞吐优化与性能基准 ✅ (2026-10-15 代码完成+真机对照)
 
@@ -40,7 +45,7 @@
 ### H-4 质量与长稳
 
 - **unsafe 收敛 ✅ (2026-10-16)**：运行时 unsafe 20 处 → **8 处**（sys.rs 6 个 libc FFI 块 + linux_map_reader 2 个 aya Pod 声明），业务代码零 unsafe。聚合器字节流解析用固定偏移手工提取替代 union 指针读（union 删除，逐字段下界检查越界置 0）；测试/回放编码走 zerocopy IntoBytes（含显式化尾部对齐填充）；libc 边界收拢 `ks-engine/src/sys.rs`（CLI 经依赖复用，FFI 只剩一份）。等价性：mock 前 300 条告警序列逐字段一致、告警率 1.3510→1.3520；真机双机 15 万+ 真实 eBPF 字节走安全解码，H-2/H-3 回归正常。187 测试全绿。后续剩余 8 处也已归零：libc 边界改走 nix 安全封装，`linux_map_reader` 的 Pod 声明删除（aya 对 `[u8; N]` 自带实现）；当前全仓库 `unsafe {` 为 0。
-- **检出率校准**：Atomic Red Team 公开样本库跑规则集对应 T 编号，检出率从"场景命中"升级为可复现量化指标；48h 真实业务基线人工标注测 FPR（目标 <10 条/天/台）
+- **检出率校准（进行中 2026-10-24）**：ART 两层法已落地——规则层本地复现测试 `tests/art_rule_repro.rs`（8/8 可达，揪出 SUID 正则漏 `u+xs` 已修）+ 6.1 真机矩阵（dns 频率/LKM+阻断闭环已确认命中，负样本零误报）；揭示内核敏感路径表过窄（cron.d/id_rsa/非 root authorized_keys 的事件对低风险进程被 FILE_OPEN 默认丢弃）、FILE_WRITE ≥1024B 门槛、勒索扩展名缺 .enc 等缺口（详见 ks-test-evidence/art-2026-10-24/）；另修复两个 H-1 级 bug：轮转后活跃文件 0644、引擎自反馈（自写事件 11 万条/5min，修复后写入量 −93~97%）。第二轮（同日）已完成 K1 内核敏感路径扩充（/etc//boot/ 前缀放行，cron.d 双机 MISS→HIT，零稳态代价）、DNS 关联重写为 Repeat 60s≥50 次 + 解析器排除（新增 CorrelationType::Repeat 与 Not 条件）、FPR 白名单三批（sshd/crond/(systemd)/cron），全部双机部署验证；3.10 真实业务机 FPR 基线 109/h（主项已清），48h 复测协议已启。同日收尾：Repeat 归属修复+规则级冷却（60 连发仅 1 条告警）、gzip 自触发观察关闭（0 复发）、伴生基础设施白名单走部署方自配（双机 systemd drop-in 配 KS_BASELINE_HIGHFREQ，编译期默认名单保持普适项），双机验证零行为误报。剩余待查：base64/LD_PRELOAD 规则形态缺口（K6，需 envp 捕获）、/home 后缀匹配（H-2）、风暴期跨文件重复写入（未复现挂起）
 - **长稳矩阵**：4.19 补入 systemd 长稳 soak（本地 QEMU），与 3.10、6.1 同标准验收；3.10/6.1 现有常驻继续积累运行时长
 
 ### H-5 新探针贡献架构：单一来源注册表 ✅ (2026-10-17)

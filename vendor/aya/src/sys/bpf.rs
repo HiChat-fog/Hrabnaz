@@ -107,6 +107,7 @@ pub(crate) fn bpf_create_map(
             _ => {
                 let btf_fd_raw = btf_fd.map(|fd| fd.as_raw_fd()).unwrap_or_default() as u32;
                 if btf_fd_raw == 0 {
+                    // HRABNAZ-PATCH(1): 见 vendor/aya/PATCHES.md
                     // No BTF loaded into kernel (e.g. 3.10 stock kernel without
                     // CONFIG_DEBUG_INFO_BTF). Zero out type IDs to avoid EINVAL
                     // from kernels that reject non-zero btf_*_type_id with
@@ -202,6 +203,7 @@ pub(crate) fn bpf_load_program(
     let line_info_buf = aya_attr.line_info.line_info_bytes();
     let func_info_buf = aya_attr.func_info.func_info_bytes();
 
+    // HRABNAZ-PATCH(2): 见 vendor/aya/PATCHES.md
     // prog_btf_fd / func_info / line_info 的 attr 字段都是 5.0 才有的；
     // 4.x 内核上这些尾部非零字节会让 BPF_PROG_LOAD 返回 E2BIG
     // （"Argument list too long"）。CO-RE 重定位在用户态已完成，
