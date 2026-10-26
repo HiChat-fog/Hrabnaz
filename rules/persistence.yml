@@ -2,7 +2,8 @@
 # 持久化检测 — 依赖的传感器面：
 #   exec args (event_type=1, 全量放行) / 文件写删 (12/13, kprobe 路径全量放行)
 #   文件打开 (10) 仅 /etc/shadow、/etc/gshadow、/etc/sudoers、/root/.ssh 前缀放行（内核 infer_sensitive_file）
-# 注意：vfs_write 只上报 >=1024 字节的写入，小文件编辑走 exec args 检测
+# 注意：vfs_write 只上报 >=1024 字节的写入；crontab 修改任务表走临时文件 + rename，
+# 由 FILE_RENAME 的 rename 目标路径捕获
 
 - name: "SSH后门公钥注入"
   description: "对 authorized_keys 的写入/删除/打开（root 的 open 事件经 /root/.ssh 风险加成放行）"
@@ -30,14 +31,35 @@
   mitre_tactic: "TA0003"
   mitre_technique: "T1543.002"
 
-- name: "crontab命令持久化"
-  description: "crontab 命令编辑定时任务（echo x | crontab - / crontab -e），小文件编辑写事件不可见，依赖 exec 事件"
+- name: "用户定时任务表修改"
+  description: "crontab 先写临时文件再 rename 覆盖任务表；Debian 在 /var/spool/cron 下使用相对路径 rename，故按进程名判定"
   severity: high
   conditions:
+    - field: event_type
+      operator: equals
+      value: "14"
     - field: comm
       operator: equals
       value: "crontab"
-  alert_message: "检测到 crontab 定时任务编辑操作，疑似持久化"
+  alert_message: "检测到用户定时任务表被替换，疑似持久化"
+  mitre_tactic: "TA0003"
+  mitre_technique: "T1053.003"
+
+- name: "定时任务表替换"
+  description: "任意进程以绝对路径 rename 覆盖 /var/spool/cron 下的任务表（CentOS 与 Debian 目录布局）"
+  severity: high
+  conditions:
+    - field: event_type
+      operator: equals
+      value: "14"
+    # 同一次 crontab 修改在 CentOS 上既是 crontab 的 rename 又命中绝对路径
+    - field: comm
+      operator: not_regex
+      value: "^crontab$"
+    - field: filename
+      operator: regex
+      value: "^/var/spool/cron/(crontabs/)?[^/]+$"
+  alert_message: "检测到任务表被替换，疑似持久化"
   mitre_tactic: "TA0003"
   mitre_technique: "T1053.003"
 

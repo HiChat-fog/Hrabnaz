@@ -62,9 +62,13 @@
   description: "检测向 /etc/crontab 或 cron.d 目录写入定时任务"
   severity: high
   conditions:
+    # cron/crond 在任务表变化后会重读 /etc/crontab 与 /etc/cron.d
+    - field: comm
+      operator: not_regex
+      value: "^(cron|crond)$"
     - field: filename
       operator: regex
-      value: "^/etc/cron(tab|\\.d/)"
+      value: "^/etc/cron(tab|\\.d/|\\.(daily|hourly|weekly|monthly)/)"
   alert_message: "检测到修改系统定时任务配置，可能是持久化或提权组合攻击"
   mitre_tactic: "TA0003"
   mitre_technique: "T1053.003"

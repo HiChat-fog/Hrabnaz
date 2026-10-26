@@ -3,10 +3,10 @@
   description: "DNS 查询指向公网 DNS 服务器,若配合高频/长域名查询则为 DNS 隧道特征"
   severity: medium
   conditions:
-    # systemd-resolve/dnsmasq 聚合全机 DNS 转发，公网上游查询对它们是常态（真机常驻误报）
+    # 本地解析器与诊断工具的公网查询是常态；binds 的 dig 以 isc-net-* 线程名上报
     - field: comm
       operator: not_regex
-      value: "^(systemd-resolve|dnsmasq|resolvectl|unbound|curl|wget)$"
+      value: "^(systemd-resolve|dnsmasq|resolvectl|unbound|curl|wget|dig|host|nslookup|isc-net.*)$"
     - field: proto
       operator: equals
       value: "UDP"
@@ -15,7 +15,8 @@
       value: "53"
     - field: daddr
       operator: not_regex
-      value: "^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|0\\.0\\.0\\.0|::1|fe80:)"
+      # 100.64.0.0/10 是共享地址段（RFC 6598），阿里云内部 DNS 100.100.2.136 属于此段
+      value: "^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|0\\.0\\.0\\.0|100\\.(6[4-9]|[7-9][0-9]|1[0-2][0-9])\\.|::1|fe80:)"
   alert_message: "DNS 查询指向公网 DNS 服务器,若同一进程伴随高频(60s>50次)或超长域名查询则疑似 DNS 隧道,需结合内核频率计数与关联引擎告警排查"
   mitre_tactic: "TA0011"
   mitre_technique: "T1071.004"

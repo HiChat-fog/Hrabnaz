@@ -10,7 +10,7 @@
 //!     到不了这里；
 //!   - FILE_WRITE 有 ≥1024B 门槛。
 
-use ks_core::event::{EventHeader, ExecEvent, FileEvent};
+use ks_core::event::{EbpfTamperEvent, EventHeader, ExecEvent, FileEvent, NetEvent};
 use ks_engine::config::Config;
 use ks_engine::engine::{Engine, EngineEffect, EngineOptions, EventSourceSpec};
 use ks_engine::event_source::{MockEventSource, MockScenario};
@@ -34,15 +34,54 @@ fn header(event_type: u32, pid: u32, comm: &str) -> EventHeader {
     }
 }
 
-fn file_open(pid: u32, comm: &str, path: &str) -> Vec<u8> {
+fn file_event(event_type: u32, pid: u32, comm: &str, path: &str) -> Vec<u8> {
     let mut f = [0u8; 256];
     f[..path.len()].copy_from_slice(path.as_bytes());
     FileEvent {
-        header: header(10, pid, comm),
+        header: header(event_type, pid, comm),
         filename: f,
         bytes: 0,
         fd: 3,
         flags: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+fn file_open(pid: u32, comm: &str, path: &str) -> Vec<u8> {
+    file_event(10, pid, comm, path)
+}
+
+fn tamper_event(pid: u32, comm: &str) -> Vec<u8> {
+    let mut c = [0u8; 16];
+    c[..comm.len().min(16)].copy_from_slice(&comm.as_bytes()[..comm.len().min(16)]);
+    EbpfTamperEvent {
+        header: header(82, pid, comm),
+        pid,
+        uid: 0,
+        _pad_self1: 0,
+        prog_name: [0u8; 64],
+        comm: c,
+        action: [0u8; 16],
+        _pad_self2: [0u8; 4],
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+fn net_dns(pid: u32, comm: &str, daddr: &str) -> Vec<u8> {
+    let p: Vec<u8> = daddr.split('.').filter_map(|x| x.parse().ok()).collect();
+    NetEvent {
+        header: header(24, pid, comm),
+        saddr: u32::from_ne_bytes([192, 168, 1, 50]),
+        daddr: u32::from_ne_bytes([p[0], p[1], p[2], p[3]]),
+        sport: 53000,
+        dport: 53,
+        proto: 17,
+        family: 2,
+        saddr6: [0u8; 16],
+        daddr6: [0u8; 16],
+        _pad3: [0u8; 2],
     }
     .as_bytes()
     .to_vec()
@@ -102,6 +141,21 @@ async fn art_rule_layer_repro() {
             &["Cron 定时任务持久化"],
         ),
         (
+            "T1053.003 cron.daily 写入",
+            file_open(9114, "bash", "/etc/cron.daily/art-cron"),
+            &["Cron 定时任务持久化"],
+        ),
+        (
+            "T1486 .enc 加密后缀",
+            file_open(9115, "openssl", "/tmp/art-secret.enc"),
+            &["勒索软件加密行为"],
+        ),
+        (
+            "T1562 bpftool 释放程序",
+            tamper_event(9116, "bpftool"),
+            &["eBPF 程序篡改检测"],
+        ),
+        (
             "T1136.001 useradd",
             exec(
                 9105,
@@ -124,6 +178,50 @@ async fn art_rule_layer_repro() {
             "T1140 base64 -d",
             exec(9108, "bash", "echo aGF4 | base64 -d"),
             &["base64解码执行"],
+        ),
+        (
+            "T1053.003 crontab 替换 (Debian 相对路径)",
+            file_event(14, 9109, "crontab", "crontabs/root"),
+            &["用户定时任务表修改"],
+        ),
+        (
+            "T1053.003 mv 替换 (CentOS 绝对路径)",
+            file_event(14, 9110, "mv", "/var/spool/cron/root"),
+            &["定时任务表替换"],
+        ),
+        (
+            "T1053.003 mv 替换 (Debian 绝对路径)",
+            file_event(14, 9111, "mv", "/var/spool/cron/crontabs/www-data"),
+            &["定时任务表替换"],
+        ),
+        (
+            "T1071.004 公网 DNS 查询",
+            net_dns(9113, "bash", "8.8.8.8"),
+            &["dns_tunnel_suspicious_domain"],
+        ),
+        (
+            "T1105 第 6 参数落地 /tmp",
+            exec(
+                9117,
+                "curl",
+                "-s -m 2 -o /tmp/art_payload http://127.0.0.1:8000/",
+            ),
+            &["载荷下载落地tmp"],
+        ),
+        (
+            "T1552.004 ssh id_rsa",
+            file_open(9118, "cat", "/root/.ssh/id_rsa"),
+            &["SSH私钥文件访问"],
+        ),
+        (
+            "T1552.004 ssh .pem 私钥",
+            file_open(9119, "cat", "/root/.ssh/aws.pem"),
+            &["SSH私钥文件访问"],
+        ),
+        (
+            "T1552.004 ssh host key",
+            file_open(9120, "cat", "/etc/ssh/ssh_host_rsa_key"),
+            &["SSH私钥文件访问"],
         ),
     ];
 
@@ -160,6 +258,45 @@ async fn art_rule_layer_repro() {
             "FPR (systemd) 读 shadow",
             file_open(9205, "(systemd)", "/etc/shadow"),
         ),
+        ("FPR crontab -l", exec(9206, "crontab", "-l")),
+        (
+            "FPR rename 非任务表",
+            file_event(14, 9207, "mv", "/tmp/not-cron"),
+        ),
+        (
+            "FPR cron 重读 /etc/crontab",
+            file_open(9208, "cron", "/etc/crontab"),
+        ),
+        (
+            "FPR crond 重读 /etc/cron.d",
+            file_open(9209, "crond", "/etc/cron.d/0hourly"),
+        ),
+        (
+            "FPR crontab 读 shadow",
+            file_open(9210, "crontab", "/etc/shadow"),
+        ),
+        (
+            "FPR dig 线程查询公网 DNS",
+            net_dns(9211, "isc-net-0000", "8.8.8.8"),
+        ),
+        ("FPR 共享地址段 DNS", net_dns(9212, "bash", "100.100.2.136")),
+        ("FPR systemd 释放 BPF 程序", tamper_event(9213, "systemd")),
+        (
+            "FPR CA bundle cert.pem",
+            file_open(9214, "cat", "/etc/pki/tls/cert.pem"),
+        ),
+        (
+            "FPR Debian 证书目录",
+            file_open(9215, "cat", "/etc/ssl/certs/server.pem"),
+        ),
+        (
+            "FPR SSH 公钥 .pub",
+            file_open(9216, "cat", "/root/.ssh/id_rsa.pub"),
+        ),
+        (
+            "FPR sshd 读主机私钥",
+            file_open(9217, "sshd", "/etc/ssh/ssh_host_rsa_key"),
+        ),
     ] {
         let out = engine.process_event(&bytes).await.unwrap();
         let fired: Vec<String> = out
@@ -173,5 +310,29 @@ async fn art_rule_layer_repro() {
         assert!(fired.is_empty(), "{name}: 不应告警, 实际 {fired:?}");
         println!("[NEG] {name} → 干净");
     }
+
+    // CentOS 上 crontab 的 rename 同时满足进程名与绝对路径，只应出一条
+    let out = engine
+        .process_event(&file_event(14, 9112, "crontab", "/var/spool/cron/root"))
+        .await
+        .unwrap();
+    let fired: Vec<String> = out
+        .effects
+        .iter()
+        .filter_map(|e| match e {
+            EngineEffect::Alert(raised) => Some(raised.alert.rule_name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        fired.iter().any(|f| f.contains("用户定时任务表修改")),
+        "crontab rename 未命中: {fired:?}"
+    );
+    assert!(
+        !fired.iter().any(|f| f.contains("定时任务表替换")),
+        "同一动作重复告警: {fired:?}"
+    );
+    println!("[NEG] crontab 绝对路径 rename 不重复告警 → {fired:?}");
+
     engine.shutdown().await.unwrap();
 }

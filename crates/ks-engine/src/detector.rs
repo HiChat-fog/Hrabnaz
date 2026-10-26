@@ -8,10 +8,28 @@ use ks_core::rule::{Condition, DetectionRule, Field, MatchResult, Operator};
 use log::{info, warn};
 use std::collections::HashMap;
 
+fn env_list(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .map(normalize_list)
+        .unwrap_or_default()
+}
+
+fn normalize_list(items: Vec<String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub struct DetectionEngine {
     rules: Vec<DetectionRule>,
     rules_index: HashMap<String, usize>,
     regex_cache: HashMap<String, regex::Regex>,
+    sensitive_path_allow: Vec<String>,
+    rule_comm_allow: Vec<String>,
 }
 
 impl Default for DetectionEngine {
@@ -26,7 +44,35 @@ impl DetectionEngine {
             rules: Vec::new(),
             rules_index: HashMap::new(),
             regex_cache: HashMap::new(),
+            sensitive_path_allow: env_list("KS_SENSITIVE_PATH_ALLOW"),
+            rule_comm_allow: env_list("KS_RULE_PROC_ALLOW"),
         }
+    }
+
+    /// 部署方言：这些路径在本地环境不属于敏感资源（前缀匹配，区分大小写）。
+    pub fn set_sensitive_path_allow(&mut self, paths: Vec<String>) {
+        self.sensitive_path_allow = normalize_list(paths);
+    }
+
+    /// 部署方言：这些进程的规则匹配整体跳过（大小写不敏感包含匹配）。
+    pub fn set_rule_comm_allow(&mut self, comms: Vec<String>) {
+        self.rule_comm_allow = normalize_list(comms);
+    }
+
+    fn path_allowed(&self, path: &str) -> bool {
+        self.sensitive_path_allow
+            .iter()
+            .any(|p| path.starts_with(p.as_str()))
+    }
+
+    fn comm_allowed(&self, comm: &str) -> bool {
+        if self.rule_comm_allow.is_empty() {
+            return false;
+        }
+        let lower = comm.to_lowercase();
+        self.rule_comm_allow
+            .iter()
+            .any(|p| lower.contains(&p.to_lowercase()))
     }
 
     pub fn load_rules_from_yaml(&mut self, yaml_content: &str) -> Result<usize> {
@@ -78,6 +124,9 @@ impl DetectionEngine {
     }
 
     pub fn match_event(&self, event: &DecodedEvent) -> Vec<MatchResult> {
+        if self.comm_allowed(&event.comm) {
+            return Vec::new();
+        }
         let mut results = Vec::new();
         for rule in &self.rules {
             if self.rule_matches(rule, event) {
@@ -131,12 +180,19 @@ impl DetectionEngine {
             Field::Signal => match_opt_i32(event.signal, &cond.operator, &cond.value, cache),
             Field::FileBytes => match_opt_u64(event.file_bytes, &cond.operator, &cond.value),
             Field::Comm => match_str(&event.comm, &cond.operator, &cond.value, cache),
-            Field::Filename => match_opt_str(
-                event.filename.as_deref(),
-                &cond.operator,
-                &cond.value,
-                cache,
-            ),
+            Field::Filename => {
+                if let Some(path) = event.filename.as_deref() {
+                    if self.path_allowed(path) {
+                        return false;
+                    }
+                }
+                match_opt_str(
+                    event.filename.as_deref(),
+                    &cond.operator,
+                    &cond.value,
+                    cache,
+                )
+            }
             Field::Args => match_opt_str(event.args.as_deref(), &cond.operator, &cond.value, cache),
             Field::Saddr => {
                 match_opt_str(event.saddr.as_deref(), &cond.operator, &cond.value, cache)
@@ -676,7 +732,7 @@ mod tests {
       value: "^/var/log/(auth|secure)"
     - field: comm
       operator: not_regex
-      value: "^(rsyslogd|AliYunDunMonito)$"
+      value: "^(rsyslogd|cloud-agent)$"
   alert_message: "log access detected"
 "#;
         let mut engine = DetectionEngine::new();
@@ -707,13 +763,109 @@ mod tests {
             "日志守护进程读取属于本职行为，应被豁免"
         );
         assert!(
-            engine.match_event(&mk("AliYunDunMonito")).is_empty(),
-            "云监控代理（comm 截断名）应被豁免"
+            engine.match_event(&mk("cloud-agent")).is_empty(),
+            "部署方声明的代理应被豁免"
         );
         assert_eq!(
             engine.match_event(&mk("evil")).len(),
             1,
             "非豁免进程读取敏感日志仍应告警"
+        );
+    }
+
+    #[test]
+    fn test_sensitive_path_allow_suppresses_filename_rules() {
+        let yaml = r#"
+- name: key_access
+  description: "key"
+  severity: high
+  conditions:
+    - field: filename
+      operator: regex
+      value: "id_rsa$"
+  alert_message: "key"
+"#;
+        let mut engine = DetectionEngine::new();
+        engine.load_rules_from_yaml(yaml).unwrap();
+        let mk = |path: &str| DecodedEvent {
+            seq: 1,
+            header: make_header(10, 100),
+            comm: "cat".to_string(),
+            filename: Some(path.to_string()),
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
+        };
+        assert_eq!(engine.match_event(&mk("/opt/keys/id_rsa")).len(), 1);
+        engine.set_sensitive_path_allow(vec!["/opt/keys/".into()]);
+        assert!(
+            engine.match_event(&mk("/opt/keys/id_rsa")).is_empty(),
+            "部署方声明的非敏感路径应跳过文件名规则"
+        );
+        assert_eq!(
+            engine.match_event(&mk("/root/.ssh/id_rsa")).len(),
+            1,
+            "白名单之外的同名文件仍应告警"
+        );
+    }
+
+    #[test]
+    fn test_rule_comm_allow_skips_rules() {
+        let yaml = r#"
+- name: agent_read
+  description: "agent"
+  severity: medium
+  conditions:
+    - field: comm
+      operator: contains
+      value: "agent"
+  alert_message: "agent"
+"#;
+        let mut engine = DetectionEngine::new();
+        engine.load_rules_from_yaml(yaml).unwrap();
+        let mk = |comm: &str| DecodedEvent {
+            seq: 1,
+            header: make_header(10, 100),
+            comm: comm.to_string(),
+            filename: None,
+            args: None,
+            saddr: None,
+            daddr: None,
+            sport: None,
+            dport: None,
+            proto: None,
+            target_pid: None,
+            signal: None,
+            file_bytes: None,
+            module_name: None,
+            prog_name: None,
+            source_ns_inum: None,
+            target_ns_inum: None,
+            cap_eff: None,
+            action: None,
+        };
+        assert_eq!(engine.match_event(&mk("cloud-agent")).len(), 1);
+        engine.set_rule_comm_allow(vec!["cloud-agent".into()]);
+        assert!(
+            engine.match_event(&mk("cloud-agent")).is_empty(),
+            "部署方声明的进程应跳过规则匹配"
+        );
+        assert_eq!(
+            engine.match_event(&mk("evil")).len(),
+            0,
+            "未匹配规则的其他进程本来就不告警"
         );
     }
 

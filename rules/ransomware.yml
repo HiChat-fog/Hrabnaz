@@ -1,11 +1,11 @@
 # ransomware.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "勒索软件加密行为"
-  description: "检测文件写入加密后缀 (.encrypted/.locked/.crypto) 或批量文件删除操作"
+  description: "检测文件写入加密后缀 (.enc/.encrypted/.locked/.crypto) 或批量文件删除操作"
   severity: critical
   conditions:
     - field: filename
       operator: regex
-      value: "(\\.encrypted|\\.locked|\\.crypto|\\.ryuk|\\.wanna|\\.cerber)$"
+      value: "(\\.enc|\\.encrypted|\\.locked|\\.crypto|\\.ryuk|\\.wanna|\\.cerber)$"
   alert_message: "检测到可疑文件加密行为，疑似勒索软件活动"
   mitre_tactic: "TA0040"
   mitre_technique: "T1486"
@@ -19,8 +19,9 @@
     - field: comm
       operator: not_regex
       # 真机实测：cron(PAM 认证)/crond(CentOS 名)/systemd(ProcFS 显示带括号)/sshd(PAM)
-      # 合法读 shadow 都属正常认证行为，一小时可产生 30+ 条 high 误报
-      value: "^(cron|crond|CRON|\\(?systemd\\)?|sshd)$"
+      # 合法读 shadow 都属正常认证行为，一小时可产生 30+ 条 high 误报；
+      # CentOS 的 crontab 会读 shadow 校验账户有效期
+      value: "^(cron|crond|CRON|crontab|\\(?systemd\\)?|sshd)$"
     - field: filename
       operator: contains
       value: "/etc/shadow"

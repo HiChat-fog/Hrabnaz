@@ -1726,7 +1726,16 @@ fn test_udp_sendmsg_net_event_raw_bytes_decode() {
             .as_str(),
         )
         .unwrap();
-    let matches = detector.match_event(&decoded);
+    // 100.100.2.136 属 RFC 6598 共享地址段，规则按内网处理；用公网地址验证可达性
+    let public = make_udp(
+        ipv4_to_u32("172.24.46.21"),
+        51821,
+        ipv4_to_u32("8.8.8.8"),
+        53,
+        2250834984494224,
+    );
+    let decoded_public = agg.decode(&encode_struct(&public)).unwrap();
+    let matches = detector.match_event(&decoded_public);
     assert!(
         !matches.is_empty(),
         "修复后 UDP:53 事件应命中 dns_tunnel.yml 规则"

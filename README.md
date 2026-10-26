@@ -82,6 +82,7 @@ eBPF 按 tier 条件编译：modern(5.8+ ringbuf)、legacy(4.x perfbuf+LRU)、an
 ## 检测与阻断
 
 - 规则引擎：YAML + Field 枚举，字段名拼错在加载时报错，不会静默不匹配
+- 部署方言：编译期规则只放普适语义。`KS_SENSITIVE_PATH_ALLOW`（逗号分隔路径前缀）声明本地非敏感路径，`KS_RULE_PROC_ALLOW`（逗号分隔进程名，大小写不敏感包含匹配）跳过指定进程的规则匹配；两者都由部署方配置，不写进默认规则
 - 跨事件关联三类：窗口关联、序列检测、进程树关联——单事件规则查不了的组合靠它（如读过 /etc/shadow 后外连 4444）
 - 基线：每进程六维 z-score，一次性训练锁定，异常数据不会反过来把基线拉偏
 - 阻断闭环：裁决经 block_decisions map 下发，同 PID 下次 syscall 查表实杀（modern tier bpf_send_signal）；protected_pids / protected_comms 硬豁免、warmup 干跑期、独立 kill 阈值，默认 monitor 只告警不杀。3.10/4.19 无 bpf_send_signal，map 写入生效但暂不实杀

@@ -417,7 +417,7 @@ fn cstr_to_string(data: &[u8]) -> String {
 
 fn exec_args_to_cmdline(args: &[u8; 512]) -> Option<String> {
     let mut mingling_duan = Vec::new();
-    for duan in args.chunks(64).take(5) {
+    for duan in args.chunks(64).take(8) {
         let zi_fu = cstr_to_string(duan);
         if zi_fu.is_empty() {
             break;
@@ -520,6 +520,21 @@ mod tests {
 
     fn encode_header(header: &EventHeader) -> Vec<u8> {
         header.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_exec_args_keeps_sixth_argument() {
+        let mut args = [0u8; 512];
+        for (i, s) in ["curl", "-s", "-m", "2", "-o", "/tmp/payload"]
+            .iter()
+            .enumerate()
+        {
+            args[i * 64..i * 64 + s.len()].copy_from_slice(s.as_bytes());
+        }
+        assert_eq!(
+            exec_args_to_cmdline(&args).as_deref(),
+            Some("curl -s -m 2 -o /tmp/payload")
+        );
     }
 
     #[test]

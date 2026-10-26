@@ -12,7 +12,7 @@ struct syscall_ctx {
     u64 start_ns;
     u32 pid;
     u32 syscall_nr;
-    char exec_args[320];
+    char exec_args[384];
 };
 
 struct {
@@ -81,6 +81,8 @@ int trace_sys_enter(KS_TP_SYS_ENTER *ctx) {
                 bpf_probe_read_user_str(sctx.exec_args + 192, 64, arg_ptr);
             if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[4]) == 0 && arg_ptr)
                 bpf_probe_read_user_str(sctx.exec_args + 256,  64, arg_ptr);
+            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[5]) == 0 && arg_ptr)
+                bpf_probe_read_user_str(sctx.exec_args + 320,  64, arg_ptr);
         }
     }
 

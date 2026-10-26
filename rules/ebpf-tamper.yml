@@ -6,9 +6,10 @@
     - field: event_type
       operator: equals
       value: "82"
+    # systemd 在服务/网卡生命周期里正常释放 BPF 程序（真机 modprobe 即触发）
     - field: comm
       operator: regex
-      value: "(bpftool|rmmod|systemd|kill|bpftool_rls)"
+      value: "^(bpftool|bpftool_rls|rmmod)$"
   alert_message: "检测到 eBPF 程序被篡改/卸载，疑似防御规避 (Impair Defenses)"
   mitre_tactic: "TA0005"
   mitre_technique: "T1562"
