@@ -105,8 +105,11 @@ pub fn inherently_high_freq_comms() -> Vec<String> {
 }
 
 fn is_inherently_high_freq_comm(comms: &[String], comm: &str) -> bool {
+    /* starts_with 而非 contains：contains 让攻击者把 comm 改成 python-worker
+    等即可绕过基线和 ML 告警（code-review H-2）。前缀匹配保留 tokio-rt-worker
+    之类截断名的匹配能力。 */
     let lower = comm.to_lowercase();
-    comms.iter().any(|p| lower.contains(&p.to_lowercase()))
+    comms.iter().any(|p| lower.starts_with(&p.to_lowercase()))
 }
 
 pub struct BaselineManager {

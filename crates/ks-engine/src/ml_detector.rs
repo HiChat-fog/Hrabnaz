@@ -363,7 +363,12 @@ impl AdaptiveDetector {
                     used_ewma = true;
                     let stddev = s.variance.sqrt();
                     let z = if stddev > 0.0 {
-                        (val - s.mean).abs() / stddev
+                        /* 单侧偏离（与 baseline.rs 一致）：低于均值不告警 */
+                        if val > &s.mean {
+                            (val - s.mean) / stddev
+                        } else {
+                            0.0
+                        }
                     } else if val > &s.mean {
                         3.0
                     } else {

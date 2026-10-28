@@ -268,7 +268,16 @@ impl ForensicLogger {
         let reader = BufReader::new(file);
         let mut last_hash: Option<String> = None;
         let mut last_event_seq: Option<u64> = None;
-        for line in reader.lines().map_while(Result::ok) {
+        /* I/O 错误（截断/损坏的 gz）不得静默吞掉——否则损坏文件被报告为链完整（H-4） */
+        let mut io_broken = false;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => {
+                    io_broken = true;
+                    break;
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -286,12 +295,16 @@ impl ForensicLogger {
                 last_event_seq = Some(seq);
             }
         }
+        if io_broken {
+            /* 截断/损坏文件恢复出的链尾不可靠，重置为创世（锚定语义兜底） */
+            log::warn!("recover_chain_state: I/O 错误，链尾恢复不可靠，重置为创世");
+            return Ok((GENESIS_HASH.to_string(), 0));
+        }
         match last_hash {
             None => Ok((GENESIS_HASH.to_string(), 0)),
             Some(hash) => Ok((hash, last_event_seq.unwrap_or(0))),
         }
     }
-
     fn maybe_rotate(&mut self) -> Result<()> {
         if self.current_file_size < self.rotation_config.max_file_size {
             return Ok(());
@@ -558,7 +571,16 @@ impl ForensicLogger {
         let mut anchored = false;
         let hasher = Sha256Hash;
 
-        for line in reader.lines().map_while(Result::ok) {
+        /* I/O 错误（截断/损坏的 gz）不得静默吞掉——否则损坏文件被报告为链完整（H-4） */
+        let mut io_broken = false;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => {
+                    io_broken = true;
+                    break;
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -619,6 +641,11 @@ impl ForensicLogger {
                 broken_at = Some(total_records);
             }
             prev_hash = stored_hash.to_string();
+        }
+
+        /* I/O 错误必须标记为 broken，不得报告损坏文件为链完整（H-4） */
+        if io_broken && broken_at.is_none() {
+            broken_at = Some(total_records + 1);
         }
 
         Ok(ChainVerification {
@@ -703,8 +730,11 @@ fn cleanup_old_archives(log_dir: &Path, retain_days: u32) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if name.starts_with("events_") && (name.ends_with(".jsonl.gz") || name.ends_with(".jsonl"))
-        {
+        /* 只清 .jsonl.gz 归档：.jsonl 可能是活跃文件（active file 的 mtime
+        可能早于 retain_days——宿主机离线超过保留天数），删掉会静默丢失
+        全部证据（code-review H-4）。.jsonl.gz 是已封存+压缩的归档，
+        不含活跃文件。 */
+        if name.starts_with("events_") && name.ends_with(".jsonl.gz") {
             if let Ok(metadata) = entry.metadata() {
                 if let Ok(modified) = metadata.modified() {
                     let mod_secs = modified
@@ -712,8 +742,12 @@ fn cleanup_old_archives(log_dir: &Path, retain_days: u32) -> Result<()> {
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
                     if mod_secs < cutoff_secs {
-                        remove_file(&path)?;
-                        log::info!("清理过期归档: {}", path.display());
+                        /* 单文件删除失败不中断整个清理扫描 */
+                        if let Err(e) = remove_file(&path) {
+                            log::warn!("清理过期归档失败 {}: {}", path.display(), e);
+                        } else {
+                            log::info!("清理过期归档: {}", path.display());
+                        }
                     }
                 }
             }

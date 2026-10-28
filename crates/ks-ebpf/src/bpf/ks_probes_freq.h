@@ -80,6 +80,8 @@ static __always_inline void update_freq_counter_ex(void *ctx, u32 pid, u32 count
         fc->net_op_count_60s = 0;  fc->dns_op_count_60s = 0;
         fc->ptrace_count_60s = 0;  fc->signal_count_60s = 0;
         fc->window_start_ns = now; fc->anomaly_flags = 0;
+        /* C-1 修复：60s 窗口重置时衰减 risk，低风险活动的 risk 逐步消退 */
+        decay_risk(pid, 10);
     }
 
     fc->syscall_count_60s++;

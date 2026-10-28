@@ -43,7 +43,7 @@ int trace_sys_enter(KS_TP_SYS_ENTER *ctx) {
     }
 
     switch (syscall_nr) {
-    case 59:  case 2:   case 257:
+    case 59:  case 322: case 2:   case 257:
     case 0:   case 1:   case 42:
     case 101: case 62:  case 313:
     /* 8-31 补发射的事件源：rename(82/264/316)/chmod(90/268) 产出 FILE_RENAME/FILE_CHMOD
@@ -67,8 +67,12 @@ int trace_sys_enter(KS_TP_SYS_ENTER *ctx) {
     sctx.args[4] = ctx->args[4];
     sctx.args[5] = ctx->args[5];
 
-    if (syscall_nr == 59) {
-        const char __user *const *argv_ptr = (const char __user *const *)sctx.args[1];
+    if (syscall_nr == 59 || syscall_nr == 322) {
+        /* execve(59): filename=args[0], argv=args[1]
+           execveat(322): filename=args[1], argv=args[3]（H-1 修复） */
+        const char __user *const *argv_ptr = (syscall_nr == 59)
+            ? (const char __user *const *)sctx.args[1]
+            : (const char __user *const *)sctx.args[3];
         if (argv_ptr) {
             const char __user *arg_ptr;
             if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_ptr[0]) == 0 && arg_ptr)
@@ -112,15 +116,18 @@ int trace_sys_exit_proc(KS_TP_SYS_EXIT *ctx) {
      * 删除：键是 pid_tgid，下一次 sys_enter 会覆盖；三程序顺序不确定，任何一方
      * 删除都可能截断其它程序的读取。 */
 
-    if (syscall_nr == 59 && ret >= 0) {
+    if ((syscall_nr == 59 || syscall_nr == 322) && ret >= 0) {
         struct exec_event *evt = KS_RESERVE(events, struct exec_event);
         if (!evt) { ks_count_drop(); goto cleanup; }
 
         fill_header(&evt->header, EVENT_PROCESS_EXEC);
-        evt->header.syscall_nr = 59;
+        evt->header.syscall_nr = syscall_nr;
         evt->header.retval = ret;
 
-        const char __user *filename_ptr = (const char __user *)sctx->args[0];
+        /* execve(59): filename=args[0]; execveat(322): filename=args[1] */
+        const char __user *filename_ptr = (syscall_nr == 59)
+            ? (const char __user *)sctx->args[0]
+            : (const char __user *)sctx->args[1];
         KS_WRITE_USER_STR(evt->filename, sizeof(evt->filename), filename_ptr);
 
         __builtin_memcpy(evt->args, sctx->exec_args, sizeof(sctx->exec_args));

@@ -30,3 +30,4 @@ dist/
 
 # 机器相关诊断脚本不进仓库
 scripts/ecs-ks-diag.sh
+决赛演讲稿.md

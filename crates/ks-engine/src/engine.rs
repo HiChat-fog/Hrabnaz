@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::aggregator::{DecodedEvent, EventAggregator};
@@ -166,6 +166,10 @@ pub struct EngineStats {
     pub suppressed_alerts: u64,
     /// 自身进程事件丢弃数：取证写入/gzip 线程与引擎同 tgid，不丢弃会自反馈
     pub self_events_dropped: u64,
+    /// 同 (pid, 路径) 重复读写被合并的事件数：只保留窗口内首条
+    pub repeated_io_collapsed: u64,
+    /// 取证日志目录内的读写事件丢弃数（消费自身产物的放大回路）
+    pub self_forensic_events_dropped: u64,
 }
 
 pub struct ShutdownSummary {
@@ -264,6 +268,16 @@ impl ForensicSink {
         {
             warn!("forensic worker已退出,告警丢失");
         }
+    }
+}
+
+/// 取证目录规范化：去掉尾部重复分隔符后补一个，便于按前缀整段匹配。
+fn normalize_dir(dir: &str) -> String {
+    let trimmed = dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{}/", trimmed)
     }
 }
 
@@ -437,6 +451,58 @@ fn severity_meets_threshold(severity: &Severity, threshold: &str) -> bool {
 ///   进入异常态告警一次即可，不应按事件重复。
 ///
 /// `KS_ALERT_COOLDOWN_SEC` 覆盖两类窗口（0 = 关闭去重）。
+/// 重复 I/O 合并：同一进程对同一路径的 open/read/write 在一个窗口内只保留首条。
+/// 逐条记录同一文件的连续读写不提供新的取证信息，却能把日志放大两三个数量级
+/// （真机：索引器写 SQLite 1 小时 170 万条 file_write）。删除/改名/改权限不合并。
+struct RepeatIoFilter {
+    seen: std::collections::HashMap<(u32, String), Instant>,
+    window: Duration,
+}
+
+impl RepeatIoFilter {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::HashMap::new(),
+            window: Duration::from_secs(
+                std::env::var("KS_REPEAT_IO_WINDOW_SEC")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(10),
+            ),
+        }
+    }
+
+    /// 返回 true 表示应保留（窗口内首条），false 表示合并掉。
+    fn keep(&mut self, event: &ks_core::event::DecodedEvent) -> bool {
+        const FILE_OPEN: u32 = 10;
+        const FILE_READ: u32 = 11;
+        const FILE_WRITE: u32 = 12;
+        let et = event.header.event_type;
+        if et != FILE_OPEN && et != FILE_READ && et != FILE_WRITE {
+            return true;
+        }
+        let Some(path) = event.filename.as_deref() else {
+            return true;
+        };
+        if self.window.is_zero() {
+            return true;
+        }
+        let key = (event.header.pid, path.to_string());
+        let now = Instant::now();
+        if let Some(last) = self.seen.get(&key) {
+            if now.saturating_duration_since(*last) < self.window {
+                return false;
+            }
+        }
+        if self.seen.len() > 65536 {
+            self.seen
+                .retain(|_, t| now.saturating_duration_since(*t) < self.window);
+        }
+        self.seen.insert(key, now);
+        true
+    }
+}
+
 struct AlertThrottle {
     last: std::collections::HashMap<(String, u32), Instant>,
     override_secs: Option<u64>,
@@ -505,6 +571,7 @@ pub struct Engine {
     chain_reconstructor: ChainReconstructor,
     stats: EngineStats,
     alert_throttle: AlertThrottle,
+    repeat_io_filter: RepeatIoFilter,
     anomaly_threshold: f64,
     block_ttl: u64,
     block_severity_threshold: String,
@@ -512,6 +579,9 @@ pub struct Engine {
     /// 引擎自身 tgid（含 tokio 写入线程与 gzip 线程）：事件头 pid 即 tgid，
     /// 与之相同的事件在进任何消费方之前整条丢弃
     self_tgid: u32,
+    /// 本实例取证日志目录（规范化后带末尾分隔符）；读取/写入该目录下文件的事件
+    /// 在进任何消费方之前丢弃，避免"消费自己的产物"形成放大回路
+    self_forensic_dir: String,
     block_pinned: bool,
     info: EngineInfo,
     hot_reload_task: tokio::task::JoinHandle<()>,
@@ -790,11 +860,13 @@ impl Engine {
             chain_reconstructor: ChainReconstructor::new(),
             stats: EngineStats::default(),
             alert_throttle: AlertThrottle::new(),
+            repeat_io_filter: RepeatIoFilter::new(),
             anomaly_threshold,
             block_ttl,
             block_severity_threshold,
             protected_pids,
             self_tgid: std::process::id(),
+            self_forensic_dir: normalize_dir(&options.log_dir),
             block_pinned: info.block_channel.is_some(),
             info,
             hot_reload_task,
@@ -876,6 +948,22 @@ impl Engine {
         Ok(outcome)
     }
 
+    /// 取证目录内的读取/写入/打开事件：属于消费本产品产物，不是被监控行为。
+    /// 删除/改名/改权限不在其列，证据破坏必须仍然可检测。
+    fn is_self_forensic_io(&self, event: &ks_core::event::DecodedEvent) -> bool {
+        const FILE_OPEN: u32 = 10;
+        const FILE_READ: u32 = 11;
+        const FILE_WRITE: u32 = 12;
+        let et = event.header.event_type;
+        if et != FILE_OPEN && et != FILE_READ && et != FILE_WRITE {
+            return false;
+        }
+        event
+            .filename
+            .as_deref()
+            .is_some_and(|p| p.starts_with(&self.self_forensic_dir))
+    }
+
     fn drain_kill_notices(&mut self, outcome: &mut EngineOutcome) {
         if let Some(rx) = self.kill_notices_rx.as_mut() {
             while let Ok((pid, reason)) = rx.try_recv() {
@@ -908,6 +996,21 @@ impl Engine {
         // 进程号的事件在进取证/基线/规则之前整条丢弃，环路增益归零。
         if event.header.pid == self.self_tgid {
             self.stats.self_events_dropped += 1;
+            return Ok(effects);
+        }
+
+        // 自产物消费（与进程名无关）：任何进程读取或写入本实例取证目录下的文件，
+        // 都是"消费产物"而非被监控行为。取证目录是产品自身参数，对所有部署成立。
+        // 只排除读/写/打开：delete/rename/chmod 仍要过检测——那是证据破坏。
+        if self.is_self_forensic_io(&event) {
+            self.stats.self_forensic_events_dropped += 1;
+            return Ok(effects);
+        }
+
+        // 重复 I/O 合并：同一进程对同一路径的连续 open/read/write 只留首条。
+        // 逐条记录不增加取证信息，却会把日志放大几个数量级。
+        if !self.repeat_io_filter.keep(&event) {
+            self.stats.repeated_io_collapsed += 1;
             return Ok(effects);
         }
 
@@ -1261,6 +1364,150 @@ mod tests {
         assert!(!severity_meets_threshold(&Severity::High, "critical"));
         assert!(severity_meets_threshold(&Severity::High, "high"));
         assert!(severity_meets_threshold(&Severity::Low, "low"));
+    }
+
+    fn file_bytes(pid: u32, event_type: u32, path: &[u8]) -> Vec<u8> {
+        use ks_core::event::{EventHeader, FileEvent};
+        use zerocopy::IntoBytes as _;
+        let ev = FileEvent {
+            header: EventHeader {
+                event_type,
+                _pad1: 0,
+                timestamp_ns: 1,
+                pid,
+                tid: pid,
+                uid: 0,
+                ppid: 1,
+                comm: {
+                    let mut b = [0u8; 16];
+                    b[..8].copy_from_slice(b"tailer\0\0");
+                    b
+                },
+                syscall_nr: 1,
+                _pad2: 0,
+                retval: 0,
+            },
+            filename: {
+                let mut b = [0u8; 256];
+                b[..path.len()].copy_from_slice(path);
+                b
+            },
+            bytes: 65536,
+            fd: 3,
+            flags: 0,
+        };
+        ev.as_bytes().to_vec()
+    }
+
+    /// 自产物消费：任何进程读写本实例取证目录下的文件都不该入链，
+    /// 但同目录之外的读写、以及删除/改名仍要检测（证据破坏）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_engine_drops_own_forensic_io_but_keeps_tamper() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules");
+        let log_dir = dir.path().to_string_lossy().to_string();
+        let options = EngineOptions {
+            config: Config::default(),
+            rules_dir: rules.to_string_lossy().to_string(),
+            log_dir: log_dir.clone(),
+            source: EventSourceSpec::Provided(
+                Box::new(MockEventSource::new_with_scenario(MockScenario::All)),
+                None,
+            ),
+            heartbeat_path: None,
+            ml_observe_sec: None,
+        };
+        let mut engine = Engine::start(options).await.unwrap();
+        let forensic_path = engine.info().forensic_path.clone();
+        let inside = format!("{}/events_20260101.jsonl", log_dir.trim_end_matches('/'));
+        let outside = "/var/log/other/app.log";
+
+        // 目录内 read/write/open：丢弃
+        for et in [10u32, 11, 12] {
+            let out = engine
+                .process_event(&file_bytes(5000, et, inside.as_bytes()))
+                .await
+                .unwrap();
+            assert_eq!(out.effects.len(), 0);
+        }
+        assert_eq!(engine.stats().self_forensic_events_dropped, 3);
+
+        // 目录内的 delete：必须保留（证据破坏）
+        let out = engine
+            .process_event(&file_bytes(5001, 13, inside.as_bytes()))
+            .await
+            .unwrap();
+        assert_eq!(out.consumed, 1);
+        assert_eq!(engine.stats().self_forensic_events_dropped, 3);
+
+        // 目录外的写：正常入链
+        let out = engine
+            .process_event(&file_bytes(5002, 12, outside.as_bytes()))
+            .await
+            .unwrap();
+        assert_eq!(out.consumed, 1);
+
+        engine.shutdown().await.unwrap();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&forensic_path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"type\":\"event\""))
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let count = events.len();
+        assert_eq!(count, 2, "只有删除与目录外写入应入链");
+    }
+
+    /// 重复 I/O 合并：同 pid 同路径的连续写只留一条，不同路径与删除事件不受影响。
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_engine_collapses_repeated_io() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules");
+        let options = EngineOptions {
+            config: Config::default(),
+            rules_dir: rules.to_string_lossy().to_string(),
+            log_dir: dir.path().to_string_lossy().to_string(),
+            source: EventSourceSpec::Provided(
+                Box::new(MockEventSource::new_with_scenario(MockScenario::All)),
+                None,
+            ),
+            heartbeat_path: None,
+            ml_observe_sec: None,
+        };
+        let mut engine = Engine::start(options).await.unwrap();
+        let forensic_path = engine.info().forensic_path.clone();
+
+        let a = b"/var/lib/app/index.sqlite";
+        for _ in 0..5 {
+            engine
+                .process_event(&file_bytes(6000, 12, a))
+                .await
+                .unwrap();
+        }
+        assert_eq!(engine.stats().repeated_io_collapsed, 4);
+
+        // 不同路径仍保留
+        engine
+            .process_event(&file_bytes(6000, 12, b"/var/lib/app/other.sqlite"))
+            .await
+            .unwrap();
+        assert_eq!(engine.stats().repeated_io_collapsed, 4);
+
+        // 同路径的删除不合并
+        engine
+            .process_event(&file_bytes(6000, 13, a))
+            .await
+            .unwrap();
+        assert_eq!(engine.stats().repeated_io_collapsed, 4);
+
+        engine.shutdown().await.unwrap();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&forensic_path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"type\":\"event\""))
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(events.len(), 3, "首条写 + 另一路径写 + 删除");
     }
 
     fn file_write_bytes(pid: u32) -> Vec<u8> {

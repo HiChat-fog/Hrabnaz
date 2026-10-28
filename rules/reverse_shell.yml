@@ -1,14 +1,14 @@
 # reverse_shell.yml — 本文件规则均未声明 enforce，阻断模式下只告警不实杀（severity 仅决定告警级别）。
 - name: "反弹Shell检测"
-  description: "检测通过 bash -i 或 /dev/tcp 建立的反弹 Shell 连接"
+  description: "检测通过 bash/zsh -i、/dev/tcp、python pty 建立的反弹 Shell 连接"
   severity: critical
   conditions:
     - field: comm
-      operator: contains
-      value: "bash"
+      operator: regex
+      value: "(bash|zsh|python[23]?|perl|ruby)"
     - field: args
       operator: regex
-      value: "(-i|/dev/tcp|/dev/udp)"
+      value: "(-i|/dev/tcp|/dev/udp|pty\\.spawn|import pty|socket\\.socket)"
   alert_message: "检测到反弹 Shell 行为: 进程试图建立交互式反向连接"
   mitre_tactic: "TA0002"
   mitre_technique: "T1059.004"

@@ -64,4 +64,17 @@ static __always_inline void add_risk(u32 pid, u32 delta) {
     }
 }
 
+/* C-1 修复：risk 只涨不降导致长跑进程终将被误杀。
+   60s 窗口重置时衰减 10 分，低风险活动的 risk 逐步消退。 */
+static __always_inline void decay_risk(u32 pid, u32 delta) {
+    u32 key = pid;
+    u32 *score = bpf_map_lookup_elem(&risk_scores, &key);
+    if (score) {
+        if (*score <= delta)
+            *score = 0;
+        else
+            *score -= delta;
+    }
+}
+
 #endif
