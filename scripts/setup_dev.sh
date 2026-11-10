@@ -1,11 +1,11 @@
 #!/bin/bash
-# KernelSentinel 开发环境一键搭建脚本
+# Hrabnaz 开发环境一键搭建脚本
 # 用法: chmod +x setup_dev.sh && ./setup_dev.sh
 
 set -euo pipefail
 
 echo "========================================"
-echo " 内核哨兵 (KernelSentinel) 开发环境搭建"
+echo " 内核哨兵 (Hrabnaz) 开发环境搭建"
 echo "========================================"
 
 # 1. 系统依赖
@@ -33,7 +33,7 @@ cargo install bpf-linker || echo "  [warn] bpf-linker 安装失败（本项目�
 
 # 3. Rust 目标平台
 echo "[3/6] 添加 Rust 交叉编译目标..."
-# eBPF 由 clang 直接编译（ks-engine/build.rs），无需额外 rust target
+# eBPF 由 clang 直接编译（hrabnaz-engine/build.rs），无需额外 rust target
 
 # 4. bpf 工具链
 echo "[4/6] 安装 BPF 工具..."

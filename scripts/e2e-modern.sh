@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # E1.4 — Modern tier 端到端验证脚本
-# 验证 KernelSentinel 在 5.8+ 内核上的完整链路:
+# 验证 Hrabnaz 在 5.8+ 内核上的完整链路:
 #   eBPF 采集 → aggregator → detector → forensic JSONL 落盘
 #
 # 退出码:
@@ -26,26 +26,26 @@ RULES_DIR="${PROJECT_ROOT}/rules"
 SCENARIOS_DIR="${PROJECT_ROOT}/scenarios"
 
 # ── 可执行文件解析：优先 release，次 debug，最后 PATH ────────────────────────
-if [[ -x "${PROJECT_ROOT}/target/release/kernelsentinel" ]]; then
-    KS_BIN="${PROJECT_ROOT}/target/release/kernelsentinel"
-elif [[ -x "${PROJECT_ROOT}/target/debug/kernelsentinel" ]]; then
-    KS_BIN="${PROJECT_ROOT}/target/debug/kernelsentinel"
-elif command -v kernelsentinel >/dev/null 2>&1; then
-    KS_BIN="$(command -v kernelsentinel)"
+if [[ -x "${PROJECT_ROOT}/target/release/hrabnaz" ]]; then
+    HRABNAZ_BIN="${PROJECT_ROOT}/target/release/hrabnaz"
+elif [[ -x "${PROJECT_ROOT}/target/debug/hrabnaz" ]]; then
+    HRABNAZ_BIN="${PROJECT_ROOT}/target/debug/hrabnaz"
+elif command -v hrabnaz >/dev/null 2>&1; then
+    HRABNAZ_BIN="$(command -v hrabnaz)"
 else
-    echo "ERROR: 找不到 kernelsentinel 可执行文件（target/{release,debug}/kernelsentinel 或 PATH）" >&2
+    echo "ERROR: 找不到 hrabnaz 可执行文件（target/{release,debug}/hrabnaz 或 PATH）" >&2
     exit 1
 fi
 
 # ── 运行态 ────────────────────────────────────────────────────────────────────
-KS_PID=""
+HRABNAZ_PID=""
 
 # ── 诊断函数：断言失败时打印上下文后 exit 1 ─────────────────────────────────
 fail() {
     echo "============================================================" >&2
     echo "ASSERT FAILED: $1" >&2
     echo "------------------------------------------------------------" >&2
-    if [[ -n "${KS_PID:-}" ]] && kill -0 "${KS_PID}" 2>/dev/null; then
+    if [[ -n "${HRABNAZ_PID:-}" ]] && kill -0 "${HRABNAZ_PID}" 2>/dev/null; then
         echo ">>> ks-stdout.log 末尾 10 行:" >&2
         tail -10 "${LOG_DIR}/ks-stdout.log" >&2 || true
     fi
@@ -67,17 +67,17 @@ fail() {
 # ── 清理函数：trap EXIT 调用 ─────────────────────────────────────────────────
 cleanup() {
     local code=$?
-    if [[ -n "${KS_PID:-}" ]] && kill -0 "${KS_PID}" 2>/dev/null; then
-        echo "[cleanup] 终止 kernelsentinel (pid=${KS_PID})..."
-        kill "${KS_PID}" 2>/dev/null || true
+    if [[ -n "${HRABNAZ_PID:-}" ]] && kill -0 "${HRABNAZ_PID}" 2>/dev/null; then
+        echo "[cleanup] 终止 hrabnaz (pid=${HRABNAZ_PID})..."
+        kill "${HRABNAZ_PID}" 2>/dev/null || true
         # SIGTERM handler 触发优雅退出（清探针条目+flush 取证），最多等 10s，
         # 别用固定 0.5s 的 kill -9 打断清理
         local waited=0
-        while kill -0 "${KS_PID}" 2>/dev/null && (( waited < 10 )); do
+        while kill -0 "${HRABNAZ_PID}" 2>/dev/null && (( waited < 10 )); do
             sleep 1
             waited=$((waited + 1))
         done
-        kill -9 "${KS_PID}" 2>/dev/null || true
+        kill -9 "${HRABNAZ_PID}" 2>/dev/null || true
     fi
     if [[ -f "${PID_FILE}" ]]; then
         rm -f "${PID_FILE}"
@@ -124,23 +124,23 @@ check_kernel_version() {
 }
 
 # =============================================================================
-# E1.4.2 — 启动 kernelsentinel 后台运行
+# E1.4.2 — 启动 hrabnaz 后台运行
 # =============================================================================
-start_kernelsentinel() {
-    echo "[E1.4.2] 启动 kernelsentinel: ${KS_BIN} start --rules-dir ${RULES_DIR} --log-dir ${LOG_DIR}"
+start_hrabnaz() {
+    echo "[E1.4.2] 启动 hrabnaz: ${HRABNAZ_BIN} start --rules-dir ${RULES_DIR} --log-dir ${LOG_DIR}"
     if [[ ! -d "${RULES_DIR}" ]]; then
         echo "ERROR: 规则目录不存在: ${RULES_DIR}" >&2
         exit 1
     fi
     mkdir -p "${LOG_DIR}"
     # nohup + & 后台运行；stdout/stderr 落到日志文件便于事后排查
-    nohup "${KS_BIN}" start \
+    nohup "${HRABNAZ_BIN}" start \
         --rules-dir "${RULES_DIR}" \
         --log-dir "${LOG_DIR}" \
         >"${LOG_DIR}/ks-stdout.log" 2>&1 &
-    KS_PID=$!
-    echo "${KS_PID}" >"${PID_FILE}"
-    echo "         pid=${KS_PID}, pid_file=${PID_FILE}"
+    HRABNAZ_PID=$!
+    echo "${HRABNAZ_PID}" >"${PID_FILE}"
+    echo "         pid=${HRABNAZ_PID}, pid_file=${PID_FILE}"
 }
 
 # =============================================================================
@@ -150,8 +150,8 @@ wait_for_startup() {
     echo "[E1.4.3] 等待引擎初始化（最多 ${STARTUP_TIMEOUT}s，每 ${STARTUP_POLL_INTERVAL}s 轮询）..."
     local elapsed=0
     while (( elapsed < STARTUP_TIMEOUT )); do
-        if ! kill -0 "${KS_PID}" 2>/dev/null; then
-            echo "ERROR: kernelsentinel 进程已退出" >&2
+        if ! kill -0 "${HRABNAZ_PID}" 2>/dev/null; then
+            echo "ERROR: hrabnaz 进程已退出" >&2
             echo ">>> ks-stdout.log 末尾 20 行:" >&2
             tail -20 "${LOG_DIR}/ks-stdout.log" >&2 || true
             exit 1
@@ -243,7 +243,7 @@ assert_local_outputs() {
 
     # 3) 二进制 --version 输出版本号
     local version_out
-    version_out="$("${KS_BIN}" --version 2>&1 || fail "kernelsentinel --version 执行失败")"
+    version_out="$("${HRABNAZ_BIN}" --version 2>&1 || fail "hrabnaz --version 执行失败")"
     echo "         version: ${version_out}"
     echo "${version_out}" | grep -qE '[0-9]+\.[0-9]+' \
         || fail "断言失败: --version 未输出版本号"
@@ -284,14 +284,14 @@ check_forensic_log() {
 # =============================================================================
 main() {
     echo "============================================================"
-    echo " KernelSentinel E2E 验证 (Modern tier, 内核 >= 5.8)"
-    echo " 二进制: ${KS_BIN}"
+    echo " Hrabnaz E2E 验证 (Modern tier, 内核 >= 5.8)"
+    echo " 二进制: ${HRABNAZ_BIN}"
     echo " 规则:   ${RULES_DIR}"
     echo " 日志:   ${LOG_DIR}"
     echo "============================================================"
 
     check_kernel_version    # E1.4.1 (失败时 exit 2)
-    start_kernelsentinel    # E1.4.2
+    start_hrabnaz    # E1.4.2
     wait_for_startup        # E1.4.3
     run_scenarios           # E1.4.4
     assert_local_outputs    # E1.4.5

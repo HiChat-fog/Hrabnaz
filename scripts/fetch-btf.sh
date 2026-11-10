@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 为目标内核生成 BTF 文件，供 aya 在用户态做 CO-RE 重定位（无 /sys/kernel/btf/vmlinux
-# 的内核必需）。产物放到 crates/ks-ebpf/btf/，构建时由 ks-engine/build.rs 内嵌进二进制。
+# 的内核必需）。产物放到 crates/hrabnaz-ebpf/btf/，构建时由 hrabnaz-engine/build.rs 内嵌进二进制。
 #
 # 两种来源：
 #   默认     从发行版 kernel-debuginfo RPM 提取带 DWARF 的 vmlinux，
@@ -23,7 +23,7 @@
 #
 # 生成后务必重新构建并跑回归测试——它会对每一份内嵌 BTF 做一次真实重定位，
 # 老内核 BTF 里缺字段会导致整个 tier 加载失败，必须在上线前发现：
-#   cargo test -p ks-engine --test btf_relocation_test
+#   cargo test -p hrabnaz-engine --test btf_relocation_test
 set -euo pipefail
 
 RELEASE="${1:-}"
@@ -47,7 +47,7 @@ need xz "apt: xz-utils"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-OUT_DIR="${OUT_DIR:-${REPO_DIR}/crates/ks-ebpf/btf}"
+OUT_DIR="${OUT_DIR:-${REPO_DIR}/crates/hrabnaz-ebpf/btf}"
 mkdir -p "$OUT_DIR"
 
 WORK="$(mktemp -d)"
@@ -158,10 +158,10 @@ XZ_MB="$(du -m "${BTF_RAW}.xz" | cut -f1)"
 echo "" >&2
 echo "===== 完成 =====" >&2
 echo "  产物: ${OUT_DIR}/${RELEASE}.btf.xz  (${XZ_MB}MB, 未压缩 ${RAW_MB}MB)" >&2
-echo "  内嵌: 重新构建 ks-engine 即会被 include_bytes! 进二进制" >&2
+echo "  内嵌: 重新构建 hrabnaz-engine 即会被 include_bytes! 进二进制" >&2
 echo "" >&2
 echo "  下一步（必做）:" >&2
-echo "    cargo test -p ks-engine --test btf_relocation_test" >&2
+echo "    cargo test -p hrabnaz-engine --test btf_relocation_test" >&2
 echo "    —— 会对这份 BTF 做真实重定位；若有字段解析不了，必须先加" >&2
 echo "       bpf_core_field_exists() 守卫，否则该 tier 在目标机上整体加载失败。" >&2
 echo "" >&2

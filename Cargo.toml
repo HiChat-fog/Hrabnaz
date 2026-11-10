@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "crates/ks-core",
-    "crates/ks-engine",
-    "crates/ks-cli",
+    "crates/hrabnaz-core",
+    "crates/hrabnaz-engine",
+    "crates/hrabnaz-cli",
 ]
 resolver = "2"
 
-# ks-ebpf 是纯 C 项目，不在 workspace 中，由 build.rs 独立编译
+# hrabnaz-ebpf 是纯 C 项目，不在 workspace 中，由 build.rs 独立编译
 
 # 本地 patch: aya 在 btf_fd=None 时仍传非零 btf_key/value_type_id，
 # 3.10 stock 内核（无 BTF）会返回 EINVAL。patch 后 btf_fd=0 时自动清零 type ID。

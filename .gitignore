@@ -19,15 +19,15 @@ logs-collected/
 dist/
 
 # 文档不进仓库(只留README)
-/docs/
 /realdocs/
-/CONTRIBUTING.md
 !ARCHITECTURE.md
 !ROADMAP.md
-/vendor/aya/*.md
 /.github/ISSUE_TEMPLATE/
 /.github/pull_request_template.md
 
 # 机器相关诊断脚本不进仓库
 scripts/ecs-ks-diag.sh
 决赛演讲稿.md
+.trae-html-share-packages/
+docs/ARCHITECTURE_ZH.md
+scenarios/

@@ -2,33 +2,33 @@
 # =============================================================================
 # E2.4 — ECS (3.10 stock kernel) 端到端验证脚本
 # 验证 NOBTF 方案完整链路:
-#   上传 ks_main_ancient_nobtf.o + ks_loader.c → 远程 gcc 编译
+#   上传 hrabnaz_main_ancient_nobtf.o + hrabnaz_loader.c → 远程 gcc 编译
 #   → --load-only 验证 13/13 加载 → --stream 验证事件帧输出
 #
 # 目标 ECS: CentOS 7.2, kernel 3.10.0-1160.119.1.el7.x86_64, glibc 2.17 (无 BTF)
 # ECS glibc 太旧无法直接跑 Rust 二进制, 故端到端 Rust 链路在本地用 mock 子进程验证
-# (参考 cloader_source.rs::tests 13 个单元测试); 本脚本只验证 ks_loader 端的帧输出.
+# (参考 cloader_source.rs::tests 13 个单元测试); 本脚本只验证 hrabnaz_loader 端的帧输出.
 #
 # 退出码:
 #   0 — 全部断言通过
 #   1 — 断言失败（已打印诊断信息）
 #   2 — SSH 不可达 / ECS 连接失败
-#   3 — 本地产物缺失 (ks_main_ancient_nobtf.o 或 ks_loader.c)
+#   3 — 本地产物缺失 (hrabnaz_main_ancient_nobtf.o 或 hrabnaz_loader.c)
 #   4 — 远程 gcc 编译失败
 # =============================================================================
 set -euo pipefail
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 # 连接信息改由环境变量注入：旧实现把本机私钥绝对路径与服务器 IP 硬编码进仓库
-readonly SSH_KEY="${KS_E2E_SSH_KEY:?请设置 KS_E2E_SSH_KEY=/path/to/key}"
-readonly ECS_HOST="${KS_E2E_HOST:?请设置 KS_E2E_HOST=<服务器IP>}"
-readonly ECS_USER="${KS_E2E_USER:-root}"
+readonly SSH_KEY="${HRABNAZ_E2E_SSH_KEY:?请设置 HRABNAZ_E2E_SSH_KEY=/path/to/key}"
+readonly ECS_HOST="${HRABNAZ_E2E_HOST:?请设置 HRABNAZ_E2E_HOST=<服务器IP>}"
+readonly ECS_USER="${HRABNAZ_E2E_USER:-root}"
 readonly REMOTE_DIR="/tmp/ks-e2e"
-readonly KS_LOADER_SRC_REL="crates/ks-ebpf/scripts/ks_loader.c"
-readonly OBJ_NAME="ks_main_ancient_nobtf.o"
-readonly REMOTE_LOADER="${REMOTE_DIR}/ks_loader"
+readonly HRABNAZ_LOADER_SRC_REL="crates/hrabnaz-ebpf/scripts/hrabnaz_loader.c"
+readonly OBJ_NAME="hrabnaz_main_ancient_nobtf.o"
+readonly REMOTE_LOADER="${REMOTE_DIR}/hrabnaz_loader"
 readonly REMOTE_OBJ="${REMOTE_DIR}/${OBJ_NAME}"
-readonly REMOTE_LOADER_SRC="${REMOTE_DIR}/ks_loader.c"
+readonly REMOTE_LOADER_SRC="${REMOTE_DIR}/hrabnaz_loader.c"
 readonly REMOTE_STREAM_OUT="${REMOTE_DIR}/stream.out"
 readonly REMOTE_STREAM_ERR="${REMOTE_DIR}/stream.err"
 readonly REMOTE_STREAM_PID="${REMOTE_DIR}/stream.pid"
@@ -49,10 +49,10 @@ readonly EXIT_COMPILE=4
 # ── 项目根目录（脚本所在目录的上一级）──────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-KS_LOADER_SRC_LOCAL="${PROJECT_ROOT}/${KS_LOADER_SRC_REL}"
+HRABNAZ_LOADER_SRC_LOCAL="${PROJECT_ROOT}/${HRABNAZ_LOADER_SRC_REL}"
 
 # ── 运行态 ────────────────────────────────────────────────────────────────────
-OBJ_PATH=""                # 本地 ks_main_ancient_nobtf.o 绝对路径 (find_ancient_nobtf_object 填充)
+OBJ_PATH=""                # 本地 hrabnaz_main_ancient_nobtf.o 绝对路径 (find_ancient_nobtf_object 填充)
 REMOTE_STREAM_PID_VAL=""   # 远程 stream 进程 pid (start_stream 填充)
 
 # ── 日志 / 失败函数 ───────────────────────────────────────────────────────────
@@ -107,8 +107,8 @@ cleanup() {
     local code=$?
     # 终止远程 stream 进程 (若有 pid 记录)
     if [[ -n "${REMOTE_STREAM_PID_VAL:-}" ]]; then
-        log "[cleanup] 终止远程 ks_loader stream (pid=${REMOTE_STREAM_PID_VAL})..."
-        # 先 SIGTERM 优雅退出 (ks_loader 注册了 SIGTERM handler 会 detach + 退出 0)
+        log "[cleanup] 终止远程 hrabnaz_loader stream (pid=${REMOTE_STREAM_PID_VAL})..."
+        # 先 SIGTERM 优雅退出 (hrabnaz_loader 注册了 SIGTERM handler 会 detach + 退出 0)
         ssh_run "kill ${REMOTE_STREAM_PID_VAL} 2>/dev/null" 2>/dev/null || true
         sleep 0.5
         ssh_run "kill -9 ${REMOTE_STREAM_PID_VAL} 2>/dev/null" 2>/dev/null || true
@@ -143,7 +143,7 @@ check_ssh_and_deps() {
     log "         SSH ok, 远程 uname: $(head -2 /tmp/ks-e2e-ping.out | tail -1)"
     rm -f /tmp/ks-e2e-ping.out /tmp/ks-e2e-ping.err
 
-    # 检测 libelf-devel (gcc 编译 ks_loader.c 需要 elf.h + libelf.so)
+    # 检测 libelf-devel (gcc 编译 hrabnaz_loader.c 需要 elf.h + libelf.so)
     log "         检测 libelf-devel ..."
     if ! ssh_run "pkg-config --exists libelf 2>/dev/null || test -f /usr/include/libelf.h && test -f /usr/lib64/libelf.so"; then
         log "         libelf-devel 缺失, 安装中 (yum install -y libelf-devel) ..."
@@ -164,26 +164,26 @@ check_ssh_and_deps() {
 # E2.4.2 — 查找本地产物 + 上传到 ECS /tmp/ks-e2e/
 # =============================================================================
 # 模拟 event_source.rs::find_ancient_nobtf_object 的查找逻辑:
-#   1. 环境变量 KS_EBPF_DIR + ks_main_ancient_nobtf.o
-#   2. target/{debug,release}/build/ks-engine-*/out/ks_main_ancient_nobtf.o (取最新)
+#   1. 环境变量 HRABNAZ_EBPF_DIR + hrabnaz_main_ancient_nobtf.o
+#   2. target/{debug,release}/build/hrabnaz-engine-*/out/hrabnaz_main_ancient_nobtf.o (取最新)
 find_local_artifact() {
-    if [[ -z "${KS_EBPF_DIR:-}" ]]; then
-        KS_EBPF_DIR=""
+    if [[ -z "${HRABNAZ_EBPF_DIR:-}" ]]; then
+        HRABNAZ_EBPF_DIR=""
     fi
-    local env_path="${KS_EBPF_DIR}/${OBJ_NAME}"
-    if [[ -n "${KS_EBPF_DIR}" && -f "${env_path}" ]]; then
+    local env_path="${HRABNAZ_EBPF_DIR}/${OBJ_NAME}"
+    if [[ -n "${HRABNAZ_EBPF_DIR}" && -f "${env_path}" ]]; then
         OBJ_PATH="${env_path}"
-        log "[E2.4.2] 使用 KS_EBPF_DIR: ${OBJ_PATH}"
+        log "[E2.4.2] 使用 HRABNAZ_EBPF_DIR: ${OBJ_PATH}"
         return 0
     fi
 
-    log "[E2.4.2] 查找 target/{debug,release}/build/ks-engine-*/out/${OBJ_NAME} ..."
+    log "[E2.4.2] 查找 target/{debug,release}/build/hrabnaz-engine-*/out/${OBJ_NAME} ..."
     local candidates=()
     local f
     # nullglob 让通配无匹配时返回空数组而非字面 pattern
     shopt -s nullglob
     for tier in release debug; do
-        for f in "${PROJECT_ROOT}/target/${tier}/build/ks-engine-"*/out/${OBJ_NAME}; do
+        for f in "${PROJECT_ROOT}/target/${tier}/build/hrabnaz-engine-"*/out/${OBJ_NAME}; do
             candidates+=("${f}")
         done
     done
@@ -193,9 +193,9 @@ find_local_artifact() {
         echo "============================================================" >&2
         echo "ERROR: 找不到 ${OBJ_NAME}" >&2
         echo "       已查找:" >&2
-        echo "         - KS_EBPF_DIR=${KS_EBPF_DIR:-<unset>}/${OBJ_NAME}" >&2
-        echo "         - ${PROJECT_ROOT}/target/{debug,release}/build/ks-engine-*/out/${OBJ_NAME}" >&2
-        echo "       请先运行: cargo build --release -p ks-engine" >&2
+        echo "         - HRABNAZ_EBPF_DIR=${HRABNAZ_EBPF_DIR:-<unset>}/${OBJ_NAME}" >&2
+        echo "         - ${PROJECT_ROOT}/target/{debug,release}/build/hrabnaz-engine-*/out/${OBJ_NAME}" >&2
+        echo "       请先运行: cargo build --release -p hrabnaz-engine" >&2
         echo "============================================================" >&2
         exit "${EXIT_NO_ARTIFACT}"
     fi
@@ -212,18 +212,18 @@ find_local_artifact() {
 }
 
 upload_artifacts() {
-    # 校验本地 ks_loader.c 存在
-    if [[ ! -f "${KS_LOADER_SRC_LOCAL}" ]]; then
+    # 校验本地 hrabnaz_loader.c 存在
+    if [[ ! -f "${HRABNAZ_LOADER_SRC_LOCAL}" ]]; then
         echo "============================================================" >&2
-        echo "ERROR: 找不到 ks_loader.c: ${KS_LOADER_SRC_LOCAL}" >&2
+        echo "ERROR: 找不到 hrabnaz_loader.c: ${HRABNAZ_LOADER_SRC_LOCAL}" >&2
         echo "============================================================" >&2
         exit "${EXIT_NO_ARTIFACT}"
     fi
     log "[E2.4.2] 远程 mkdir -p ${REMOTE_DIR}"
     ssh_run "mkdir -p ${REMOTE_DIR}" || exit "${EXIT_SSH}"
 
-    log "         scp 上传 ks_loader.c ($(wc -l < "${KS_LOADER_SRC_LOCAL}") 行) ..."
-    scp_upload "${KS_LOADER_SRC_LOCAL}" "${REMOTE_LOADER_SRC}" || exit "${EXIT_SSH}"
+    log "         scp 上传 hrabnaz_loader.c ($(wc -l < "${HRABNAZ_LOADER_SRC_LOCAL}") 行) ..."
+    scp_upload "${HRABNAZ_LOADER_SRC_LOCAL}" "${REMOTE_LOADER_SRC}" || exit "${EXIT_SSH}"
 
     log "         scp 上传 ${OBJ_NAME} ($(wc -c < "${OBJ_PATH}") bytes) ..."
     scp_upload "${OBJ_PATH}" "${REMOTE_OBJ}" || exit "${EXIT_SSH}"
@@ -232,10 +232,10 @@ upload_artifacts() {
 }
 
 # =============================================================================
-# E2.4.3 — 远程 gcc 编译 ks_loader
+# E2.4.3 — 远程 gcc 编译 hrabnaz_loader
 # =============================================================================
 remote_compile() {
-    log "[E2.4.3] 远程 gcc 编译 ks_loader ..."
+    log "[E2.4.3] 远程 gcc 编译 hrabnaz_loader ..."
     local compile_log
     if ! compile_log=$(ssh_run \
             "gcc -std=c99 -O2 -Wall -Wextra -o ${REMOTE_LOADER} ${REMOTE_LOADER_SRC} -lelf 2>&1"); then
@@ -262,7 +262,7 @@ remote_compile() {
 # =============================================================================
 # E2.4.4 — --load-only 验证 13/13 加载
 # =============================================================================
-# 注意: ks_loader.c 实际输出的成功标记是 "=== Summary: N loaded, 0 failed ==="
+# 注意: hrabnaz_loader.c 实际输出的成功标记是 "=== Summary: N loaded, 0 failed ==="
 # (而非 "attached"; 后者是设计文档用词, 实现里加载成功的 stderr 标记是 "loaded")
 # 故断言 stderr 含 "loaded" 且退出码 0; 同时校验 "0 failed" 确认无失败.
 verify_load_only() {
@@ -282,7 +282,7 @@ verify_load_only() {
         exit "${EXIT_ASSERT}"
     fi
 
-    # 断言含 "loaded" + "0 failed" (ks_loader.c:740 行: "=== Summary: N loaded, N failed ===")
+    # 断言含 "loaded" + "0 failed" (hrabnaz_loader.c:740 行: "=== Summary: N loaded, N failed ===")
     if ! echo "${out}" | grep -q "loaded"; then
         fail "stderr 不含 'loaded' 标记 (期望: === Summary: N loaded, 0 failed ===)"
     fi
@@ -363,7 +363,7 @@ verify_stream_output() {
 
     # 2) 第一个帧的 length 字段 (前 4 字节 LE u32) > 0
     #    (心跳帧 length=0 是 4 个 0x00 字节; 事件帧 length > 0)
-    #    注意: ks_loader HEARTBEAT_INTERVAL_SEC=30, 本脚本只跑 5s 左右, 不会有心跳;
+    #    注意: hrabnaz_loader HEARTBEAT_INTERVAL_SEC=30, 本脚本只跑 5s 左右, 不会有心跳;
     #          但仍校验 first frame 非心跳, 提高健壮性.
     local first4
     first4=$(ssh_run "od -An -tx1 -N4 ${REMOTE_STREAM_OUT} 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || echo "")
@@ -397,7 +397,7 @@ verify_stream_output() {
     fi
     log "         首帧格式校验通过: [length=${length_val}][payload ${length_val} bytes]"
 
-    # 4) stream.err 不含 "FAIL" (ks_loader.c 失败标记: [FAIL] program=...)
+    # 4) stream.err 不含 "FAIL" (hrabnaz_loader.c 失败标记: [FAIL] program=...)
     local err_content
     err_content=$(ssh_run "cat ${REMOTE_STREAM_ERR} 2>/dev/null" 2>/dev/null || echo "")
     if echo "${err_content}" | grep -q "FAIL"; then
@@ -410,7 +410,7 @@ verify_stream_output() {
 
 stop_stream() {
     log "         停止远程 stream 进程 (pid=${REMOTE_STREAM_PID_VAL}) ..."
-    # SIGTERM 让 ks_loader 优雅退出 (注册了 SIGTERM handler, 会 detach + cleanup + exit 0)
+    # SIGTERM 让 hrabnaz_loader 优雅退出 (注册了 SIGTERM handler, 会 detach + cleanup + exit 0)
     ssh_run "kill ${REMOTE_STREAM_PID_VAL} 2>/dev/null" 2>/dev/null || true
     sleep 0.5
     # 兜底 SIGKILL (若 SIGTERM 未生效)
@@ -423,11 +423,11 @@ stop_stream() {
 # =============================================================================
 main() {
     echo "============================================================"
-    echo " KernelSentinel E2.4 验证 (Ancient tier, ECS 3.10 stock kernel, NOBTF)"
+    echo " Hrabnaz E2.4 验证 (Ancient tier, ECS 3.10 stock kernel, NOBTF)"
     echo " ECS:        ${ECS_USER}@${ECS_HOST}"
     echo " SSH Key:    ${SSH_KEY}"
     echo " Remote Dir: ${REMOTE_DIR}"
-    echo " Loader Src: ${KS_LOADER_SRC_LOCAL}"
+    echo " Loader Src: ${HRABNAZ_LOADER_SRC_LOCAL}"
     echo "============================================================"
 
     find_local_artifact    # E2.4.2 (失败时 exit 3)

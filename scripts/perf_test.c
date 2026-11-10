@@ -23,7 +23,7 @@ int main(void) {
     unsigned long long id = 81; /* raw_syscalls/sys_enter（实测）*/
     int fd;
 
-    /* A: size=0, sample_period=1, RAW|TIME, enabled（当前ks_loader配置）*/
+    /* A: size=0, sample_period=1, RAW|TIME, enabled（当前hrabnaz_loader配置）*/
     struct perf_event_attr a; memset(&a, 0, sizeof(a));
     a.type = PERF_TYPE_TRACEPOINT; a.config = id;
     a.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_TIME; a.sample_period = 1; a.wakeup_events = 1;

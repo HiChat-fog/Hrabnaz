@@ -66,9 +66,12 @@
     - field: comm
       operator: not_regex
       value: "^(cron|crond)$"
+    # 只盯任务表本体：cron.daily/hourly 等脚本目录里的文件会被 run-parts
+    # 子进程按事件 14 打开（Ubuntu cron.daily 每天误报 7 条），且该目录的
+    # 落盘持久化受 K2（<1024B 写入不可见）限制本就测不到写入
     - field: filename
       operator: regex
-      value: "^/etc/cron(tab|\\.d/|\\.(daily|hourly|weekly|monthly)/)"
+      value: "^/etc/cron(tab|\\.d/)"
   alert_message: "检测到修改系统定时任务配置，可能是持久化或提权组合攻击"
   mitre_tactic: "TA0003"
   mitre_technique: "T1053.003"

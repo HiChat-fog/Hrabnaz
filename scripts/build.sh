@@ -26,7 +26,7 @@ echo ""
 
 # ========== 阶段 1: 生成 vmlinux.h ==========
 echo "[1/4] 生成 vmlinux.h..."
-VMLINUX_DIR="crates/ks-ebpf/src/bpf"
+VMLINUX_DIR="crates/hrabnaz-ebpf/src/bpf"
 
 if [ -f "/sys/kernel/btf/vmlinux" ]; then
     bpftool btf dump file /sys/kernel/btf/vmlinux format c > "${VMLINUX_DIR}/vmlinux.h"
@@ -46,9 +46,9 @@ echo ""
 
 # ========== 阶段 2: 编译 eBPF ==========
 # 旧实现遍历的 syscall_probe/vfs_probe/net_probe/infer 源文件早已不存在；
-# eBPF 现由 ks-engine/build.rs 按 tier 矩阵（modern/legacy/ancient/*_nobtf）统一编译，
+# eBPF 现由 hrabnaz-engine/build.rs 按 tier 矩阵（modern/legacy/ancient/*_nobtf）统一编译，
 # cargo build 阶段自动触发，这里只做提示
-echo "[2/4] 编译 eBPF 探针（由 ks-engine/build.rs 在 cargo build 时按 tier 自动编译）..."
+echo "[2/4] 编译 eBPF 探针（由 hrabnaz-engine/build.rs 在 cargo build 时按 tier 自动编译）..."
 echo ""
 
 # ========== 阶段 3: 编译 Rust ==========

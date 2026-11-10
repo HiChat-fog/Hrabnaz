@@ -1,0 +1,64 @@
+[package]
+name = "hrabnaz-engine"
+version = "0.1.0"
+edition = "2021"
+description = "内核哨兵 - 用户态检测引擎"
+license = "GPL-3.0-only"
+
+[dependencies]
+hrabnaz-core = { path = "../hrabnaz-core" }
+# hrabnaz-ebpf 是纯 C 项目，eBPF 字节码由 build.rs 编译
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal", "sync", "time"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+sha2 = "0.10"
+flate2 = "1"
+aya = "0.14"
+aya-obj = "0.3"
+aya-log = "0.2"
+# A6: EventSource trait async 支持（trait object 需要 async_trait 宏）
+async-trait = "0.1"
+# Phase E2.3: 运行时查找 hrabnaz_loader 二进制（PATH 查找），与 build.rs 共用同一版本
+which = "7"
+# blocker: block_decisions 下发的 expire 需与内核 bpf_ktime_get_ns 同源（CLOCK_MONOTONIC）
+libc = "0.2"
+# H-4 unsafe 收敛: 测试/回放编码走 IntoBytes 安全字节转换（版本对齐依赖树中 aya 传递依赖）
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[build-dependencies]
+which = "7"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# G5.1: 性能压测 — criterion bench
+# 运行: cargo bench --workspace -p hrabnaz-engine
+# 报告: target/criterion/<bench_name>/report/index.html
+[[bench]]
+name = "decode_bench"
+harness = false
+
+[[bench]]
+name = "correlation_bench"
+harness = false
+
+[[bench]]
+name = "baseline_bench"
+harness = false
+
+[[bench]]
+name = "ml_bench"
+harness = false
+
+[[bench]]
+name = "detector_bench"
+harness = false

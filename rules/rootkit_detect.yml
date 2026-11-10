@@ -1,8 +1,8 @@
 # rootkit 检测 — 本文件含 enforce: true 规则（阻断模式下命中即写内核裁决实杀）。
 # enforce 规则编写守则（对齐 Tetragon/KubeArmor 的显式 action 语义）：
 #   1. 匹配条件必须精确（comm/syscall 级），不得用行为类模糊条件（文件读取/网络访问）；
-#   2. 先在 monitor 模式（不开 KS_DETECTION_BLOCK_ENABLED）观察，确认零误报再标 true；
-#   3. 系统进程（sshd/systemd/cron 及 KS_PROTECTED_COMMS 名单）由内核与 killer 双侧豁免。
+#   2. 先在 monitor 模式（不开 HRABNAZ_DETECTION_BLOCK_ENABLED）观察，确认零误报再标 true；
+#   3. 系统进程（sshd/systemd/cron 及 HRABNAZ_PROTECTED_COMMS 名单）由内核与 killer 双侧豁免。
 - name: "rootkit_module_load"
   description: "加载内核模块 (insmod/finit_module), 可能是 Rootkit"
   severity: critical

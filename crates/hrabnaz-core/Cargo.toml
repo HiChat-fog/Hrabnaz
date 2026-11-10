@@ -1,0 +1,25 @@
+[package]
+name = "hrabnaz-core"
+version = "0.1.0"
+edition = "2021"
+description = "内核哨兵 - 核心数据类型与公共结构"
+license = "GPL-3.0-only"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+# H-4 unsafe 收敛: repr(C) 事件结构体 ↔ 字节的安全双向转换（测试/回放编码与带校验解码）
+zerocopy = { version = "0.8", features = ["derive"] }
+# forensic 契约（哈希链/JSONL 读取/滚动归档/脱敏）与 sys 安全 syscall 封装的依赖
+anyhow = "1"
+sha2 = "0.10"
+regex = "1"
+flate2 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+log = "0.4"
+# H-4: sys.rs 的 libc FFI 收敛为 nix 安全封装（仓库内零 unsafe）；仅开用到的 feature
+nix = { version = "0.31", default-features = false, features = ["fs", "resource", "signal", "time", "user"] }
+
+[dev-dependencies]
+tempfile = "3"

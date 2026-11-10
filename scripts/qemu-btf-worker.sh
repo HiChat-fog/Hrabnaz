@@ -16,7 +16,7 @@
 set -u
 RELEASE="${1:?release}"; KERNEL="${2:?vmlinuz}"; WORK="${3:?workdir}"
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${KS_BIN:-$BASE/target/x86_64-unknown-linux-musl/release/kernelsentinel}"
+BIN="${HRABNAZ_BIN:-$BASE/target/x86_64-unknown-linux-musl/release/hrabnaz}"
 INITRAMFS="${INITRAMFS:-/tmp/qemu-harness/initramfs.cpio.gz}"
 OUT="$WORK/results"; LOG="$WORK/logs"
 mkdir -p "$OUT" "$LOG"

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Rebuild crates/ks-ebpf/btf/index.tsv and blobs/ from cached full BTF files.
+# Rebuild crates/hrabnaz-ebpf/btf/index.tsv and blobs/ from cached full BTF files.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BTF=$ROOT/crates/ks-ebpf/btf
+BTF=$ROOT/crates/hrabnaz-ebpf/btf
 BLOBS=$BTF/blobs
 INDEX=$BTF/index.tsv
-CACHE=${KS_BTF_CACHE:-$HOME/.cache/hrabnaz/btf-full}
+CACHE=${HRABNAZ_BTF_CACHE:-$HOME/.cache/hrabnaz/btf-full}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -22,14 +22,14 @@ shift
 find_objects() {
     local out
     while IFS= read -r out; do
-        if [ -f "$out/ks_main_modern.o" ] && [ -f "$out/ks_main_legacy.o" ] &&
-            [ -f "$out/ks_main_ancient.o" ]; then
+        if [ -f "$out/hrabnaz_main_modern.o" ] && [ -f "$out/hrabnaz_main_legacy.o" ] &&
+            [ -f "$out/hrabnaz_main_ancient.o" ]; then
             echo "$out"
             return 0
         fi
-    done < <(find "$ROOT/target" -path '*/build/ks-engine-*/out/ks_main_modern.o' \
+    done < <(find "$ROOT/target" -path '*/build/hrabnaz-engine-*/out/hrabnaz_main_modern.o' \
         -printf '%T@ %h\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
-    echo "no build output with the three CO-RE objects; run cargo build -p ks-engine first" >&2
+    echo "no build output with the three CO-RE objects; run cargo build -p hrabnaz-engine first" >&2
     return 1
 }
 
@@ -95,7 +95,7 @@ trim_one() {
     }
     full=$(sha256sum "$TMP/full.btf" | cut -d' ' -f1)
     if ! bpftool gen min_core_btf "$TMP/full.btf" "$TMP/min.btf" \
-        "$objdir/ks_main_modern.o" "$objdir/ks_main_legacy.o" "$objdir/ks_main_ancient.o" \
+        "$objdir/hrabnaz_main_modern.o" "$objdir/hrabnaz_main_legacy.o" "$objdir/hrabnaz_main_ancient.o" \
         >/dev/null 2>&1; then
         echo "trim failed: $rel" >&2
         return 1

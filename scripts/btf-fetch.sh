@@ -3,9 +3,9 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-CACHE=${KS_BTF_CACHE:-$HOME/.cache/hrabnaz/btf-full}
-BASE=${KS_BTF_BASE:-https://raw.githubusercontent.com/aquasecurity/btfhub-archive/main}
-MIRROR=${KS_BTF_MIRROR:-https://cdn.jsdelivr.net/gh/aquasecurity/btfhub-archive@main}
+CACHE=${HRABNAZ_BTF_CACHE:-$HOME/.cache/hrabnaz/btf-full}
+BASE=${HRABNAZ_BTF_BASE:-https://raw.githubusercontent.com/aquasecurity/btfhub-archive/main}
+MIRROR=${HRABNAZ_BTF_MIRROR:-https://cdn.jsdelivr.net/gh/aquasecurity/btfhub-archive@main}
 
 mkdir -p "$CACHE"
 
@@ -60,7 +60,7 @@ if [ $# -eq 0 ]; then
 fi
 
 if [ "$1" = "--all" ]; then
-    mapfile -t releases < <(awk -F'\t' '!/^#/ && NF {print $1}' "$ROOT/crates/ks-ebpf/btf/index.tsv")
+    mapfile -t releases < <(awk -F'\t' '!/^#/ && NF {print $1}' "$ROOT/crates/hrabnaz-ebpf/btf/index.tsv")
 else
     releases=("$@")
 fi

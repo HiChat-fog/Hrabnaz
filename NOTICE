@@ -1,0 +1,21 @@
+Hrabnaz
+Copyright (C) 2026 HiChat-fog
+SPDX-License-Identifier: GPL-3.0-only
+
+This product includes third-party software and data:
+
+---
+vendor/aya
+Copyright (c) aya-rs contributors
+Licensed under either of Apache License, Version 2.0 or MIT license
+at your option.
+Local modifications: see vendor/aya/PATCHES.md for the list of
+applied patches and their rationale.
+---
+
+BTF profiles (crates/hrabnaz-ebpf/btf/)
+Source: https://github.com/aquasecurity/btfhub-archive
+Copyright (c) Aqua Security Software Ltd.
+Licensed under the Apache License, Version 2.0.
+Profiles were trimmed using bpftool gen min_core_btf; provenance is
+recorded in crates/hrabnaz-ebpf/btf/index.tsv (full_btf_sha256 column).

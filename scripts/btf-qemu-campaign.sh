@@ -4,7 +4,7 @@
 # 产出 PASS/FAIL verdict。断点续跑：已有 verdict / 已下载镜像自动跳过。
 #
 # 用法: btf-qemu-campaign.sh [workdir]
-# 环境: KS_BIN（默认 musl release 二进制）、INITRAMFS、JOBS（默认 6）
+# 环境: HRABNAZ_BIN（默认 musl release 二进制）、INITRAMFS、JOBS（默认 6）
 set -u
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${1:-/tmp/qemu-harness/campaign}"
@@ -15,7 +15,7 @@ LOG="$WORK/campaign.log"
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
 WORKER="$BASE/scripts/qemu-btf-worker.sh"
-BTF_DIR="${BTF_DIR:-$BASE/crates/ks-ebpf/btf}"
+BTF_DIR="${BTF_DIR:-$BASE/crates/hrabnaz-ebpf/btf}"
 if [ -n "${RELS_FILE:-}" ]; then RELS=$(cat "$RELS_FILE"); else RELS=$(ls "$BTF_DIR" | sed 's/\.btf\.xz$//'); fi
 [ -n "${SHARD:-}" ] && RELS=$(echo "$RELS" | grep -E "$SHARD" || true)
 

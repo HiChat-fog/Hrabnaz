@@ -56,14 +56,14 @@ jobs:
           sudo apt-get install -y libelf-dev libbpf-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build ks-cli (triggers ks-engine build.rs -> eBPF)
-        run: cargo build -p ks-cli --release
+      - name: Build hrabnaz-cli (triggers hrabnaz-engine build.rs -> eBPF)
+        run: cargo build -p hrabnaz-cli --release
       - name: Verify 5 eBPF .o files (modern/legacy/ancient/ancient_nobtf/legacy_nobtf)
         run: |
           set -e
           echo "=== Compiled eBPF objects ==="
-          find target/release -name 'ks_main_*.o' -print
-          count=$(find target/release -name 'ks_main_*.o' | wc -l)
+          find target/release -name 'hrabnaz_main_*.o' -print
+          count=$(find target/release -name 'hrabnaz_main_*.o' | wc -l)
           echo "Found $count .o files (expected 5)"
           test "$count" -eq 5
 
@@ -90,7 +90,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run criterion benchmarks (compile check, no stats)
-        run: cargo bench -p ks-engine --no-run
+        run: cargo bench -p hrabnaz-engine --no-run
 
   security-audit:
     name: Security Audit (cargo audit)

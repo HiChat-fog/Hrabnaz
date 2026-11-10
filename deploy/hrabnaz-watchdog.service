@@ -1,0 +1,14 @@
+[Unit]
+Description=Hrabnaz Watchdog — engine liveness monitor (H-1.6)
+After=hrabnaz.service
+Requires=hrabnaz.service
+
+[Service]
+Type=oneshot
+# 心跳停摆超过 60s（引擎 10s 写一次心跳）即 SIGTERM，systemd Restart=on-failure 自动拉起
+ExecStart=/usr/local/bin/hrabnaz watchdog --stale-secs 60
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

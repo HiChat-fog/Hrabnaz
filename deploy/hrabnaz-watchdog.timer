@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Hrabnaz watchdog every minute (H-1.6)
+
+[Timer]
+# 引擎心跳 10s/次，60s 无刷新即判停摆；每分钟巡检一轮
+OnBootSec=2min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target

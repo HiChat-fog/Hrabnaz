@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # D3: 离线提取内核struct成员偏移，生成nobtf偏移表条目
 #
-# ks_main_ancient_nobtf.o用硬编码struct偏移（common.h的KS_OFF_*），偏移随内核release而变。
+# hrabnaz_main_ancient_nobtf.o用硬编码struct偏移（common.h的KS_OFF_*），偏移随内核release而变。
 # 本脚本在构建机上下载目标内核kernel-debuginfo RPM，用pahole从vmlinux(DWARF)提取偏移。
 #
 # 用法：scripts/extract-offsets.sh 3.10.0-1160.119.1.el7.x86_64
@@ -78,7 +78,7 @@ extract_offset() {
 echo ""
 echo "===== struct 偏移（release=${RELEASE}）====="
 # 对应common.h的KS_OFF_*。pahole给的是struct内偏移（inet_sock字段偏移含sock_common前置）；
-# KS_OFF_INET_SADDR即inet_sock内inet_saddr的偏移，与pahole一致。
+# HRABNAZ_OFF_INET_SADDR即inet_sock内inet_saddr的偏移，与pahole一致。
 INET_SADDR=$(extract_offset inet_sock inet_saddr)
 INET_SPORT=$(extract_offset inet_sock inet_sport)
 PATH_DENTRY=$(extract_offset path dentry)
@@ -95,7 +95,7 @@ print_kv "file.f_path"              "$FILE_FPATH"
 print_kv "sockaddr_in6.sin6_port"   "$SIN6_PORT"
 
 echo ""
-echo "===== 偏移表条目（粘进 common.h KS_OFF_* 注释 / Rust offset 表）====="
+echo "===== 偏移表条目（粘进 common.h HRABNAZ_OFF_* 注释 / Rust offset 表）====="
 cat <<EOF
 # release: ${RELEASE}
 # inet_saddr=${INET_SADDR:-?} inet_sport=${INET_SPORT:-?} path.dentry=${PATH_DENTRY:-?} dentry.d_name=${DENTRY_DNAME_NAME:-?} file.f_path=${FILE_FPATH:-?} sin6_port=${SIN6_PORT:-?}

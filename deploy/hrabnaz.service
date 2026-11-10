@@ -1,0 +1,36 @@
+[Unit]
+Description=Hrabnaz — eBPF Endpoint Threat Detection
+Documentation=https://github.com/your-org/hrabnaz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/hrabnaz start --rules-dir /etc/hrabnaz/rules --log-dir /var/log/hrabnaz --sd-notify
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+
+# eBPF需要的能力
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+
+# 解除内存锁限制（eBPF map需要）
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hrabnaz
+
+# 安全加固
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+PrivateDevices=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

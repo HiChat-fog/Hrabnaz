@@ -42,17 +42,17 @@ jobs:
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release -p ks-cli --target ${{ matrix.target }}
+        run: cargo build --release -p hrabnaz-cli --target ${{ matrix.target }}
 
       - name: Package release archive
         run: |
           STAGING="staging"
           mkdir -p "$STAGING"
-          cp "target/${{ matrix.target }}/release/kernelsentinel" "$STAGING/"
+          cp "target/${{ matrix.target }}/release/hrabnaz" "$STAGING/"
           cp -r rules "$STAGING/"
           cp -r scripts "$STAGING/"
           cp README.md "$STAGING/"
-          ARCHIVE="kernelsentinel-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          ARCHIVE="hrabnaz-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
           tar czf "$ARCHIVE" -C "$STAGING" .
           echo "=== Archive contents ==="
           tar tzf "$ARCHIVE"
@@ -62,4 +62,4 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           generate_release_notes: true
-          files: kernelsentinel-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          files: hrabnaz-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
