@@ -62,10 +62,3 @@ sudo ./target/debug/hrabnaz start --rules-dir rules/ --log-dir /tmp/ks-try
 ./target/debug/hrabnaz status --watch          # 盯着探针 attach、map 增长
 ./target/debug/hrabnaz replay --file /tmp/ks-try/events_*.jsonl
 ```
-
-## 五、 Commit 风格与 Issue
-
-- **Commit**：一个逻辑改动一个 commit。英文祈使句，短小精悍即可（如："Harden detection and reduce log volume"）。发布打包必须从干净的 git 树出，生成产物不进库。
-- **提 Issue**：请务必带上三样东西：内核版本（`uname -r`）、发行版、`hrabnaz status` 输出。
-  - 测出检测问题：附带相关的取证 JSONL。
-  - 遇到误报：附带该 PID 的 `baseline` 输出（统计层噪声基本都是突发频率模式，去那儿一眼就能看出来）。
