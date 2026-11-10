@@ -16,7 +16,9 @@
 
 # Hrabnaz
 
-eBPF-based endpoint threat detection for Linux 3.10–7.x.
+eBPF-based endpoint threat detection for Linux servers that can't be upgraded. One binary covers 3.10 through 7.x.
+
+[![AtomGit G-Star](https://atomgit.com/HiChat-fog/Hrabnaz/star/new_badge.svg)](https://atomgit.com/HiChat-fog/Hrabnaz)
 
 [中文文档](docs/README.zh-CN.md)
 

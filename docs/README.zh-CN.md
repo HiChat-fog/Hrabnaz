@@ -16,7 +16,9 @@
 
 # Hrabnaz
 
-基于eBPF的Linux终端威胁检测系统，覆盖3.10–7.x内核。
+面向无法升级的Linux服务器，基于eBPF的终端威胁检测系统。单二进制覆盖3.10至7.x内核。
+
+[![AtomGit G-Star](https://atomgit.com/HiChat-fog/Hrabnaz/star/new_badge.svg)](https://atomgit.com/HiChat-fog/Hrabnaz)
 
 [English](../README.md)
 
