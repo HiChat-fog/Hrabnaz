@@ -1,12 +1,14 @@
 # Contributing
 
+> Of course, you don’t have to follow it exactly,do whatever you think is best. Thank you.
+
 Thanks for looking at Hrabnaz. This page covers the things a new contributor cannot guess from the code: the invariants that the build and tests enforce, where each kind of change lands, and how to verify your work without a kernel lab.
 
 [中文](CONTRIBUTING.zh-CN.md)
 
 ## Ground rules
 
-1. **User-space code contains zero `unsafe`.** Event decoding reads eBPF memory through safe byte extraction and `nix` wrappers. If a change seems to need `unsafe`, the design is wrong somewhere; bring it to an issue first.
+1. **User-space code contains zero `unsafe`.** Event decoding reads eBPF memory through safe byte extraction and `nix` wrappers. If a change seems to need `unsafe`, the design is wrong somewhere.
 2. **C/Rust structs are one contract.** Anything in `crates/hrabnaz-core/src/` marked `#[repr(C)]` is shared with the eBPF side. There are compile-time size asserts next to the definitions; a field change that breaks them fails the build, which is the point. Update both sides in the same commit.
 3. **Kernel-side policy stays cheap.** The eBPF layer does integer scoring and filtering only. Regexes, correlation and baselines belong in `hrabnaz-engine`. If you are about to put a loop over strings into a probe, reconsider.
 4. **Dialect-specific values stay out of default rules.** Rules ship only semantics true on every Linux. Cloud agents and site-specific noise are handled by the deployment allowlists (`HRABNAZ_SENSITIVE_PATH_ALLOW`, `HRABNAZ_RULE_PROC_ALLOW`, `HRABNAZ_BASELINE_HIGHFREQ`). A rule patch that hardcodes one vendor's daemon will be rejected.
